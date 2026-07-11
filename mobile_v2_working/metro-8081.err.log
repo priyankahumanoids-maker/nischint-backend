@@ -1,0 +1,12 @@
+Error while reading cache, falling back to a full crawl:
+ Error: Unable to deserialize cloned data.
+    at deserialize (node:v8:469:14)
+    at DiskCacheManager.read (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\metro-file-map\src\cache\DiskCacheManager.js:60:33)
+    at FileMap.read (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\metro-file-map\src\index.js:317:14)
+    at D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\metro-file-map\src\index.js:208:25
+    at DependencyGraph.ready (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\metro\src\node-haste\DependencyGraph.js:94:5)
+    at Bundler.ready (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\metro\src\Bundler.js:62:5)
+    at IncrementalBundler.ready (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\metro\src\IncrementalBundler.js:310:5)
+    at Server.ready (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\metro\src\Server.js:1446:5)
+    at runMetro (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\metro\src\index.flow.js:142:5)
+    at createConnectMiddleware (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\metro\src\index.flow.js:147:23)

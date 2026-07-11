@@ -1,0 +1,12 @@
+User-agent: *
+Allow: /
+
+# BLOCK INTERNAL SYSTEM ROUTES
+Disallow: /api/
+Disallow: /ws/
+Disallow: /admin
+Disallow: /dashboard
+Disallow: /login
+
+# IMPORTANT: USE DYNAMIC SITEMAP
+Sitemap: https://nischint.care/api/blog/sitemap

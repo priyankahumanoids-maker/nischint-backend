@@ -1,0 +1,8 @@
+Starting project at D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working
+Starting Metro Bundler
+
+ ERROR  An unknown error occurred while installing React Native DevTools. Details:
+
+spawn EPERM
+Waiting on http://localhost:8081
+Logs for your project will appear below.

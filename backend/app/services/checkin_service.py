@@ -1,0 +1,518 @@
+# Check-In Service — 2-way safety check between guardian and child
+import logging
+import uuid
+from datetime import datetime, timezone, timedelta
+
+from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.checkin import CheckIn
+from app.models.user import User
+from app.models.guardian import Guardian
+
+logger = logging.getLogger(__name__)
+
+CHECKIN_EXPIRY_MINUTES = 15
+
+
+# ── DLQ for check-in audit rows that failed to persist ─────────────
+# Compensating action for the two safety-critical event-dispatch
+# swallows below (help_requested GuardianAlert + SafetyEvent). The
+# SSE + push broadcast has ALREADY fired by the time the INSERT is
+# attempted; the only thing this DLQ recovers is the audit trail.
+# Bounded to protect Redis memory during a sustained DB outage.
+_CHECKIN_DLQ_NAMESPACE = "dlq"
+_CHECKIN_DLQ_KEY = "checkin_audit"
+_CHECKIN_DLQ_MAX = 500
+
+
+def _push_checkin_audit_dlq(payload: dict) -> bool:
+    """LPUSH the check-in audit payload to a bounded Redis list. The
+    payload carries a `row_type` discriminator (`help_requested` or
+    `safety_event`) so the reconciler can dispatch to the right
+    replay function."""
+    try:
+        import json
+        from app.services.redis_service import _get_client
+        c = _get_client()
+        if not c:
+            return False
+        full_key = f"{_CHECKIN_DLQ_NAMESPACE}:{_CHECKIN_DLQ_KEY}"
+        c.lpush(full_key, json.dumps(payload, default=str))
+        c.ltrim(full_key, 0, _CHECKIN_DLQ_MAX - 1)
+        return True
+    except Exception as e:  # noqa: BLE001 — best-effort DLQ
+        logger.debug("checkin DLQ push skipped: %r", e)
+        return False
+
+
+async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str) -> dict:
+    """Guardian initiates a safety check-in for a child."""
+    logger.info(f"CHECKIN_CREATE guardian={guardian_id} child={child_id}")
+    # Verify guardian is linked to this child
+    guardian_uuid = uuid.UUID(guardian_id)
+    child_uuid = uuid.UUID(child_id)
+
+    # Get guardian's email to verify link
+    guardian_user = await session.execute(select(User).where(User.id == guardian_uuid))
+    guardian = guardian_user.scalar_one_or_none()
+    if not guardian:
+        return {"error": "Guardian not found"}
+
+    link_result = await session.execute(
+        select(Guardian).where(
+            Guardian.user_id == child_uuid,
+            Guardian.email == guardian.email,
+            Guardian.is_active == True,  # noqa: E712
+        ).limit(1)
+    )
+    is_linked = link_result.scalar_one_or_none() is not None
+
+    # Also check relationships table (code-based linking)
+    if not is_linked:
+        from app.models.relationship import Relationship
+        rel_result = await session.execute(
+            select(Relationship).where(
+                Relationship.guardian_id == guardian_uuid,
+                Relationship.child_id == child_uuid,
+                Relationship.status == "accepted",
+            ).limit(1)
+        )
+        is_linked = rel_result.scalar_one_or_none() is not None
+
+    if not is_linked:
+        return {"error": "You are not linked as a guardian to this user"}
+
+    # Cancel any existing pending check-ins from this guardian to this child
+    await session.execute(
+        update(CheckIn).where(
+            CheckIn.guardian_id == guardian_uuid,
+            CheckIn.child_id == child_uuid,
+            CheckIn.status == "pending",
+        ).values(status="expired", escalated_at=datetime.now(timezone.utc))
+    )
+
+    checkin = CheckIn(
+        guardian_id=guardian_uuid,
+        child_id=child_uuid,
+        status="pending",
+    )
+    session.add(checkin)
+    await session.flush()
+
+    # Capture values before commit (avoids detached-instance errors in async SQLAlchemy)
+    check_in_id = str(checkin.id)
+    created_at = checkin.created_at.isoformat()
+
+    # Get child info for response
+    child_user = await session.execute(select(User).where(User.id == child_uuid))
+    child = child_user.scalar_one_or_none()
+    child_name = child.full_name if child else "Unknown"
+
+    # Send push notification to child
+    try:
+        from app.services.push_service import send_push_to_user
+        await send_push_to_user(
+            session,
+            child_uuid,
+            "Safety Check",
+            f"{guardian.full_name or 'Your parent'} is checking on you — are you safe?",
+        )
+        logger.info(f"CHECKIN_PUSH_SENT child={child_id}")
+    except Exception as e:
+        logger.warning(f"CHECKIN_PUSH_FAILED {e}")
+
+    await session.commit()
+    logger.info(f"CHECKIN_CREATE_SUCCESS id={check_in_id} guardian={guardian_id} child={child_id}")
+
+    # Broadcast checkin_pending to BOTH guardian AND child via SSE
+    try:
+        from app.services.event_broadcaster import broadcaster
+        pending_payload = {
+            "check_in_id": check_in_id,
+            "child_id": child_id,
+            "child_name": child_name,
+            "guardian_id": guardian_id,
+            "guardian_name": guardian.full_name or "Your parent",
+            "status": "pending",
+            "created_at": created_at,
+        }
+        await broadcaster.broadcast_to_user(guardian_id, "checkin_pending", pending_payload)
+        logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_pending user={guardian_id} checkin={check_in_id}")
+        await broadcaster.broadcast_to_user(child_id, "checkin_pending", pending_payload)
+        logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_pending user={child_id} checkin={check_in_id}")
+    except Exception as e:
+        logger.warning(f"[SSE_CHECKIN_EMIT] checkin_pending broadcast failed: {e}")
+
+    return {
+        "check_in_id": check_in_id,
+        "guardian_id": guardian_id,
+        "child_id": child_id,
+        "child_name": child_name,
+        "status": "pending",
+        "created_at": created_at,
+    }
+
+
+async def get_pending_checkins(session: AsyncSession, child_id: str) -> list[dict]:
+    """Get all pending check-ins for a child."""
+    child_uuid = uuid.UUID(child_id)
+    now = datetime.now(timezone.utc)
+
+    result = await session.execute(
+        select(CheckIn).where(
+            CheckIn.child_id == child_uuid,
+            CheckIn.status == "pending",
+        ).order_by(CheckIn.created_at.desc())
+    )
+
+    checkins = []
+    for ci in result.scalars().all():
+        # Auto-expire if older than 15 min (and mark for escalation)
+        age_min = (now - ci.created_at).total_seconds() / 60
+        if age_min > CHECKIN_EXPIRY_MINUTES:
+            ci.status = "expired"
+            ci.escalated_at = now
+            await session.flush()
+            continue
+
+        # Get guardian name
+        g_result = await session.execute(select(User).where(User.id == ci.guardian_id))
+        guardian = g_result.scalar_one_or_none()
+
+        checkins.append({
+            "check_in_id": str(ci.id),
+            "guardian_id": str(ci.guardian_id),
+            "guardian_name": guardian.full_name if guardian else "Guardian",
+            "status": ci.status,
+            "created_at": ci.created_at.isoformat(),
+            "expires_in_seconds": max(0, int(CHECKIN_EXPIRY_MINUTES * 60 - age_min * 60)),
+        })
+
+    await session.commit()
+    return checkins
+
+
+async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: str, response: str) -> dict:
+    """Child responds to a check-in. response = 'safe' | 'help'."""
+    logger.info(f"CHECKIN_RESPOND child={child_id} check_in={check_in_id} response={response}")
+
+    ci_result = await session.execute(
+        select(CheckIn).where(
+            CheckIn.id == uuid.UUID(check_in_id),
+            CheckIn.child_id == uuid.UUID(child_id),
+        )
+    )
+    ci = ci_result.scalar_one_or_none()
+    if not ci:
+        logger.warning(f"CHECKIN_RESPOND check-in {check_in_id} not found for child {child_id}")
+        return {"error": "Check-in not found"}
+
+    if ci.status != "pending":
+        logger.warning(f"CHECKIN_RESPOND check-in {check_in_id} already {ci.status}")
+        return {"error": f"Check-in already {ci.status}"}
+
+    now = datetime.now(timezone.utc)
+    ci.status = response  # "safe" or "help"
+    ci.responded_at = now
+    await session.flush()
+    logger.info(f"CHECKIN_RESPOND DB updated: check_in={check_in_id} status={response}")
+
+    # Get names for notification
+    guardian_result = await session.execute(select(User).where(User.id == ci.guardian_id))
+    guardian = guardian_result.scalar_one_or_none()
+    child_result = await session.execute(select(User).where(User.id == ci.child_id))
+    child = child_result.scalar_one_or_none()
+    child_name = child.full_name if child else "Your child"
+    guardian_id_str = str(ci.guardian_id)
+
+    # ── Step A: Push notification ──
+    push_count = 0
+    if response == "safe":
+        try:
+            from app.services.push_service import send_push_to_user
+            push_count = await send_push_to_user(
+                session, ci.guardian_id,
+                "All Clear",
+                f"{child_name} confirmed they are safe.",
+            )
+            logger.info(f"CHECKIN_RESPOND Push sent to guardian {guardian_id_str}: count={push_count}")
+        except Exception as e:
+            logger.warning(f"CHECKIN_RESPOND Push failed for safe response: {e}")
+
+    elif response == "help":
+        try:
+            from app.services.push_service import send_push_to_user
+            push_count = await send_push_to_user(
+                session, ci.guardian_id,
+                f"URGENT: {child_name} needs help!",
+                f"{child_name} responded to your safety check requesting help!",
+                data={
+                    "type": "CHECKIN_HELP",
+                    "child_id": str(ci.child_id),
+                    "child_name": child_name,
+                    "checkin_id": str(ci.id),
+                },
+            )
+            logger.info(f"CHECKIN_RESPOND Push sent to guardian {guardian_id_str}: count={push_count}")
+        except Exception as e:
+            logger.warning(f"CHECKIN_RESPOND Push failed for help response: {e}")
+
+    # ── Step B: Broadcast real-time SSE event to guardian + child + operators ──
+    response_payload = {
+        "check_in_id": check_in_id,
+        "child_id": child_id,
+        "child_name": child_name,
+        "guardian_id": guardian_id_str,
+        "response": response,
+        "responded_at": now.isoformat(),
+    }
+    try:
+        from app.services.event_broadcaster import broadcaster
+        event_type = "checkin_help" if response == "help" else "checkin_safe"
+        await broadcaster.broadcast_to_user(guardian_id_str, event_type, response_payload)
+        logger.info(f"[SSE_CHECKIN_EMIT] type={event_type} user={guardian_id_str} checkin={check_in_id}")
+        await broadcaster.broadcast_to_user(child_id, event_type, response_payload)
+        logger.info(f"[SSE_CHECKIN_EMIT] type={event_type} user={child_id} checkin={check_in_id}")
+        await broadcaster.broadcast_to_operators(event_type, response_payload)
+    except Exception as e:
+        logger.error(f"[SSE_CHECKIN_EMIT] {event_type} broadcast failed: {e}")
+
+    # ── Step C: Create a GuardianAlert record (so it appears in the Alerts tab) ──
+    if response == "help":
+        try:
+            from app.models.guardian import GuardianAlert, GuardianSession
+            sess_result = await session.execute(
+                select(GuardianSession).where(
+                    GuardianSession.user_id == uuid.UUID(child_id),
+                    GuardianSession.status == "active",
+                ).order_by(GuardianSession.started_at.desc()).limit(1)
+            )
+            active_session = sess_result.scalar_one_or_none()
+
+            # Session-less alerts are now first-class. The DB row
+            # MUST be created even when no active journey exists,
+            # otherwise the ACK engine is blind and the audit trail
+            # has a hole at the exact moment it matters most.
+            alert = GuardianAlert(
+                session_id=active_session.id if active_session else None,
+                user_id=uuid.UUID(child_id),
+                alert_type="help_requested",
+                severity="critical",
+                message=f"{child_name} needs help! Responded to safety check requesting assistance.",
+                details=f"Check-in ID: {check_in_id}. Child explicitly requested help.",
+                recommendation="Contact the child immediately. Call or send help.",
+                location=active_session.current_location if active_session else None,
+            )
+            session.add(alert)
+            await session.flush()
+            logger.info(
+                f"[ALERT_CREATED] type=help_requested id={alert.id} "
+                f"child={child_id} guardian={guardian_id_str} "
+                f"session={active_session.id if active_session else 'none'}"
+            )
+
+            # Wire into the ACK engine so escalation runs even on
+            # session-less alerts (critical severity demands it).
+            try:
+                from app.services.alert_ack_engine import (
+                    severity_requires_ack, mark_for_ack,
+                )
+                if severity_requires_ack(alert.severity):
+                    await mark_for_ack(session, alert)
+            except Exception:
+                logger.exception("[alert_ack] mark_for_ack wiring failed (non-fatal)")
+        except SQLAlchemyError as e:
+            # Compensating action for safety-critical event dispatch:
+            # SSE + push has already fired upstream; the help_requested
+            # alert row is the only persistent record. Push the planned
+            # payload to a bounded Redis DLQ for out-of-band replay.
+            _push_checkin_audit_dlq({
+                "row_type":     "help_requested",
+                "check_in_id":  check_in_id,
+                "child_id":     child_id,
+                "child_name":   child_name,
+                "guardian_id":  guardian_id_str,
+                "failed_at":    datetime.now(timezone.utc).isoformat(),
+                "error_type":   type(e).__name__,
+                "error":        str(e)[:200],
+            })
+            logger.critical(
+                "checkin_help_audit_row_dlq",
+                extra={
+                    "event":       "checkin_help_audit_row_dlq",
+                    "check_in_id": check_in_id,
+                    "child_id":    child_id,
+                    "error_type":  type(e).__name__,
+                },
+                exc_info=True,
+            )
+
+        # ── Step D: Create SafetyEvent + broadcast safety_alert ──
+        try:
+            from app.models.safety_event import SafetyEvent
+            safety_event = SafetyEvent(
+                user_id=uuid.UUID(child_id),
+                risk_score=0.9,
+                risk_level="critical",
+                signals={"help_request": 1.0, "check_in_id": check_in_id},
+                primary_event="help_request",
+                location_lat=0.0,
+                location_lng=0.0,
+                status="active",
+            )
+            session.add(safety_event)
+            await session.flush()
+            logger.info(f"[HELP_EVENT_CREATED] SafetyEvent id={safety_event.id} child={child_id}")
+
+            # Broadcast safety_alert to guardian
+            safety_alert_data = {
+                "type": "HELP_REQUEST",
+                "severity": "HIGH",
+                "child_id": child_id,
+                "child_name": child_name,
+                "check_in_id": check_in_id,
+                "safety_event_id": str(safety_event.id),
+                "timestamp": now.isoformat(),
+            }
+            logger.info(f"[ALERT_GUARDIAN_IDS] guardian={guardian_id_str} for help_requested child={child_id}")
+            await broadcaster.broadcast_to_user(guardian_id_str, "safety_alert", safety_alert_data)
+            logger.info(f"[ALERT_BROADCAST] type=safety_alert/HELP_REQUEST guardian={guardian_id_str} child={child_id}")
+            await broadcaster.broadcast_to_operators("safety_alert", safety_alert_data)
+            logger.info(f"[SSE_EVENT_SENT] safety_alert/HELP_REQUEST to guardian={guardian_id_str}")
+        except SQLAlchemyError as e:
+            # SSE has already fanned out to guardian + operators.
+            # SafetyEvent row is the persistent record — DLQ replay.
+            _push_checkin_audit_dlq({
+                "row_type":     "safety_event",
+                "check_in_id":  check_in_id,
+                "child_id":     child_id,
+                "child_name":   child_name,
+                "guardian_id":  guardian_id_str,
+                "now_iso":      now.isoformat(),
+                "failed_at":    datetime.now(timezone.utc).isoformat(),
+                "error_type":   type(e).__name__,
+                "error":        str(e)[:200],
+            })
+            logger.critical(
+                "checkin_safety_event_audit_row_dlq",
+                extra={
+                    "event":       "checkin_safety_event_audit_row_dlq",
+                    "check_in_id": check_in_id,
+                    "child_id":    child_id,
+                    "error_type":  type(e).__name__,
+                },
+            )
+
+    await session.commit()
+    logger.info(f"CHECKIN_RESPOND Pipeline complete: check_in={check_in_id} response={response} push={push_count} sse=sent")
+
+    return {
+        "check_in_id": check_in_id,
+        "status": response,
+        "responded_at": now.isoformat(),
+    }
+
+
+async def get_checkin_status(session: AsyncSession, check_in_id: str) -> dict | None:
+    """Get status of a check-in (for guardian polling)."""
+    ci_result = await session.execute(
+        select(CheckIn).where(CheckIn.id == uuid.UUID(check_in_id))
+    )
+    ci = ci_result.scalar_one_or_none()
+    if not ci:
+        return None
+
+    child_result = await session.execute(select(User).where(User.id == ci.child_id))
+    child = child_result.scalar_one_or_none()
+
+    return {
+        "check_in_id": str(ci.id),
+        "child_id": str(ci.child_id),
+        "child_name": child.full_name if child else "Unknown",
+        "status": ci.status,
+        "created_at": ci.created_at.isoformat(),
+        "responded_at": ci.responded_at.isoformat() if ci.responded_at else None,
+        "escalated_at": ci.escalated_at.isoformat() if ci.escalated_at else None,
+    }
+
+
+async def get_latest_checkin_for_child(session: AsyncSession, guardian_id: str, child_id: str) -> dict | None:
+    """Get the most recent check-in between a guardian and child."""
+    result = await session.execute(
+        select(CheckIn).where(
+            CheckIn.guardian_id == uuid.UUID(guardian_id),
+            CheckIn.child_id == uuid.UUID(child_id),
+        ).order_by(CheckIn.created_at.desc()).limit(1)
+    )
+    ci = result.scalar_one_or_none()
+    if not ci:
+        logger.info(f"[CHECKIN-LATEST] No check-ins found for guardian={guardian_id} child={child_id}")
+        return None
+
+    logger.info(f"[CHECKIN-LATEST] guardian={guardian_id} child={child_id} → status={ci.status} id={ci.id}")
+    return {
+        "check_in_id": str(ci.id),
+        "status": ci.status,
+        "created_at": ci.created_at.isoformat(),
+        "responded_at": ci.responded_at.isoformat() if ci.responded_at else None,
+    }
+
+
+async def expire_stale_checkins(session: AsyncSession) -> int:
+    """Background job: expire pending check-ins older than 15 min and notify guardian."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=CHECKIN_EXPIRY_MINUTES)
+    result = await session.execute(
+        select(CheckIn).where(
+            CheckIn.status == "pending",
+            CheckIn.created_at < cutoff,
+        )
+    )
+
+    expired_count = 0
+    now = datetime.now(timezone.utc)
+    for ci in result.scalars().all():
+        ci.status = "expired"
+        ci.escalated_at = now
+        expired_count += 1
+
+        # Get child name
+        child_result = await session.execute(select(User).where(User.id == ci.child_id))
+        child = child_result.scalar_one_or_none()
+        child_name = child.full_name if child else "Your child"
+
+        # Notify guardian: no response
+        try:
+            from app.services.push_service import send_push_to_user
+            await send_push_to_user(
+                session, ci.guardian_id,
+                "No Response",
+                f"{child_name} did not respond to your safety check within 15 minutes.",
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send expiry push: {e}")
+
+        # Broadcast checkin_expired to both guardian and child via SSE
+        try:
+            from app.services.event_broadcaster import broadcaster
+            expired_payload = {
+                "check_in_id": str(ci.id),
+                "child_id": str(ci.child_id),
+                "child_name": child_name,
+                "guardian_id": str(ci.guardian_id),
+                "status": "expired",
+                "expired_at": now.isoformat(),
+            }
+            await broadcaster.broadcast_to_user(str(ci.guardian_id), "checkin_expired", expired_payload)
+            logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_expired user={ci.guardian_id} checkin={ci.id}")
+            await broadcaster.broadcast_to_user(str(ci.child_id), "checkin_expired", expired_payload)
+            logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_expired user={ci.child_id} checkin={ci.id}")
+        except Exception as e:
+            logger.warning(f"[SSE_CHECKIN_EMIT] checkin_expired broadcast failed: {e}")
+
+    if expired_count > 0:
+        await session.commit()
+        logger.info(f"Expired {expired_count} stale check-ins and sent escalation alerts")
+
+    return expired_count

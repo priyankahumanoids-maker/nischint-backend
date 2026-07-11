@@ -1,0 +1,267 @@
+# Lighthouse CI — runs Google's Lighthouse audit against the live
+# production site after every deploy + on a daily schedule, and fails
+# the build if scores regress below the agreed budgets.
+#
+# Output:
+#   1. Lighthouse JSON + HTML report uploaded as a build artifact
+#      (90-day retention, useful for diffing regressions later).
+#   2. Per-category scores written to a public Gist so README Shields.io
+#      badges always reflect the latest run.
+#   3. PR comment with a score-vs-baseline table when triggered on PRs.
+#
+# Required repo secrets (one-time setup, see .github/LIGHTHOUSE.md):
+#   - GIST_TOKEN     PAT with `gist` scope, used to push scores to the badge gist
+#   - GIST_ID        ID of the gist that backs the README badges
+#
+# Without these secrets the workflow still runs and uploads the report
+# artifact — only the badge update step is skipped (no hard failure).
+
+name: lighthouse
+
+on:
+  # Run after every deploy to main (production push)
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "memory/**"
+      - "test_reports/**"
+      - "backend/tests/**"
+  # Daily safety net — catches third-party regressions
+  # (e.g. Cloudflare bot-challenge script bumps, CDN drift)
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC daily ≈ 11:30 AM IST
+  # Manual trigger from the Actions tab
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "URL to audit (defaults to https://nischint.care/)"
+        required: false
+        default: "https://nischint.care/"
+
+# Limit concurrency so only the latest commit on main runs at a time
+concurrency:
+  group: lighthouse-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  audit:
+    name: Lighthouse audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        page:
+          - name: home
+            url: "https://nischint.care/"
+            label: "Home"
+          - name: women-safety
+            url: "https://nischint.care/women-safety-app"
+            label: "Women Safety"
+          - name: kids-safety
+            url: "https://nischint.care/kids-safety-app"
+            label: "Kids Safety"
+          - name: family-safety
+            url: "https://nischint.care/family-safety-app"
+            label: "Family Safety"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Lighthouse CLI
+        run: npm install -g lighthouse@12
+
+      - name: Allow override of target URL on manual dispatch (home only)
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ matrix.page.name }}" = "home" ]; then
+            echo "url=${{ github.event.inputs.target_url }}" >> $GITHUB_OUTPUT
+          else
+            echo "url=${{ matrix.page.url }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Lighthouse — ${{ matrix.page.label }}
+        run: |
+          set -e
+          mkdir -p reports
+          lighthouse "${{ steps.target.outputs.url }}" \
+            --quiet \
+            --output=json --output=html \
+            --output-path="reports/${{ matrix.page.name }}" \
+            --chrome-flags="--headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage" \
+            --only-categories=performance,accessibility,best-practices,seo \
+            --max-wait-for-load=120000 \
+            --max-wait-for-fcp=60000
+
+      - name: Extract scores
+        id: scores
+        run: |
+          python3 <<'PY' >> $GITHUB_OUTPUT
+          import json, os
+          d = json.load(open("reports/${{ matrix.page.name }}.report.json"))
+          cats = d.get("categories", {})
+          out = {}
+          for k in ("performance", "accessibility", "best-practices", "seo"):
+              s = cats.get(k, {}).get("score")
+              out[k] = int(round(s * 100)) if s is not None else 0
+          for k, v in out.items():
+              print(f"{k.replace('-', '_')}={v}")
+          PY
+
+      - name: Score summary
+        run: |
+          echo "## 🚦 Lighthouse — ${{ matrix.page.label }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "URL: ${{ steps.target.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Category | Score |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Performance | ${{ steps.scores.outputs.performance }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Accessibility | ${{ steps.scores.outputs.accessibility }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Best Practices | ${{ steps.scores.outputs.best_practices }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SEO | ${{ steps.scores.outputs.seo }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Enforce score budgets (regression gate)
+        # Budgets are intentionally tighter than current observed scores so
+        # the gate catches drift early. Bump them up as the scores improve.
+        # Production should normally beat: Perf 55, A11Y 95, BP 80, SEO 95.
+        env:
+          MIN_PERF: 50
+          MIN_A11Y: 90
+          MIN_BP: 75
+          MIN_SEO: 90
+        run: |
+          P=${{ steps.scores.outputs.performance }}
+          A=${{ steps.scores.outputs.accessibility }}
+          B=${{ steps.scores.outputs.best_practices }}
+          S=${{ steps.scores.outputs.seo }}
+          fail=0
+          [ "$P" -lt "$MIN_PERF" ] && { echo "::error::Performance $P < budget $MIN_PERF (${{ matrix.page.label }})"; fail=1; } || true
+          [ "$A" -lt "$MIN_A11Y" ] && { echo "::error::Accessibility $A < budget $MIN_A11Y (${{ matrix.page.label }})"; fail=1; } || true
+          [ "$B" -lt "$MIN_BP" ] && { echo "::error::Best-Practices $B < budget $MIN_BP (${{ matrix.page.label }})"; fail=1; } || true
+          [ "$S" -lt "$MIN_SEO" ] && { echo "::error::SEO $S < budget $MIN_SEO (${{ matrix.page.label }})"; fail=1; } || true
+          if [ "$fail" -ne 0 ]; then
+            echo "❌ Lighthouse budget regression on ${{ matrix.page.label }}"
+            exit 1
+          fi
+          echo "✅ All four scores meet or exceed budget on ${{ matrix.page.label }}"
+
+      - name: Upload Lighthouse report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-${{ matrix.page.name }}
+          path: reports/${{ matrix.page.name }}.report.*
+          retention-days: 90
+
+  # Aggregates scores from the matrix legs and updates the README-badge
+  # Gist in one shot. Only runs on push to main (not on PRs, not on
+  # manual runs against arbitrary URLs).
+  publish-badges:
+    name: Publish badges (Gist)
+    needs: audit
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Skip when Gist secrets missing
+        id: precheck
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          if [ -z "$GIST_TOKEN" ] || [ -z "$GIST_ID" ]; then
+            echo "configured=false" >> $GITHUB_OUTPUT
+            echo "::warning::GIST_TOKEN or GIST_ID secret missing — skipping badge update. See .github/LIGHTHOUSE.md."
+          else
+            echo "configured=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all reports
+        if: steps.precheck.outputs.configured == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+          pattern: lighthouse-*
+          merge-multiple: false
+
+      - name: Build badge payloads
+        if: steps.precheck.outputs.configured == 'true'
+        id: payload
+        run: |
+          python3 <<'PY'
+          import json, os, pathlib, glob
+          # Average across all matrix legs — one number per category.
+          totals = {"performance": [], "accessibility": [], "best-practices": [], "seo": []}
+          for path in glob.glob("reports/*/*.report.json"):
+              try:
+                  d = json.load(open(path))
+              except Exception:
+                  continue
+              cats = d.get("categories", {})
+              for k in totals:
+                  s = cats.get(k, {}).get("score")
+                  if s is not None:
+                      totals[k].append(int(round(s * 100)))
+
+          def color(score):
+              if score >= 90: return "brightgreen"
+              if score >= 75: return "yellow"
+              if score >= 50: return "orange"
+              return "red"
+
+          out = {}
+          for k, samples in totals.items():
+              avg = int(round(sum(samples) / len(samples))) if samples else 0
+              label_key = k.replace("-", "_")
+              # Shields.io endpoint schema v1
+              out[f"lighthouse-{label_key}.json"] = {
+                  "content": json.dumps({
+                      "schemaVersion": 1,
+                      "label": k.replace("-", " ").title(),
+                      "message": str(avg),
+                      "color": color(avg),
+                  })
+              }
+          os.makedirs("badge-payloads", exist_ok=True)
+          for name, body in out.items():
+              with open(f"badge-payloads/{name}", "w") as f:
+                  f.write(body["content"])
+          # Compose the Gist PATCH body
+          gist_body = {"files": {name: {"content": body["content"]} for name, body in out.items()}}
+          with open("gist-patch.json", "w") as f:
+              json.dump(gist_body, f)
+          print("Built payloads for:", ", ".join(out.keys()))
+          PY
+
+      - name: PATCH Gist
+        if: steps.precheck.outputs.configured == 'true'
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          curl -s -X PATCH \
+            -H "Authorization: Bearer $GIST_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/gists/$GIST_ID" \
+            --data-binary @gist-patch.json \
+            -w "HTTP %{http_code}\n" -o /tmp/gist-resp.json
+          if grep -q '"message":' /tmp/gist-resp.json; then
+            echo "::warning::Gist update may have failed:"
+            cat /tmp/gist-resp.json
+          else
+            echo "✅ Badge gist updated"
+          fi

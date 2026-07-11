@@ -1,0 +1,529 @@
+"""
+NISCHINT BLE Wearable Backend — Device identity, event ingestion, and escalation layer.
+Mobile-bridged architecture: BLE stays on mobile, backend handles truth/mapping/escalation.
+
+Endpoints:
+  POST /api/wearable/register     — Register a BLE peripheral
+  POST /api/wearable/bind         — Bind device to user
+  POST /api/wearable/event        — Ingest BLE events (button press, fall, etc.)
+  POST /api/wearable/heartbeat    — Device health telemetry
+  GET  /api/wearable/devices      — List user's devices
+  GET  /api/wearable/audit        — Event audit trail
+"""
+import json as json_lib
+import logging
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+from typing import Optional
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_db_session, get_current_user
+from app.models.user import User
+from app.services.event_broadcaster import broadcaster
+from app.core.rate_limiter import limiter
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/wearable", tags=["BLE Wearable"])
+
+
+# ──────────────────────────────────────────────
+# DB SCHEMA
+# ──────────────────────────────────────────────
+
+SCHEMA_SQL = [
+    """
+    CREATE TABLE IF NOT EXISTS wearable_devices (
+        id UUID PRIMARY KEY,
+        device_uid TEXT NOT NULL UNIQUE,
+        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        device_type TEXT DEFAULT 'wearable',
+        status TEXT DEFAULT 'inactive',
+        battery_level INT,
+        last_seen_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS device_audit_log (
+        id UUID PRIMARY KEY,
+        device_id UUID REFERENCES wearable_devices(id) ON DELETE CASCADE,
+        user_id UUID,
+        event_type TEXT NOT NULL,
+        event_id TEXT,
+        payload JSONB DEFAULT '{}',
+        source TEXT DEFAULT 'wearable',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS device_health_log (
+        id UUID PRIMARY KEY,
+        device_id UUID REFERENCES wearable_devices(id) ON DELETE CASCADE,
+        battery INT,
+        rssi INT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_wd_device_uid ON wearable_devices(device_uid);",
+    "CREATE INDEX IF NOT EXISTS idx_wd_user_id ON wearable_devices(user_id);",
+    "CREATE INDEX IF NOT EXISTS idx_dal_device_id ON device_audit_log(device_id);",
+    "CREATE INDEX IF NOT EXISTS idx_dal_event_id ON device_audit_log(event_id);",
+    "CREATE INDEX IF NOT EXISTS idx_dal_event_type ON device_audit_log(event_type);",
+    "CREATE INDEX IF NOT EXISTS idx_dhl_device_id ON device_health_log(device_id);",
+]
+
+
+_schema_ready = False
+
+
+async def _ensure_schema(db: AsyncSession):
+    global _schema_ready
+    if _schema_ready:
+        return
+    for sql in SCHEMA_SQL:
+        await db.execute(text(sql))
+    await db.commit()
+    _schema_ready = True
+
+
+# ──────────────────────────────────────────────
+# EVENT NORMALIZER
+# ──────────────────────────────────────────────
+
+EVENT_MAP = {
+    "BUTTON_PRESS": "EMERGENCY",
+    "BUTTON_LONG_PRESS": "EMERGENCY",
+    "FALL_DETECTED": "SAFETY_ALERT",
+    "IMPACT_DETECTED": "SAFETY_ALERT",
+    "TAMPER_DETECTED": "TAMPER_ALERT",
+    "GEOFENCE_BREACH": "GEOFENCE_ALERT",
+    "HEARTRATE_ANOMALY": "HEALTH_ALERT",
+}
+
+
+def normalize_event(event_type: str) -> str:
+    """Map raw BLE event types to system alert categories."""
+    return EVENT_MAP.get(event_type, "DEVICE_EVENT")
+
+
+# ──────────────────────────────────────────────
+# REQUEST MODELS
+# ──────────────────────────────────────────────
+
+class DeviceRegisterRequest(BaseModel):
+    device_uid: str
+    device_type: str = "wearable"
+
+
+class DeviceBindRequest(BaseModel):
+    device_id: str
+    user_id: str
+
+
+class DeviceEventRequest(BaseModel):
+    device_id: str
+    event_type: str
+    event_id: Optional[str] = None
+    payload: Optional[dict] = None
+    client_timestamp: Optional[str] = None
+
+
+class HeartbeatRequest(BaseModel):
+    device_id: str
+    battery: Optional[int] = None
+    rssi: Optional[int] = None
+
+
+# ──────────────────────────────────────────────
+# DEVICE RESOLVER
+# ──────────────────────────────────────────────
+
+async def _resolve_device(db: AsyncSession, device_id: str) -> dict | None:
+    """Resolve device_id → user_id + guardian_ids + last known location."""
+    r = await db.execute(text("""
+        SELECT wd.id, wd.device_uid, wd.user_id, wd.device_type, wd.status,
+               u.full_name, u.email, u.role
+        FROM wearable_devices wd
+        LEFT JOIN users u ON wd.user_id = u.id
+        WHERE wd.id = :did
+    """), {"did": device_id})
+    row = r.fetchone()
+    if not row or not row.user_id:
+        return None
+
+    user_id = str(row.user_id)
+
+    # Resolve guardian IDs
+    g = await db.execute(text("""
+        SELECT guardian_id FROM relationships WHERE child_id = :uid AND status = 'accepted'
+    """), {"uid": user_id})
+    guardian_ids = [str(r2.guardian_id) for r2 in g.fetchall()]
+
+    # Last known location from guardian_sessions
+    loc = await db.execute(text("""
+        SELECT current_location FROM guardian_sessions
+        WHERE user_id = :uid AND status = 'active'
+        ORDER BY started_at DESC LIMIT 1
+    """), {"uid": user_id})
+    loc_row = loc.fetchone()
+    location = None
+    if loc_row and loc_row.current_location:
+        try:
+            import json
+            loc_data = loc_row.current_location if isinstance(loc_row.current_location, dict) else json.loads(loc_row.current_location)
+            location = {"lat": loc_data.get("lat"), "lng": loc_data.get("lng")}
+        except Exception:
+            pass
+
+    return {
+        "device_id": str(row.id),
+        "device_uid": row.device_uid,
+        "user_id": user_id,
+        "user_name": row.full_name or row.email,
+        "user_role": row.role,
+        "guardian_ids": guardian_ids,
+        "location": location,
+    }
+
+
+# ──────────────────────────────────────────────
+# AUDIT LOGGER
+# ──────────────────────────────────────────────
+
+async def _audit_log(db: AsyncSession, device_id: str, user_id: str | None,
+                     event_type: str, event_id: str | None, payload: dict | None,
+                     source: str = "wearable"):
+    await db.execute(text("""
+        INSERT INTO device_audit_log (id, device_id, user_id, event_type, event_id, payload, source, created_at)
+        VALUES (:id, :did, :uid, :etype, :eid, CAST(:payload AS jsonb), :source, :now)
+    """), {
+        "id": str(uuid.uuid4()),
+        "did": device_id,
+        "uid": user_id,
+        "etype": event_type,
+        "eid": event_id,
+        "payload": json_lib.dumps(payload or {}),
+        "source": source,
+        "now": datetime.now(timezone.utc),
+    })
+
+
+# ══════════════════════════════════════════════
+# P0 ENDPOINTS
+# ══════════════════════════════════════════════
+
+@router.post("/register")
+@limiter.limit("30/minute")
+async def register_device(
+    request: Request,
+    req: DeviceRegisterRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Register a BLE peripheral device. Returns device_id for subsequent calls."""
+    await _ensure_schema(db)
+
+    # Check if already registered
+    existing = await db.execute(
+        text("SELECT id, user_id FROM wearable_devices WHERE device_uid = :uid"),
+        {"uid": req.device_uid},
+    )
+    row = existing.fetchone()
+    if row:
+        return {
+            "status": "exists",
+            "device_id": str(row.id),
+            "linked_user": row.user_id is not None,
+        }
+
+    device_id = str(uuid.uuid4())
+    await db.execute(text("""
+        INSERT INTO wearable_devices (id, device_uid, device_type, status, created_at)
+        VALUES (:id, :uid, :dtype, 'inactive', :now)
+    """), {
+        "id": device_id,
+        "uid": req.device_uid,
+        "dtype": req.device_type,
+        "now": datetime.now(timezone.utc),
+    })
+    await db.commit()
+
+    logger.info(f"[WEARABLE_REGISTER] device_uid={req.device_uid} device_id={device_id}")
+    return {
+        "status": "registered",
+        "device_id": device_id,
+        "linked_user": False,
+    }
+
+
+@router.post("/bind")
+@limiter.limit("30/minute")
+async def bind_device(
+    request: Request,
+    req: DeviceBindRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Bind a registered device to a user. Activates the device."""
+    # Verify device exists
+    d = await db.execute(
+        text("SELECT id FROM wearable_devices WHERE id = :did"),
+        {"did": req.device_id},
+    )
+    if not d.fetchone():
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    # Verify user exists
+    u = await db.execute(
+        text("SELECT id FROM users WHERE id = :uid"),
+        {"uid": req.user_id},
+    )
+    if not u.fetchone():
+        raise HTTPException(status_code=404, detail="User not found")
+
+    await db.execute(text("""
+        UPDATE wearable_devices
+        SET user_id = :uid, status = 'active', last_seen_at = :now
+        WHERE id = :did
+    """), {
+        "uid": req.user_id,
+        "did": req.device_id,
+        "now": datetime.now(timezone.utc),
+    })
+    await db.commit()
+
+    logger.info(f"[WEARABLE_BIND] device={req.device_id} -> user={req.user_id}")
+    return {"status": "bound", "device_id": req.device_id, "user_id": req.user_id}
+
+
+@router.post("/event")
+@limiter.limit("120/minute")
+async def ingest_event(
+    request: Request,
+    req: DeviceEventRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """
+    Ingest a BLE event. Resolves device→user, normalizes event type,
+    logs audit trail, broadcasts SSE, and triggers escalation for emergencies.
+    """
+    await _ensure_schema(db)
+
+    # Idempotency: skip if event_id already processed
+    if req.event_id:
+        dup = await db.execute(
+            text("SELECT id FROM device_audit_log WHERE event_id = :eid LIMIT 1"),
+            {"eid": req.event_id},
+        )
+        if dup.fetchone():
+            return {"status": "duplicate", "event_id": req.event_id}
+
+    # Resolve device → user + guardians + location
+    context = await _resolve_device(db, req.device_id)
+    if not context:
+        raise HTTPException(status_code=404, detail="Device not found or not bound to a user")
+
+    # Normalize event
+    alert_category = normalize_event(req.event_type)
+    now = datetime.now(timezone.utc)
+
+    # Enrich payload
+    enriched = {
+        **(req.payload or {}),
+        "raw_event_type": req.event_type,
+        "alert_category": alert_category,
+        "trigger_source": "wearable",
+        "user_id": context["user_id"],
+        "user_name": context["user_name"],
+        "user_role": context["user_role"],
+        "guardian_ids": context["guardian_ids"],
+        "location": context["location"],
+        "client_timestamp": req.client_timestamp,
+        "server_timestamp": now.isoformat(),
+    }
+
+    # Audit log
+    await _audit_log(db, req.device_id, context["user_id"],
+                     req.event_type, req.event_id, enriched, "wearable")
+
+    # Update device last_seen
+    await db.execute(text("""
+        UPDATE wearable_devices SET last_seen_at = :now WHERE id = :did
+    """), {"now": now, "did": req.device_id})
+
+    await db.commit()
+
+    # SSE broadcast to guardians (non-blocking)
+    import asyncio
+    sse_event_type = f"wearable_{req.event_type.lower()}"
+    for gid in context["guardian_ids"]:
+        asyncio.create_task(broadcaster.broadcast_to_user(gid, sse_event_type, enriched))
+
+    # Trigger escalation for emergency events (non-blocking)
+    escalation_triggered = False
+    if alert_category == "EMERGENCY":
+        try:
+            from app.services.auto_escalation_engine import _trigger_escalation
+            asyncio.create_task(_trigger_escalation(
+                event_id=req.event_id or str(uuid.uuid4()),
+                user_id=context["user_id"],
+                child_name=context["user_name"] or "Unknown",
+                alert_type="wearable_emergency",
+            ))
+            escalation_triggered = True
+            logger.info(f"[WEARABLE_ESCALATION] Triggered for user={context['user_id']}")
+        except Exception as e:
+            logger.error(f"[WEARABLE_ESCALATION_FAIL] {e}")
+
+    logger.info(f"[WEARABLE_EVENT] type={req.event_type} -> {alert_category} "
+                f"user={context['user_id']} guardians={len(context['guardian_ids'])}")
+
+    return {
+        "status": "processed",
+        "event_id": req.event_id,
+        "alert_category": alert_category,
+        "user_id": context["user_id"],
+        "guardians_notified": len(context["guardian_ids"]),
+        "escalation_triggered": escalation_triggered,
+    }
+
+
+# ══════════════════════════════════════════════
+# P1 ENDPOINTS
+# ══════════════════════════════════════════════
+
+@router.post("/heartbeat")
+@limiter.limit("300/minute")
+async def device_heartbeat(
+    request: Request,
+    req: HeartbeatRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Device health telemetry — battery, signal strength, connectivity check."""
+    await _ensure_schema(db)
+
+    now = datetime.now(timezone.utc)
+
+    # Verify device
+    d = await db.execute(
+        text("SELECT id, user_id, battery_level FROM wearable_devices WHERE id = :did"),
+        {"did": req.device_id},
+    )
+    device = d.fetchone()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    # Update device status
+    await db.execute(text("""
+        UPDATE wearable_devices
+        SET last_seen_at = :now, status = 'active',
+            battery_level = COALESCE(:battery, battery_level)
+        WHERE id = :did
+    """), {"now": now, "did": req.device_id, "battery": req.battery})
+
+    # Log health data
+    await db.execute(text("""
+        INSERT INTO device_health_log (id, device_id, battery, rssi, created_at)
+        VALUES (:id, :did, :battery, :rssi, :now)
+    """), {
+        "id": str(uuid.uuid4()),
+        "did": req.device_id,
+        "battery": req.battery,
+        "rssi": req.rssi,
+        "now": now,
+    })
+
+    await db.commit()
+
+    # Low battery alert (broadcast to guardians if < 20%)
+    if req.battery is not None and req.battery < 20 and device.user_id:
+        g = await db.execute(text("""
+            SELECT guardian_id FROM relationships WHERE child_id = :uid AND status = 'accepted'
+        """), {"uid": str(device.user_id)})
+        for row in g.fetchall():
+            await broadcaster.broadcast_to_user(str(row.guardian_id), "device_low_battery", {
+                "device_id": req.device_id,
+                "battery": req.battery,
+                "user_id": str(device.user_id),
+            })
+
+    return {"status": "ok", "device_id": req.device_id}
+
+
+@router.get("/devices")
+async def list_devices(
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """List all wearable devices linked to the current user."""
+    await _ensure_schema(db)
+
+    r = await db.execute(text("""
+        SELECT id, device_uid, device_type, status, battery_level, last_seen_at, created_at
+        FROM wearable_devices WHERE user_id = :uid ORDER BY created_at DESC
+    """), {"uid": str(user.id)})
+
+    return {
+        "devices": [
+            {
+                "device_id": str(row.id),
+                "device_uid": row.device_uid,
+                "device_type": row.device_type,
+                "status": row.status,
+                "battery_level": row.battery_level,
+                "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in r.fetchall()
+        ]
+    }
+
+
+@router.get("/audit")
+async def audit_trail(
+    device_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Event audit trail — for legal proof, insurance, debugging."""
+    await _ensure_schema(db)
+
+    conditions = ["wd.user_id = :uid"]
+    params: dict = {"uid": str(user.id), "lim": limit}
+
+    if device_id:
+        conditions.append("dal.device_id = :did")
+        params["did"] = device_id
+    if event_type:
+        conditions.append("dal.event_type = :etype")
+        params["etype"] = event_type
+
+    where = " AND ".join(conditions)
+    r = await db.execute(text(f"""
+        SELECT dal.id, dal.device_id, dal.event_type, dal.event_id,
+               dal.payload, dal.source, dal.created_at
+        FROM device_audit_log dal
+        JOIN wearable_devices wd ON dal.device_id = wd.id
+        WHERE {where}
+        ORDER BY dal.created_at DESC
+        LIMIT :lim
+    """), params)
+
+    return {
+        "events": [
+            {
+                "id": str(row.id),
+                "device_id": str(row.device_id),
+                "event_type": row.event_type,
+                "event_id": row.event_id,
+                "payload": row.payload,
+                "source": row.source,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in r.fetchall()
+        ]
+    }

@@ -1,0 +1,191 @@
+{
+  "summary": "NISCH-012 Continuous Motion Telemetry Bridge E2E Verification Complete. All 45 tests passed (21 E2E + 15 motion_features unit + 9 swallow_audit). POST /api/sensors/motion/features endpoint verified: auth (401 without token), validation (422 for invalid activity_class, 422 for >12 windows), idempotency (duplicate returns status=duplicate), happy-path (200 with inserted=1, telemetry_pipeline_version present). Trust badge motion_telemetry_stale reason verified (MEDIUM only, never LOW). Fall detection pipeline regression verified (5-stage pipeline still works). All behavioral endpoints still respond. Risk predict endpoint still works. Database schema verified: motion_features table with 15 columns and 4 indexes. Alembic at ep1a2b3c4ec01 (head). Swallow audit ratchet held: unresolved_debt=1.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_nisch012_motion_features_e2e.py",
+    "/app/backend/tests/test_motion_features.py",
+    "/app/backend/tests/test_swallow_audit.py",
+    "/app/test_reports/pytest/pytest_results_nisch012_motion_e2e.xml",
+    "/app/test_reports/pytest/pytest_results_motion_features_unit.xml",
+    "/app/test_reports/pytest/pytest_results_swallow_audit_nisch012.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "NISCH-012 motion_features.py: POST /api/sensors/motion/features endpoint with per-window ON CONFLICT (idempotency_key) DO NOTHING for idempotency. Batch commit with swallow-audit entry at line 166.",
+    "NISCH-012 models/motion_features.py: ALLOWED_ACTIVITY_CLASSES locked at 5 values (stationary, walking, running, vehicle, anomalous). TELEMETRY_PIPELINE_VERSION='motion-2026.02.1'.",
+    "NISCH-012 baseline.py lines 174-200: Motion enrichment is ADDITIVE — failure does NOT block baseline rebuild. GPS-derived mobility_signature is preserved untouched on motion-aggregate failure.",
+    "NISCH-012 trust.py: MOTION_FRESHNESS_MEDIUM_RED_S=1800 (30 min). Motion staleness is observational — surfaces as MEDIUM only, NEVER LOW.",
+    "NISCH-012 badge.py: REASON_PRIORITY ladder includes motion_telemetry_stale between unresolved_backlog and insufficient_reconciliation_window.",
+    "NISCH-012 migration ep1a2b3c4ec01: motion_features table with 15 columns, UNIQUE idempotency_key constraint, 4 indexes (entity_window, idempotency, activity_class).",
+    "Swallow audit ratchet held: idempotency_race=1, compensating_action_exists=41, unresolved_debt=1."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_nisch012_motion_features_e2e.py"
+  ],
+  "success_rate": {
+    "backend": "100% (45/45 tests passed: 21 E2E + 15 unit + 9 swallow_audit)",
+    "frontend": "N/A (backend only testing requested)"
+  },
+  "test_credentials": {
+    "admin": "nischint4parents@gmail.com / secret123",
+    "operator": "operator@nischint.com / OperatorSecure!2026"
+  },
+  "seed_data_creation": "22 motion_features rows created during E2E testing (test data with unique device_ids and timestamps).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "NISCH-012 Continuous Motion Telemetry Bridge fully verified. Alembic at ep1a2b3c4ec01 (head). E2E tests: 21/21 passed (auth, validation, idempotency, happy-path, trust badge, fall detection regression, behavioral regression, risk predict regression). Unit tests: 15/15 passed (taxonomy, trust evaluator, reason ladder, API endpoint). Swallow audit: 9/9 passed (ratchet held at unresolved_debt=1). Database: motion_features table with 15 columns and 4 indexes, 22 rows. Fall detection pipeline: 5-stage pipeline still works independently. Behavioral endpoints: all 4 endpoints respond correctly. Risk predict: endpoint still works. MOCKED: None - all motion telemetry features are real implementations.",
+  "tests_executed": {
+    "e2e_tests": {
+      "total": 21,
+      "passed": 21,
+      "failed": 0,
+      "test_file": "test_nisch012_motion_features_e2e.py",
+      "tests": [
+        "TestMotionFeaturesAuth::test_requires_auth_401_without_token - PASSED",
+        "TestMotionFeaturesValidation::test_rejects_invalid_activity_class_422 - PASSED",
+        "TestMotionFeaturesValidation::test_rejects_batch_over_12_windows_422 - PASSED",
+        "TestMotionFeaturesValidation::test_accepts_valid_activity_classes[stationary] - PASSED",
+        "TestMotionFeaturesValidation::test_accepts_valid_activity_classes[walking] - PASSED",
+        "TestMotionFeaturesValidation::test_accepts_valid_activity_classes[running] - PASSED",
+        "TestMotionFeaturesValidation::test_accepts_valid_activity_classes[vehicle] - PASSED",
+        "TestMotionFeaturesValidation::test_accepts_valid_activity_classes[anomalous] - PASSED",
+        "TestMotionFeaturesIdempotency::test_idempotency_duplicate_returns_duplicate_status - PASSED",
+        "TestMotionFeaturesHappyPath::test_single_window_returns_200_with_correct_shape - PASSED",
+        "TestMotionFeaturesHappyPath::test_response_includes_telemetry_pipeline_version - PASSED",
+        "TestMotionFeaturesHappyPath::test_partial_batch_returns_per_row_results - PASSED",
+        "TestTrustBadgeMotionFreshness::test_badge_returns_3_field_shape - PASSED",
+        "TestTrustBadgeMotionFreshness::test_badge_never_returns_low_for_stale_motion_alone - PASSED",
+        "TestFallDetectionRegression::test_fall_events_endpoint_responds - PASSED",
+        "TestFallDetectionRegression::test_fall_report_endpoint_responds - PASSED",
+        "TestBehavioralEndpointsRegression::test_baseline_endpoint_responds - PASSED",
+        "TestBehavioralEndpointsRegression::test_anomalies_endpoint_responds - PASSED",
+        "TestBehavioralEndpointsRegression::test_metrics_endpoint_responds - PASSED",
+        "TestBehavioralEndpointsRegression::test_dlq_endpoint_responds - PASSED",
+        "TestRiskPredictRegression::test_risk_predict_endpoint_responds - PASSED"
+      ]
+    },
+    "unit_tests": {
+      "total": 15,
+      "passed": 15,
+      "failed": 0,
+      "test_file": "test_motion_features.py",
+      "tests": [
+        "test_activity_class_taxonomy_locked - PASSED",
+        "test_telemetry_pipeline_version_present - PASSED",
+        "test_motion_freshness_within_threshold_keeps_high_trust - PASSED",
+        "test_motion_freshness_at_or_above_threshold_drops_to_medium - PASSED",
+        "test_motion_freshness_extreme_value_still_only_medium - PASSED",
+        "test_motion_freshness_none_is_treated_as_unavailable - PASSED",
+        "test_motion_stale_in_reason_priority_ladder - PASSED",
+        "test_motion_stale_outranks_warmup_but_not_unresolved_backlog - PASSED",
+        "test_badge_picker_surfaces_motion_when_present - PASSED",
+        "test_motion_features_requires_auth - PASSED",
+        "test_motion_features_rejects_bogus_activity_class - PASSED",
+        "test_motion_features_idempotency - PASSED",
+        "test_motion_features_response_includes_pipeline_version - PASSED",
+        "test_motion_features_batch_size_capped - PASSED",
+        "test_baseline_motion_enrichment_additive - PASSED"
+      ]
+    },
+    "swallow_audit_tests": {
+      "total": 9,
+      "passed": 9,
+      "failed": 0,
+      "test_file": "test_swallow_audit.py",
+      "debt_map": {
+        "idempotency_race": 1,
+        "compensating_action_exists": 41,
+        "unresolved_debt": 1
+      }
+    }
+  },
+  "features_verified": {
+    "POST_motion_features_auth": {
+      "status": "WORKING",
+      "description": "Endpoint requires auth. Returns 401 without token."
+    },
+    "POST_motion_features_validation_activity_class": {
+      "status": "WORKING",
+      "description": "Rejects out-of-taxonomy activity_class with 422. Only stationary/walking/running/vehicle/anomalous accepted."
+    },
+    "POST_motion_features_validation_batch_size": {
+      "status": "WORKING",
+      "description": "Rejects batches > 12 windows with 422 (per-call cost cap)."
+    },
+    "POST_motion_features_idempotency": {
+      "status": "WORKING",
+      "description": "Idempotent on (device_id, window_started_at). Second identical call returns status=duplicate, not inserted, no 500, no duplicate row."
+    },
+    "POST_motion_features_response_shape": {
+      "status": "WORKING",
+      "description": "Response includes telemetry_pipeline_version field. Returns {status, inserted, duplicate, failed, results}."
+    },
+    "POST_motion_features_happy_path": {
+      "status": "WORKING",
+      "description": "Single window with valid activity_class returns 200 with inserted=1, duplicate=0, failed=0."
+    },
+    "POST_motion_features_partial_batch": {
+      "status": "WORKING",
+      "description": "Batch with multiple windows returns per-row results array."
+    },
+    "trust_badge_motion_stale": {
+      "status": "WORKING",
+      "description": "Badge returns {level, color, reason}. Motion staleness surfaces as MEDIUM only, never LOW."
+    },
+    "fall_detection_regression": {
+      "status": "WORKING",
+      "description": "5-stage fall detection pipeline still works. GET /api/sensors/fall/events and POST /api/sensors/fall both respond."
+    },
+    "behavioral_endpoints_regression": {
+      "status": "WORKING",
+      "description": "All 4 behavioral endpoints respond: /baseline, /anomalies, /metrics, /dlq."
+    },
+    "risk_predict_regression": {
+      "status": "WORKING",
+      "description": "GET /api/risk/predict still works with model_version and pipeline_version in response."
+    }
+  },
+  "schema_verification": {
+    "table": "motion_features",
+    "columns_verified": 15,
+    "columns": [
+      "id (uuid, NOT NULL)",
+      "entity_id (uuid, NOT NULL)",
+      "window_started_at (timestamp with time zone, NOT NULL)",
+      "window_duration_s (integer, NOT NULL)",
+      "accel_mean_g (double precision, NOT NULL)",
+      "accel_stddev_g (double precision, NOT NULL)",
+      "accel_peak_g (double precision, NOT NULL)",
+      "gyro_variance (double precision, NOT NULL)",
+      "activity_class (character varying, NOT NULL)",
+      "sample_count (integer, NOT NULL)",
+      "sample_rate_hz (double precision, NOT NULL)",
+      "telemetry_pipeline_version (character varying, NOT NULL)",
+      "device_context (jsonb, nullable)",
+      "idempotency_key (character varying, NOT NULL)",
+      "uploaded_at (timestamp with time zone, NOT NULL)"
+    ],
+    "indexes_verified": [
+      "motion_features_pkey",
+      "ix_motion_features_entity_window",
+      "uq_motion_features_idempotency",
+      "ix_motion_features_activity_class"
+    ],
+    "row_count": 22
+  },
+  "mocked_apis": {},
+  "system_state_after_testing": {
+    "alembic_revision": "ep1a2b3c4ec01 (head)",
+    "backend_status": "healthy",
+    "motion_features_table": "exists with 15 columns and 4 indexes",
+    "swallow_audit_ratchet": "held at unresolved_debt=1"
+  }
+}

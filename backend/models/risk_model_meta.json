@@ -1,0 +1,19 @@
+{
+  "version": "v20260313.1311",
+  "trained_at": "2026-03-13T13:11:36.492331+00:00",
+  "training_rows": 3985,
+  "positive_samples": 1108,
+  "negative_samples": 2877,
+  "feature_importances": {
+    "hour_of_day": 0.1924,
+    "day_of_week": 0.1888,
+    "location_lat": 0.2081,
+    "location_lng": 0.1575,
+    "area_risk_score": 0.0359,
+    "movement_speed": 0.0,
+    "time_since_last_incident": 0.2172,
+    "anomaly_count": 0.0,
+    "zone_type_encoded": 0.0
+  },
+  "model_type": "XGBClassifier"
+}

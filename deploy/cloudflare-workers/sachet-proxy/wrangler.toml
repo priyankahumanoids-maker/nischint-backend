@@ -1,0 +1,23 @@
+name = "sachet-proxy"
+main = "src/index.js"
+# Workers runtime — see https://developers.cloudflare.com/workers/configuration/compatibility-dates/
+compatibility_date = "2026-01-15"
+# `nodejs_compat_v2` not required — we use only the Fetch API.
+workers_dev = true
+
+# REL-07 — colo placement notes:
+#
+# Cloudflare auto-routes requests to the nearest healthy colo to the
+# requester. Our backend runs in us-east-1, but Cloudflare's edge
+# network places this Worker near the *upstream* (Mumbai / Chennai
+# / Hyderabad) when the request is made from Indian eyeballs. For
+# our backend-initiated requests the routing is less deterministic;
+# however, since CF Workers run at every colo, the egress to NDMA
+# always originates from an Indian CF datacenter, which sidesteps
+# the country-of-origin allow-list at NDMA.
+#
+# If we ever need to pin a region (e.g. NDMA tightens the list to
+# specific AS numbers), set `placement.mode = "smart"` here.
+
+# Logs are tail-able with `npx wrangler tail sachet-proxy`.
+# No KV/D1/R2 bindings — the Worker is stateless.

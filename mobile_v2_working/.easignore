@@ -1,0 +1,13 @@
+notepad .easignore
+```
+
+Paste this and save:
+```
+node_modules
+tempfix
+dist
+.expo
+android/build
+android/app/build
+.gradle
+*.log

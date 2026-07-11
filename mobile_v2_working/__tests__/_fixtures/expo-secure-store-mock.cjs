@@ -1,0 +1,1 @@
+module.exports = { getItemAsync: async () => null, setItemAsync: async () => undefined, deleteItemAsync: async () => undefined };

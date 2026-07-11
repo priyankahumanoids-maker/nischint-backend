@@ -1,0 +1,22 @@
+Error: EPERM: operation not permitted, open 'D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\.expo\types\router.d.ts'
+    at Object.writeFileSync (node:fs:2422:20)
+    at D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\expo\node_modules\@expo\cli\node_modules\@expo\router-server\src\typed-routes\index.ts:88:10
+    at Timeout._onTimeout (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\expo\node_modules\@expo\cli\node_modules\@expo\router-server\src\typed-routes\index.ts:107:7)
+    at listOnTimeout (node:internal/timers:605:17)
+    at processTimers (node:internal/timers:541:7) {
+  errno: -4048,
+  code: 'EPERM',
+  syscall: 'open',
+  path: 'D:\\Nischint Mobile\\nischinthealth-escalate-main\\mobile_v2_working\\.expo\\types\\router.d.ts'
+}
+Error: EPERM: operation not permitted, open 'D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\.expo\types\router.d.ts'
+    at Object.writeFileSync (node:fs:2422:20)
+    at D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\expo\node_modules\@expo\cli\node_modules\@expo\router-server\src\typed-routes\index.ts:88:10
+    at Timeout._onTimeout (D:\Nischint Mobile\nischinthealth-escalate-main\mobile_v2_working\node_modules\expo\node_modules\@expo\cli\node_modules\@expo\router-server\src\typed-routes\index.ts:107:7)
+    at listOnTimeout (node:internal/timers:605:17)
+    at processTimers (node:internal/timers:541:7) {
+  errno: -4048,
+  code: 'EPERM',
+  syscall: 'open',
+  path: 'D:\\Nischint Mobile\\nischinthealth-escalate-main\\mobile_v2_working\\.expo\\types\\router.d.ts'
+}

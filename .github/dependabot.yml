@@ -1,0 +1,219 @@
+# Dependabot configuration
+#
+# Opens grouped weekly PRs for backend (pip), web frontend (npm/yarn),
+# mobile (npm/yarn), and the GitHub Actions workflows themselves.
+#
+# Each PR is reviewed by metavp369 before merge, and is automatically
+# gated by the existing quality workflows once it's open or merged:
+#
+#   • backend PRs touch `backend/requirements.txt` → pip-audit.yml
+#     runs on the PR itself (catches new CVEs before merge).
+#   • web frontend PRs are merged to main → lighthouse.yml runs
+#     on the post-merge production deploy and fails the build on
+#     score regression.
+#   • mobile dep PRs do not have a CI gate yet (no Expo build
+#     workflow in repo) — review manually before merging.
+#
+# We deliberately set `open-pull-requests-limit: 5` per ecosystem so
+# Dependabot can't drown the inbox in 30 PRs on a quiet week.
+#
+# Grouping rules per ecosystem:
+#   • `runtime` — production deps; one PR per ecosystem per week.
+#   • `dev` — testing/linting/build tooling; one PR per ecosystem.
+#   • Security updates always open their own PR (the `security` group)
+#     so they jump the queue and aren't held up by a stale runtime
+#     PR review.
+
+version: 2
+
+updates:
+  # ── Backend (Python) ──────────────────────────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "metavp369"
+    assignees:
+      - "metavp369"
+    labels:
+      - "dependencies"
+      - "backend"
+    commit-message:
+      prefix: "deps(backend)"
+      include: "scope"
+    groups:
+      backend-runtime:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "pytest*"
+          - "ruff"
+          - "black"
+          - "mypy"
+          - "pip-audit"
+          - "pre-commit"
+          - "locust"
+          - "schemathesis"
+      backend-dev:
+        applies-to: version-updates
+        patterns:
+          - "pytest*"
+          - "ruff"
+          - "black"
+          - "mypy"
+          - "pip-audit"
+          - "pre-commit"
+          - "locust"
+          - "schemathesis"
+      backend-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── Web frontend (npm/yarn) ───────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "metavp369"
+    assignees:
+      - "metavp369"
+    labels:
+      - "dependencies"
+      - "frontend"
+    commit-message:
+      prefix: "deps(frontend)"
+      include: "scope"
+    # Ignore React + react-router majors — they ship breaking changes
+    # that need a manual migration plan, not a Dependabot PR.
+    ignore:
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-router-dom"
+        update-types: ["version-update:semver-major"]
+    groups:
+      frontend-runtime:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "@testing-library/*"
+          - "eslint*"
+          - "prettier"
+          - "@types/*"
+          - "jest*"
+          - "vitest*"
+      frontend-dev:
+        applies-to: version-updates
+        patterns:
+          - "@testing-library/*"
+          - "eslint*"
+          - "prettier"
+          - "@types/*"
+          - "jest*"
+          - "vitest*"
+      frontend-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── Mobile (Expo / RN) ────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/mobile"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 4
+    reviewers:
+      - "metavp369"
+    assignees:
+      - "metavp369"
+    labels:
+      - "dependencies"
+      - "mobile"
+    commit-message:
+      prefix: "deps(mobile)"
+      include: "scope"
+    # Expo SDK and React Native are tightly coupled — only the user
+    # decides when to migrate. Block majors on the whole Expo / RN
+    # graph so Dependabot doesn't ship a runtime-incompatible PR.
+    ignore:
+      - dependency-name: "expo"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "expo-*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-native"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "react-native-*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+    groups:
+      mobile-runtime:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "@types/*"
+          - "eslint*"
+          - "jest*"
+          - "@testing-library/*"
+      mobile-dev:
+        applies-to: version-updates
+        patterns:
+          - "@types/*"
+          - "eslint*"
+          - "jest*"
+          - "@testing-library/*"
+      mobile-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── GitHub Actions workflows ──────────────────────────────────────
+  # Keeps `actions/checkout`, `actions/setup-*`, etc. on a current
+  # major. Bumps are nearly always safe (Actions team is meticulous
+  # about backward compatibility) and the cost of staying stale is
+  # security drift in CI itself.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 3
+    reviewers:
+      - "metavp369"
+    assignees:
+      - "metavp369"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "deps(ci)"
+      include: "scope"
+    groups:
+      ci-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      ci-actions-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
