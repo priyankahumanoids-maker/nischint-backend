@@ -1,0 +1,24 @@
+# Pre-commit configuration — Nischint platform
+#
+# Install hooks once per clone:
+#     pip install pre-commit && pre-commit install
+#
+# Run manually:
+#     pre-commit run --all-files
+#
+# 2026-05-30 — initial wiring of pip-audit gate. Designed to be minimal:
+# slow / heavy checks run in CI; local commits stay fast.
+repos:
+  - repo: local
+    hooks:
+      # ── pip-audit gate ─────────────────────────────────────────
+      # Fires only when backend/requirements.txt changes (so day-to-day
+      # commits stay fast). Blocks the commit if any new vulnerability
+      # is detected outside the project allowlist.
+      - id: pip-audit-gate
+        name: pip-audit-gate (requirements.txt changed)
+        entry: bash backend/scripts/pip_audit_check.sh
+        language: system
+        pass_filenames: false
+        files: ^backend/requirements\.txt$
+        stages: [pre-commit]

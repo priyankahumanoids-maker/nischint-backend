@@ -1,0 +1,174 @@
+{
+  "summary": "NISCH-011 Behavioral Baseline + Digital Twin (Phase 1) Backend Verification Complete. All 35 unit tests pass (test_behavioral_twin.py) + all 9 swallow audit tests pass (test_swallow_audit.py). Migration eo1a2b3c4eb01 applied. behavioral_baselines table verified with 15 columns, behavioral_anomalies table verified with 14 columns. All 5 required indexes verified. Scheduler running with 25 jobs including behavioral_baseline_prewarm (1h cadence ± 90s). All 4 API endpoints verified. Alert-pipeline integration confirmed non-blocking (assess_and_record wrapped in try/except, does NOT propagate exceptions). Debt map: idempotency_race=1, compensating_action_exists=40 (+2 NISCH-011), unresolved_debt=1 (ratchet held).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_behavioral_twin.py",
+    "/app/backend/tests/test_swallow_audit.py",
+    "/app/test_reports/pytest/pytest_results_behavioral_twin.xml",
+    "/app/test_reports/pytest/pytest_results_swallow_audit.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "NISCH-011 migration eo1a2b3c4eb01: Creates behavioral_baselines (15 cols) and behavioral_anomalies (14 cols) tables. Anomaly ledger is APPEND-ONLY except for reconciler-patched columns.",
+    "NISCH-011 taxonomy.py: DeviationClass enum is EXACTLY 5 values (baseline, drift, irregular, elevated_behavioral_risk, critical_behavioral_shift). classify_from_z thresholds locked at 1.5/2.0/2.5/3.5.",
+    "NISCH-011 divergence.py: compute_divergence() DAMPENS only, never amplifies. Floor at 0.2 even at maximum disagreement.",
+    "NISCH-011 fusion.py: Multiplicative fusion (behavioral_anomaly × zone_risk × temporal_context × sensor_confidence × divergence_weight). DISPATCH_INFLUENCE_ZONE_RISK_THRESHOLD=0.6 locked.",
+    "NISCH-011 detector.py: write_anomaly() has NO `id` parameter (INSERT-only, locked by test). On DB failure, falls back to dlq:ml_predictions ring buffer.",
+    "NISCH-011 dlq.py: DLQ_KEY='dlq:ml_predictions', LEDGER_MAX_ENTRIES=10000. append_anomaly_ledger() NEVER raises.",
+    "NISCH-011 temporal.py: 5/30-min windows write to Redis sorted-sets ONLY, NEVER to Postgres. 6/24h windows derived live from Postgres.",
+    "NISCH-011 prewarmer.py: BehavioralBaselinePrewarmer with scheduler_job_id='behavioral_baseline_prewarm', jitter_base_s=3600 (1h), jitter_range_s=90.",
+    "NISCH-011 safety_incident_engine.py lines 169-222: Behavioral assess_and_record wrapped in try/except, non-blocking guarantee confirmed. Only critical_behavioral_shift WITH zone_risk≥0.6 influences dispatch.",
+    "NISCH-011 swallow_audit.py: Two new entries added for detector.py:209 and baseline.py:204 with category=compensating_action_exists. Debt map: idempotency_race=1, compensating_action_exists=40, unresolved_debt=1."
+  ],
+  "updated_files": [],
+  "success_rate": {
+    "backend": "100% (44/44 tests passed: 35 behavioral_twin + 9 swallow_audit, all API endpoints verified)",
+    "frontend": "N/A (backend only testing requested)"
+  },
+  "test_credentials": {
+    "admin": "nischint4parents@gmail.com / secret123",
+    "operator": "operator@nischint.com / OperatorSecure!2026"
+  },
+  "seed_data_creation": "No new seed data created. Tests used mocked sessions and existing test infrastructure.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "NISCH-011 fully verified. Alembic at eo1a2b3c4eb01 (head). Unit tests: 44/44 passed (test_behavioral_twin 35, test_swallow_audit 9). API tests: all 4 endpoints verified via curl. Scheduler: 25 jobs running including behavioral_baseline_prewarm (1h). Database: behavioral_baselines (15 cols) and behavioral_anomalies (14 cols) tables with 5 indexes verified. Alert-pipeline integration: assess_and_record non-blocking confirmed. MOCKED: None - all behavioral features are real implementations. Cold-start behavior is correct (returns status='cold_start' when no baseline exists).",
+  "tests_executed": {
+    "unit_tests": {
+      "total": 44,
+      "passed": 44,
+      "failed": 0,
+      "test_files": [
+        "test_behavioral_twin.py (35 tests) - PASSED",
+        "test_swallow_audit.py (9 tests) - PASSED"
+      ]
+    },
+    "api_tests": {
+      "total": 6,
+      "passed": 6,
+      "failed": 0,
+      "tests": [
+        "GET /api/behavioral/baseline/{random_uuid} - 200 cold_start shape with baseline_version='behavioral-baseline-2026.02.1'",
+        "GET /api/behavioral/baseline/not-a-uuid - 400 invalid entity_id UUID",
+        "GET /api/behavioral/anomalies/{random_uuid} - 200 with count=0, items=[], anomaly_pipeline_version='behavioral-anomaly-2026.02.1'",
+        "GET /api/behavioral/anomalies/not-a-uuid - 400 invalid entity_id UUID",
+        "GET /api/behavioral/metrics - 200 with warmup-gated shape (mae=null, critical_precision=null, required_for_chip=168)",
+        "GET /api/behavioral/dlq - 200 with depth=0, items=[]"
+      ]
+    },
+    "schema_verification": {
+      "behavioral_baselines": {
+        "columns_verified": 15,
+        "columns": [
+          "id (uuid)", "entity_id (uuid)", "zone_affinity (jsonb)", "route_entropy (double precision)",
+          "dwell_duration (jsonb)", "temporal_signature (jsonb)", "mobility_signature (jsonb)",
+          "ambient_profile (jsonb)", "interaction_cadence (jsonb)", "risk_exposure_averages (jsonb)",
+          "rolling_deviation_thresholds (jsonb)", "baseline_version (character varying)",
+          "sample_count (integer)", "computed_at (timestamp with time zone)", "updated_at (timestamp with time zone)"
+        ],
+        "indexes": ["behavioral_baselines_pkey", "ix_behavioral_baselines_entity (unique)"]
+      },
+      "behavioral_anomalies": {
+        "columns_verified": 14,
+        "columns": [
+          "id (uuid)", "entity_id (uuid)", "anomaly_type (character varying)", "anomaly_score (double precision)",
+          "deviation_class (character varying)", "contributing_features (jsonb)", "linked_prediction_id (uuid)",
+          "fused_zone_risk (double precision)", "confidence (double precision)", "explanation_snapshot (jsonb)",
+          "anomaly_pipeline_version (character varying)", "reconciliation_status (character varying)",
+          "created_at (timestamp with time zone)", "reconciled_at (timestamp with time zone)"
+        ],
+        "indexes": [
+          "behavioral_anomalies_pkey",
+          "ix_behavioral_anomalies_entity_created",
+          "ix_behavioral_anomalies_class",
+          "ix_behavioral_anomalies_linked_prediction (partial)",
+          "ix_behavioral_anomalies_pending (partial)"
+        ]
+      }
+    },
+    "scheduler_verification": {
+      "total_schedulers": 25,
+      "nisch011_schedulers": [
+        "behavioral_baseline_prewarm (1h cadence, jitter_range_s=90)"
+      ],
+      "boot_log_verified": true,
+      "boot_log_message": "Scheduler runner online. role=scheduler started=25: ...behavioral_baseline_prewarm"
+    },
+    "invariants_verified": {
+      "taxonomy_5_values": true,
+      "divergence_dampens_only": true,
+      "divergence_floor_0_2": true,
+      "dispatch_influence_threshold_0_6": true,
+      "dlq_max_entries_10000": true,
+      "write_anomaly_no_id_param": true,
+      "temporal_redis_only_5_30_min": true,
+      "alert_pipeline_non_blocking": true
+    }
+  },
+  "features_verified": {
+    "NISCH-011_migration": {
+      "status": "WORKING",
+      "description": "Migration eo1a2b3c4eb01 applied. behavioral_baselines (15 cols) and behavioral_anomalies (14 cols) tables created with all required indexes."
+    },
+    "NISCH-011_taxonomy": {
+      "status": "WORKING",
+      "description": "DeviationClass enum is EXACTLY 5 values. classify_from_z thresholds locked. severity_rank ordering verified."
+    },
+    "NISCH-011_divergence_engine": {
+      "status": "WORKING",
+      "description": "compute_divergence() DAMPENS only, never amplifies. Floor at 0.2. <2 votes returns weight=1.0."
+    },
+    "NISCH-011_fusion_engine": {
+      "status": "WORKING",
+      "description": "Multiplicative fusion verified. Divergence only dampens. Dispatch influence gate: only critical_behavioral_shift WITH zone_risk≥0.6."
+    },
+    "NISCH-011_baseline_learner": {
+      "status": "WORKING",
+      "description": "build_baseline_features pure-function verified. Shannon entropy edge cases tested."
+    },
+    "NISCH-011_anomaly_detector": {
+      "status": "WORKING",
+      "description": "score_anomaly handles zero-stdev baseline. write_anomaly INSERT-only (no id param). DB failure falls back to DLQ."
+    },
+    "NISCH-011_dlq": {
+      "status": "WORKING",
+      "description": "DLQ_KEY='dlq:ml_predictions', LEDGER_MAX_ENTRIES=10000. append_anomaly_ledger NEVER raises."
+    },
+    "NISCH-011_temporal_memory": {
+      "status": "WORKING",
+      "description": "5/30-min windows write to Redis sorted-sets ONLY. read_window rejects unknown window sizes."
+    },
+    "NISCH-011_prewarmer": {
+      "status": "WORKING",
+      "description": "BehavioralBaselinePrewarmer with 1h cadence, 2.0s fetch budget. fetch() returns None on DB error."
+    },
+    "NISCH-011_api_endpoints": {
+      "status": "WORKING",
+      "description": "All 4 endpoints verified: /baseline (200 cold_start), /anomalies (200 empty), /metrics (200 warmup-gated), /dlq (200 depth+items)."
+    },
+    "NISCH-011_alert_pipeline_integration": {
+      "status": "WORKING",
+      "description": "assess_and_record in safety_incident_engine.py wrapped in try/except. Non-blocking guarantee confirmed."
+    },
+    "NISCH-011_swallow_audit": {
+      "status": "WORKING",
+      "description": "Two new entries added to allowlist. Debt map: idempotency_race=1, compensating_action_exists=40, unresolved_debt=1 (ratchet held)."
+    }
+  },
+  "mocked_apis": {},
+  "system_state_after_testing": {
+    "alembic_revision": "eo1a2b3c4eb01 (head)",
+    "backend_status": "healthy",
+    "scheduler_status": "running (25 jobs)",
+    "behavioral_baselines_table": "exists with 15 columns and 2 indexes",
+    "behavioral_anomalies_table": "exists with 14 columns and 5 indexes"
+  }
+}

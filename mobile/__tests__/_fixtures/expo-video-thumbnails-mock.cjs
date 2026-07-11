@@ -1,0 +1,1 @@
+module.exports = { getThumbnailAsync: async () => ({ uri: 'mock://thumb.jpg' }) };

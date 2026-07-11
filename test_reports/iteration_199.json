@@ -1,0 +1,156 @@
+{
+  "summary": "SF-01 v2 Days 1+2+3 (P0 critical path) validation complete. All 57 tests passed. Day 1: Voice weight locked at 0.30 (verified). Day 2: POST /api/signals/motion live-stream endpoint fully tested (auth, happy-path, impersonation, response shape). Day 3: Phase 3 env hazard multiplier (×1.30) verified, GET /api/env/hazards endpoint tested (auth, validation, state resolution), Sachet STATE_BBOX extended to 13 entries (8 original + 5 Himalayan), ALERT_THRESHOLD=0.65 verified, weather red-flag thresholds locked. Swallow audit ratchet held: unresolved_debt=1.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_sf01_v2_days123.py",
+    "/app/test_reports/pytest/pytest_results_sf01_v2_days123.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "signals_motion.py: POST /api/signals/motion correctly implements auth, impersonation (admin/operator can push for arbitrary user_id), non-blocking Redis cache (compensating action on failure), and returns all required fields (composite, risk_level, primary_event, signal_weights, env_hazard_match, alert_fired, pre_mult_score).",
+    "env_hazards.py: GET /api/env/hazards correctly validates lat/lng bounds (422 for out-of-range), requires auth, and returns state resolution from Sachet STATE_BBOX.",
+    "env_hazard_matcher.py: ENV_HAZARD_MULTIPLIER=1.30 locked, WEATHER_RED_FLAG_* thresholds locked (wind≥60, rain≥50, temp≥45 or ≤2), match_env_hazards handles null lat/lng defensively.",
+    "safety_brain_service.py: WEIGHTS voice=0.30 locked with rationale comment, ALERT_THRESHOLD=0.65 introduced, ENV_HAZARD_MULTIPLIER=1.30 locked equal to env_hazard_matcher, evaluate_risk returns new keys (env_hazard_match, env_multiplier, env_hazards, env_strongest, pre_mult_score, alert_fired).",
+    "sachet_provider.py: STATE_BBOX extended to 13 entries (8 original + 5 Himalayan: Uttarakhand, Himachal Pradesh, Jammu & Kashmir, Sikkim, Arunachal Pradesh). resolve_state correctly maps Himalayan cities.",
+    "Swallow audit ratchet held: idempotency_race=1, compensating_action_exists=41, unresolved_debt=1."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_sf01_v2_days123.py"
+  ],
+  "success_rate": {
+    "backend": "100% (57/57 tests passed + 47 regression tests passed)"
+  },
+  "test_credentials": {
+    "admin": "nischint4parents@gmail.com / secret123",
+    "operator": "operator@nischint.com / OperatorSecure!2026"
+  },
+  "seed_data_creation": "None - tests use existing seeded users",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "SF-01 v2 Days 1+2+3 fully verified. All new endpoints (POST /api/signals/motion, GET /api/env/hazards) working. Constants locked: WEIGHTS voice=0.30, ALERT_THRESHOLD=0.65, ENV_HAZARD_MULTIPLIER=1.30, WEATHER_RED_FLAG_* thresholds. Sachet STATE_BBOX has 13 entries. Swallow audit ratchet held at unresolved_debt=1. Regression tests for NISCH-012 (motion features) and NISCH-013 (command center motion_telemetry) pass. MOCKED: None - all features are real implementations.",
+  "tests_executed": {
+    "sf01_v2_days123_tests": {
+      "total": 57,
+      "passed": 57,
+      "failed": 0,
+      "test_file": "test_sf01_v2_days123.py",
+      "categories": {
+        "Day1_VoiceWeightLocked": 6,
+        "Day2_SignalsMotionAuth": 2,
+        "Day2_SignalsMotionHappyPath": 8,
+        "Day2_SignalsMotionImpersonation": 2,
+        "Day3_EnvHazardsAuth": 1,
+        "Day3_EnvHazardsValidation": 4,
+        "Day3_EnvHazardsStateResolution": 4,
+        "Day3_SachetStateBbox": 3,
+        "Day3_SachetResolveStateHimalayanCities": 3,
+        "Day3_Constants": 4,
+        "Day3_WeatherRedFlagThresholds": 4,
+        "Day3_MatchEnvHazardsNullHandling": 3,
+        "Day3_WeatherRedFlagMatching": 6,
+        "Regression_MotionFeatures": 2,
+        "Regression_CommandCenter": 1,
+        "Regression_TrustBadge": 2,
+        "SwallowAuditRatchet": 2
+      }
+    },
+    "regression_tests": {
+      "swallow_audit": {
+        "total": 9,
+        "passed": 9,
+        "debt_map": {
+          "idempotency_race": 1,
+          "compensating_action_exists": 41,
+          "unresolved_debt": 1
+        }
+      },
+      "sachet_provider": {
+        "total": 38,
+        "passed": 38
+      }
+    }
+  },
+  "features_verified": {
+    "POST_signals_motion_auth": {
+      "status": "WORKING",
+      "description": "Returns 401/403 without valid token"
+    },
+    "POST_signals_motion_happy_path": {
+      "status": "WORKING",
+      "description": "fall=0.9, voice_distress=0.65, lat=30.07, lng=79.02 returns 200 with composite, risk_level, primary_event, signal_weights, env_hazard_match, alert_fired, pre_mult_score"
+    },
+    "POST_signals_motion_impersonation": {
+      "status": "WORKING",
+      "description": "Admin/operator can push for arbitrary user_id; regular user coerced to current_user.id"
+    },
+    "GET_env_hazards_auth": {
+      "status": "WORKING",
+      "description": "Returns 401/403 without valid token"
+    },
+    "GET_env_hazards_validation": {
+      "status": "WORKING",
+      "description": "Rejects out-of-range lat/lng (>90 or >180) with 422"
+    },
+    "GET_env_hazards_state_resolution": {
+      "status": "WORKING",
+      "description": "lat=30.07, lng=79.02 → state='Uttarakhand' (new Himalayan bbox)"
+    },
+    "Sachet_STATE_BBOX_13_entries": {
+      "status": "WORKING",
+      "description": "8 original + 5 Himalayan states (Uttarakhand, Himachal Pradesh, Jammu & Kashmir, Sikkim, Arunachal Pradesh)"
+    },
+    "resolve_state_himalayan_cities": {
+      "status": "WORKING",
+      "description": "Dehradun→Uttarakhand, Shimla→Himachal Pradesh, Gangtok→Sikkim"
+    },
+    "ALERT_THRESHOLD_065": {
+      "status": "WORKING",
+      "description": "ALERT_THRESHOLD constant = 0.65 in safety_brain_service"
+    },
+    "ENV_HAZARD_MULTIPLIER_130": {
+      "status": "WORKING",
+      "description": "ENV_HAZARD_MULTIPLIER = 1.30 in both safety_brain_service and env_hazard_matcher (locked equal)"
+    },
+    "WEIGHTS_voice_030": {
+      "status": "WORKING",
+      "description": "WEIGHTS['voice'] = 0.30 (not 0.25). Comment in code documents rationale."
+    },
+    "WEATHER_RED_FLAG_thresholds": {
+      "status": "WORKING",
+      "description": "wind≥60 km/h, rain≥50mm/3h, temp≥45°C or ≤2°C"
+    },
+    "match_env_hazards_null_handling": {
+      "status": "WORKING",
+      "description": "match_env_hazards(lat=None, lng=None) returns {matched: false, multiplier: 1.0}"
+    },
+    "swallow_audit_ratchet": {
+      "status": "WORKING",
+      "description": "unresolved_debt == 1, compensating_action_exists ≥ 41"
+    },
+    "POST_motion_features_regression": {
+      "status": "WORKING",
+      "description": "NISCH-012 batched ledger still works (auth, validation, idempotency)"
+    },
+    "GET_command_center_regression": {
+      "status": "WORKING",
+      "description": "NISCH-013 unified envelope includes motion_telemetry slot"
+    },
+    "GET_trust_badge_regression": {
+      "status": "WORKING",
+      "description": "Trust badge endpoint still works"
+    }
+  },
+  "mocked_apis": {},
+  "system_state_after_testing": {
+    "backend_status": "healthy",
+    "swallow_audit_ratchet": "held at unresolved_debt=1"
+  }
+}

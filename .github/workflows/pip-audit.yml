@@ -1,0 +1,54 @@
+# pip-audit CI gate — fails the PR if any new vulnerability lands
+# outside the project allowlist (backend/pip-audit-allowlist.txt).
+#
+# Belt-and-braces with the pre-commit hook: catches PRs where the dev
+# forgot to install pre-commit locally, and ensures the gate is
+# enforced on every push to main + every PR.
+
+name: pip-audit gate
+
+on:
+  pull_request:
+    paths:
+      - "backend/requirements.txt"
+      - "backend/pip-audit-allowlist.txt"
+      - "backend/scripts/pip_audit_check.sh"
+      - ".github/workflows/pip-audit.yml"
+  push:
+    branches: [main]
+    paths:
+      - "backend/requirements.txt"
+      - "backend/pip-audit-allowlist.txt"
+      - "backend/scripts/pip_audit_check.sh"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "backend/requirements.txt"
+
+      - name: Install runtime dependencies
+        # We install the actual runtime deps so pip-audit scans the
+        # real installed graph — same view the production container
+        # has. --no-deps + selective installs would miss transitives.
+        # The `|| true` swallows the pre-existing emergentintegrations
+        # /openai resolver warning (resolver chooses a working set; the
+        # warning is informational, not a hard failure).
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || pip install -r requirements.txt --no-deps
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run pip-audit gate
+        run: bash backend/scripts/pip_audit_check.sh

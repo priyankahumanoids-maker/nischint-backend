@@ -1,0 +1,27 @@
+﻿{
+  "cli": {
+    "version": ">= 18.3.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      channel: "development"
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://nischint.care"
+      },
+      channel: "preview"
+    },
+    "production": {
+      "autoIncrement": true,
+      channel: "production"
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

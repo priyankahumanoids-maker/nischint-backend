@@ -1,0 +1,172 @@
+{
+  "expo": {
+    "name": "NISCHINT",
+    "slug": "nischint",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#061525"
+    },
+    "scheme": "nischint",
+    "userInterfaceStyle": "dark",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/121039d4-1813-4bf7-b154-22d7664058d6",
+      "enabled": false,
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 3000
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.nischint.app",
+      "config": {
+        "googleMapsApiKey": "AIzaSyDkg3hvwGXCFsjxz_Rx4XAAvuwDyyhBsXg"
+      },
+      "entitlements": {
+        "com.apple.developer.healthkit": true,
+        "com.apple.developer.healthkit.access": []
+      },
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "NISCHINT needs your location to provide real-time safety monitoring.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "NISCHINT needs background location access for continuous safety monitoring during journeys.",
+        "NSMicrophoneUsageDescription": "NISCHINT streams audio to your guardians during emergencies so they can hear you in real time.",
+        "NSHealthShareUsageDescription": "NISCHINT reads your heart rate, blood oxygen, and step count from Apple Health to detect emergencies — a sudden drop in heart rate or oxygen, or a fall — and alert your chosen guardian. We never sell or share this data with advertisers; you can revoke access in iOS Settings → Privacy → Health at any time.",
+        "NSHealthUpdateUsageDescription": "NISCHINT does not write to Apple Health. This entitlement is requested only to satisfy iOS review requirements for apps that integrate HealthKit; no health data leaves Apple Health unless you explicitly grant read access in the previous step.",
+        "UIBackgroundModes": [
+          "location",
+          "fetch",
+          "remote-notification",
+          "audio",
+          "location",
+          "fetch",
+          "remote-notification",
+          "audio"
+        ],
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "bitcode": false
+    },
+    "android": {
+      "minSdkVersion": 26,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "splash": {
+        "image": "./assets/splash-icon.png",
+        "resizeMode": "contain",
+        "backgroundColor": "#061525"
+      },
+      "config": {
+        "googleMaps": {
+          "apiKey": "AIzaSyDkg3hvwGXCFsjxz_Rx4XAAvuwDyyhBsXg"
+        }
+      },
+      "package": "com.nischint.app",
+      "googleServicesFile": "./google-services.json",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_ADVERTISE",
+        "android.permission.ACCESS_NOTIFICATION_POLICY",
+        "android.permission.USE_FULL_SCREEN_INTENT",
+        "android.permission.WAKE_LOCK",
+        "android.permission.SCHEDULE_EXACT_ALARM",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.health.READ_HEART_RATE",
+        "android.permission.health.READ_OXYGEN_SATURATION",
+        "android.permission.health.READ_STEPS",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.CAMERA",
+        "android.permission.INTERNET",
+        "android.permission.SYSTEM_ALERT_WINDOW"
+      ]
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static",
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26
+          }
+        }
+      ],
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "NISCHINT needs your location for continuous safety monitoring.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#0EA5E9",
+          "sounds": [
+            "./assets/sounds/siren_loop.wav"
+          ]
+        }
+      ],
+      "expo-task-manager",
+      "expo-web-browser",
+      [
+        "expo-audio",
+        {
+          "enableBackgroundRecording": true
+        }
+      ],
+      "expo-asset",
+      [
+        "@config-plugins/react-native-webrtc",
+        {
+          "cameraPermission": "Allow NISCHINT to access your camera during emergencies (for video streams in a future release)",
+          "microphonePermission": "Allow NISCHINT to access your microphone so guardians can hear you during emergencies"
+        }
+      ],
+      "react-native-health-connect",
+      "./plugins/with-health-connect-extra",
+      "@kingstinct/react-native-healthkit"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "121039d4-1813-4bf7-b154-22d7664058d6"
+      }
+    },
+    "owner": "metavp369"
+  }
+}

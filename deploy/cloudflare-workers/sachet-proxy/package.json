@@ -1,0 +1,15 @@
+{
+  "name": "sachet-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "REL-07 — Cloudflare Worker proxy fronting sachet.ndma.gov.in from a Mumbai colo",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail sachet-proxy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}

@@ -1,0 +1,78 @@
+# pip-audit allowlist — known + accepted vulnerabilities
+#
+# Format: one vuln ID per line; lines starting with `#` are comments.
+# Used by scripts/pip_audit_check.sh — IDs listed here are passed to
+# pip-audit via `--ignore-vuln`. Every entry MUST include rationale +
+# tracking action below. ANY NEW VULN NOT IN THIS FILE FAILS CI.
+#
+# Baseline set on 2026-05-30 after PR-1 (langchain ecosystem removal)
+# + PR-3 (pillow/cryptography/PyJWT/pymongo/mako/pyasn1 upgrades).
+# 5 langgraph/langsmith CVEs already closed. 8 more closed by PR-3.
+#
+# ── Blocked on Emergent platform (emergentintegrations transitive) ──
+#
+# litellm 1.80.0 — pinned by emergentintegrations==0.1.0. Cannot
+# upgrade without coordinated platform release. Tracking ticket:
+# /app/memory/support_ticket_reload_flag.md (companion ticket
+# requested per CHANGELOG 2026-05-30 PR-2 hold).
+GHSA-69x8-hrgq-fjj8
+CVE-2026-35029
+CVE-2026-35030
+CVE-2026-42271
+#
+# ── Project-declared out-of-scope ───────────────────────────────────
+#
+# ecdsa CVE-2024-23342 — Minerva timing side-channel. python-ecdsa
+# upstream explicitly states side-channel attacks are out of scope
+# (https://github.com/tlsfuzzer/python-ecdsa/security/advisories/
+#  GHSA-wj6h-64fc-37mp). Acceptable for our trust boundary.
+CVE-2024-23342
+#
+# ── Dev-only / non-runtime impact ───────────────────────────────────
+#
+# black 26.1.0 CVE-2026-32274 — cache file race window during local
+# `black` runs only. Not in production image. Tracking: bump on next
+# dev-deps refresh.
+CVE-2026-32274
+#
+# pip 26.0.1 (CVE-2026-3219, CVE-2026-6357) — pip itself, only
+# exploitable when installing untrusted packages. Build-time tool,
+# pinned by base image, not in app surface.
+CVE-2026-3219
+CVE-2026-6357
+#
+# pytest 9.0.2 CVE-2025-71176 — test-runner only, not in production.
+CVE-2025-71176
+#
+# ── Real vulns deferred to next deps refresh sprint (P1 backlog) ────
+#
+# These are genuine app-surface vulns with fixes available. Bumping
+# any of them in isolation risks transitive churn (Starlette + FastAPI
+# pairing, urllib3 + requests + python-multipart all need a coordinated
+# bump). Tracked separately as "Deps Refresh Sprint Q3-2026" in
+# /app/memory/CHANGELOG.md. Each entry has a fix version recorded so
+# the upgrade PR is mechanical.
+#
+# authlib 1.6.9 → 1.6.11 (PYSEC-2026-25)
+PYSEC-2026-25
+# idna 3.11 → 3.15 (CVE-2026-45409)
+CVE-2026-45409
+# pygments 2.19.2 → 2.20.0 (CVE-2026-4539)
+CVE-2026-4539
+# python-dotenv 1.2.1 → 1.2.2 (CVE-2026-28684)
+CVE-2026-28684
+# python-multipart 0.0.22 → 0.0.27 (CVE-2026-40347, CVE-2026-42561)
+CVE-2026-40347
+CVE-2026-42561
+# requests 2.32.5 → 2.33.0 (CVE-2026-25645)
+CVE-2026-25645
+# starlette 0.37.2 → 0.47.2 (PYSEC-2026-161, CVE-2024-47874, CVE-2025-54121)
+# NOTE: requires FastAPI compatibility check. Do not bump in isolation.
+PYSEC-2026-161
+CVE-2024-47874
+CVE-2025-54121
+# urllib3 2.6.3 → 2.7.0 (PYSEC-2026-141, PYSEC-2026-142)
+PYSEC-2026-141
+PYSEC-2026-142
+# ecdsa 0.19.1 → 0.19.2 (CVE-2026-33936 ASN.1 DoS) — tracked separately
+CVE-2026-33936

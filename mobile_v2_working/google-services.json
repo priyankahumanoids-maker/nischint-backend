@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "228706516031",
+    "project_id": "nischint-5f248",
+    "storage_bucket": "nischint-5f248.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:228706516031:android:3a38f091496a9bc9098c8a",
+        "android_client_info": {
+          "package_name": "com.nischint.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAYn2y4qXqzBB2TPEE6wBJsNWnnhDohgks"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
