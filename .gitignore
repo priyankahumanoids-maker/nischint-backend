@@ -1120,3 +1120,4 @@ frontend/node_modules/.cache/default-development/60.pack
 frontend/node_modules/.cache/default-development/55.pack
 firebase-sa-key.json 
 n8n_auto_blog_workflow.json 
+*.apk 
