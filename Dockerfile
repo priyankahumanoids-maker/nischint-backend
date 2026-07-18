@@ -2,19 +2,21 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for asyncpg, Shapely, and Postgres
+# Install build tools, OpenMP (libgomp1 required by XGBoost/Scikit-Learn), and C libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-dev \
     gcc \
     g++ \
     libpq-dev \
     libgeos-dev \
+    libgomp1 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements from backend directory
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all backend code into container workdir
 COPY backend/ .
 
 ENV PORT=8080
