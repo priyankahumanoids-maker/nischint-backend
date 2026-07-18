@@ -28,6 +28,7 @@ pytest
 pytest-asyncio
 python-dotenv
 python-jose
+python-multipart
 redis
 reportlab
 requests
