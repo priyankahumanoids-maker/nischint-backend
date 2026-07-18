@@ -103,6 +103,10 @@ async def get_pg_pool() -> Optional[asyncpg.Pool]:
             _ssl_ctx.check_hostname = False
             _ssl_ctx.verify_mode = ssl.CERT_NONE
             dsn = (os.environ.get("SUPABASE_DSN") or settings.database_url).split("?")[0]
+            if dsn.startswith("postgresql+asyncpg://"):
+                dsn = dsn.replace("postgresql+asyncpg://", "postgresql://", 1)
+            elif dsn.startswith("postgres+asyncpg://"):
+                dsn = dsn.replace("postgres+asyncpg://", "postgres://", 1)
             pg_pool = await asyncpg.create_pool(
                 dsn,
                 min_size=1,
