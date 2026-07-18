@@ -4,6 +4,7 @@ apscheduler
 asyncpg
 boto3
 botocore
+email-validator
 fastapi
 firebase-admin
 google-api-python-client
