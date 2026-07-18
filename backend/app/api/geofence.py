@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db_session
 from app.models.user import User
 from app.models.safe_zone import SafeZone
+from app.models.monitored_route import MonitoredRoute
 
 router = APIRouter(prefix="/geofence", tags=["geofence"])
 
@@ -36,6 +37,18 @@ class ZoneForUserRequest(BaseModel):
     name: str = Field("Safety Zone", min_length=1, max_length=100)
 
 
+class RouteForUserRequest(BaseModel):
+    user_id: str = Field(..., description="Protected user (child/woman/elderly) to create route for")
+    name: str = Field("Safety Route", min_length=1, max_length=100)
+    origin_name: str | None = None
+    origin_lat: float = Field(..., ge=-90, le=90)
+    origin_lng: float = Field(..., ge=-180, le=180)
+    dest_name: str | None = None
+    dest_lat: float = Field(..., ge=-90, le=90)
+    dest_lng: float = Field(..., ge=-180, le=180)
+    corridor_width_m: float = Field(100.0, ge=20.0, le=2000.0)
+
+
 class LocationUpdateRequest(BaseModel):
     user_id: str | None = Field(None, description="Defaults to the authenticated user")
     lat: float = Field(..., ge=-90, le=90)
@@ -44,7 +57,37 @@ class LocationUpdateRequest(BaseModel):
 
 # ── Authorization helpers ──
 async def _is_guardian_of(session: AsyncSession, guardian_id: str, child_id: str) -> bool:
-    """True if `guardian_id` is linked as a guardian of `child_id` via Guardian or Relationship table."""
+    """True if `guardian_id` is linked as a guardian of `child_id`."""
+    if not child_id or not guardian_id:
+        return False
+
+    # 1. Direct check on users table (child.guardian_id == guardian_id)
+    try:
+        r = await session.execute(
+            select(User).where(
+                User.id == uuid.UUID(child_id),
+                User.guardian_id == uuid.UUID(guardian_id),
+            )
+        )
+        if r.scalar_one_or_none():
+            return True
+    except Exception:
+        pass
+
+    # 2. Check guardian_relationships table (user_id = child_id, guardian_user_id = guardian_id)
+    try:
+        from sqlalchemy import text
+        r = await session.execute(text("""
+            SELECT id FROM guardian_relationships 
+            WHERE user_id = :cid AND guardian_user_id = :gid AND is_active = true
+            LIMIT 1
+        """), {"cid": child_id, "gid": guardian_id})
+        if r.first():
+            return True
+    except Exception:
+        pass
+
+    # 3. Legacy Guardian table check
     try:
         from app.models.guardian import Guardian
         guardian_user = await session.execute(select(User).where(User.id == uuid.UUID(guardian_id)))
@@ -61,19 +104,7 @@ async def _is_guardian_of(session: AsyncSession, guardian_id: str, child_id: str
                 return True
     except Exception:
         pass
-    try:
-        from app.models.relationship import Relationship
-        rel = await session.execute(
-            select(Relationship).where(
-                Relationship.child_id == uuid.UUID(child_id),
-                Relationship.guardian_id == uuid.UUID(guardian_id),
-                Relationship.status == "accepted",
-            )
-        )
-        if rel.scalar_one_or_none():
-            return True
-    except Exception:
-        pass
+
     return False
 
 
@@ -400,3 +431,118 @@ async def delete_pin(
     remaining = [p for p in existing if (p.get("name") or "").strip().lower() != target]
     set_json("geofence:pins", target_user_id, remaining, ttl=None)
     return {"user_id": target_user_id, "pins": remaining, "count": len(remaining)}
+
+
+# ── Monitored Route Endpoints ──
+
+@router.post("/route-for-user")
+async def create_route_for_user(
+    req: RouteForUserRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Guardian creates a monitored route corridor for a linked protected user."""
+    caller_id = str(user.id)
+
+    if req.user_id != caller_id and not _is_admin(user):
+        ok = await _is_guardian_of(session, caller_id, req.user_id)
+        if not ok:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not authorized to manage this user's routes.",
+            )
+
+    route_obj = MonitoredRoute(
+        user_id=uuid.UUID(req.user_id),
+        created_by_guardian_id=uuid.UUID(caller_id) if caller_id != req.user_id else None,
+        name=req.name,
+        origin_name=req.origin_name,
+        origin_lat=req.origin_lat,
+        origin_lng=req.origin_lng,
+        dest_name=req.dest_name,
+        dest_lat=req.dest_lat,
+        dest_lng=req.dest_lng,
+        corridor_width_m=req.corridor_width_m,
+        active=True,
+    )
+    session.add(route_obj)
+    await session.flush()
+    await session.commit()
+
+    return {
+        "id": str(route_obj.id),
+        "user_id": req.user_id,
+        "name": route_obj.name,
+        "origin_name": route_obj.origin_name,
+        "origin_lat": route_obj.origin_lat,
+        "origin_lng": route_obj.origin_lng,
+        "dest_name": route_obj.dest_name,
+        "dest_lat": route_obj.dest_lat,
+        "dest_lng": route_obj.dest_lng,
+        "corridor_width_m": route_obj.corridor_width_m,
+        "active": True,
+        "message": "Monitored route saved successfully.",
+    }
+
+
+@router.get("/routes-for/{target_user_id}")
+async def list_routes_for_user(
+    target_user_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """List active monitored routes for a user."""
+    caller_id = str(user.id)
+    if target_user_id != caller_id and not _is_admin(user):
+        ok = await _is_guardian_of(session, caller_id, target_user_id)
+        if not ok:
+            raise HTTPException(status_code=403, detail="Not authorized to view these routes.")
+
+    rows = await session.execute(
+        select(MonitoredRoute)
+        .where(MonitoredRoute.user_id == uuid.UUID(target_user_id), MonitoredRoute.active.is_(True))
+        .order_by(MonitoredRoute.created_at.desc())
+    )
+    routes = rows.scalars().all()
+    return {
+        "routes": [
+            {
+                "id": str(r.id),
+                "user_id": str(r.user_id),
+                "name": r.name,
+                "origin_name": r.origin_name,
+                "origin_lat": r.origin_lat,
+                "origin_lng": r.origin_lng,
+                "dest_name": r.dest_name,
+                "dest_lat": r.dest_lat,
+                "dest_lng": r.dest_lng,
+                "corridor_width_m": r.corridor_width_m,
+                "active": r.active,
+            }
+            for r in routes
+        ],
+        "count": len(routes),
+    }
+
+
+@router.delete("/route/{route_id}")
+async def deactivate_route(
+    route_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Deactivate a monitored route."""
+    rrow = await session.execute(select(MonitoredRoute).where(MonitoredRoute.id == uuid.UUID(route_id)))
+    r = rrow.scalar_one_or_none()
+    if not r:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    caller_id = str(r.user_id)
+    if str(r.user_id) != caller_id and not _is_admin(user):
+        ok = await _is_guardian_of(session, caller_id, str(r.user_id))
+        if not ok:
+            raise HTTPException(status_code=403, detail="Not authorized to remove this route.")
+
+    r.active = False
+    await session.commit()
+    return {"id": route_id, "active": False, "message": "Monitored route removed."}

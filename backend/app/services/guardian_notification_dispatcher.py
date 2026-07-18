@@ -114,6 +114,7 @@ async def dispatch_guardian_alert(
     sms_sent = 0
     sms_skipped = 0
     errors = []
+    sent_push_user_ids: set[uuid.UUID] = set()
 
     for g in guardians:
         prefs = g.notification_pref or {}
@@ -137,12 +138,25 @@ async def dispatch_guardian_alert(
                     "alert_type": alert.alert_type,
                     "severity": alert.severity,
                 }
-                # Push to the GUARDIAN's user account, not the child's.
-                # `g.guardian_user_id` is set when the guardian themselves
-                # has a user record. Falls back to the alert's owning
-                # user if the guardian is contact-only (SMS).
-                target_user_id = getattr(g, "guardian_user_id", None) or g.user_id
-                if target_user_id:
+                
+                # Resolve target guardian account user ID
+                target_user_id = None
+                if g.email:
+                    from app.models.user import User
+                    gu_result = await session.execute(
+                        select(User.id).where(User.email == g.email)
+                    )
+                    target_user_id = gu_result.scalar_one_or_none()
+
+                # Fallback: check if child has a primary guardian_id set in User table
+                if not target_user_id:
+                    from app.models.user import User
+                    child_res = await session.execute(
+                        select(User.guardian_id).where(User.id == uuid.UUID(user_id))
+                    )
+                    target_user_id = child_res.scalar_one_or_none()
+
+                if target_user_id and target_user_id not in sent_push_user_ids:
                     sent = await send_push_to_user(
                         session, target_user_id, title, body,
                         data=payload_data,
@@ -150,6 +164,7 @@ async def dispatch_guardian_alert(
                         louder=louder,
                     )
                     push_sent += sent
+                    sent_push_user_ids.add(target_user_id)
                     logger.info(
                         f"PUSH{' LOUDER' if louder else ''} "
                         f"[{alert.alert_type}] to guardian {g.name}: "

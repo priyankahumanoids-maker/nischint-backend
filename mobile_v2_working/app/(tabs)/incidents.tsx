@@ -125,10 +125,6 @@ function SafeZoneManagerScreen({ onBack }: { onBack: () => void }) {
   const [radius, setRadius] = useState<'100m' | '500m' | '1km'>('500m');
 
   const safeZones = [
-    { icon: 'home-outline', name: 'Home', address: 'B-42, Sector 15, Noida, UP', radius: '500m', chips: ['Aarav: Inside', 'Nana: Inside', 'Priya: Outside'] },
-    { icon: 'school-outline', name: 'School', address: 'DPS Sector 19, Noida, UP', radius: '100m', chips: ['Aarav: Inside', 'Priya: Inside'] },
-    { icon: 'medkit-outline', name: 'Hospital', address: 'Fortis Hospital, Sector 62, Noida', radius: '500m', chips: ['Nana: Outside'] },
-    { icon: 'barbell-outline', name: 'Gym', address: 'Anytime Fitness, Sector 18, Noida', radius: '100m', chips: ['Priya: Outside'] },
     { icon: 'library-outline', name: 'Tuition', address: 'Aakash Institute, Sector 10, Noida', radius: '100m', chips: ['Aarav: Outside'] },
     { icon: 'business-outline', name: 'Office', address: 'Logix Techno Park, Sector 132, Noida', radius: '1km', chips: ['Priya: Outside'] },
   ];

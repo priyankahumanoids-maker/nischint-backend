@@ -299,16 +299,43 @@ async def get_my_guardian(
     session: AsyncSession = Depends(get_db_session),
 ):
     """
-    Returns the guardian linked to the current user via users.guardian_id.
-    Intended for child/woman/senior/family accounts to display their
-    guardian's name in their Settings screen.
+    Returns the guardian linked to the current user via users.guardian_id
+    or guardian_relationships table.
     """
-    from sqlalchemy import select
+    from sqlalchemy import select, text
+    import uuid
 
-    if not user.guardian_id:
+    guardian_id = getattr(user, "guardian_id", None)
+
+    # 1. Direct DB lookup to bypass 30s user cache staleness
+    if not guardian_id:
+        try:
+            r = await session.execute(text("SELECT guardian_id FROM users WHERE id = :uid"), {"uid": str(user.id)})
+            row = r.first()
+            if row and row.guardian_id:
+                guardian_id = row.guardian_id
+        except Exception as e:
+            logger.warning(f"[MY_GUARDIAN] DB lookup error: {e}")
+
+    # 2. Query guardian_relationships table (child -> guardian_user_id link)
+    if not guardian_id:
+        try:
+            r = await session.execute(text("""
+                SELECT guardian_user_id FROM guardian_relationships 
+                WHERE user_id = :uid AND is_active = true 
+                ORDER BY priority ASC LIMIT 1
+            """), {"uid": str(user.id)})
+            row = r.first()
+            if row and row.guardian_user_id:
+                guardian_id = row.guardian_user_id
+        except Exception as e:
+            logger.warning(f"[MY_GUARDIAN] Relationships lookup error: {e}")
+
+    # 3. Clean 404 for Guardian accounts or unlinked members
+    if not guardian_id:
         raise HTTPException(status_code=404, detail="No guardian linked to your account")
 
-    result = await session.execute(select(User).where(User.id == user.guardian_id))
+    result = await session.execute(select(User).where(User.id == uuid.UUID(str(guardian_id))))
     guardian = result.scalar_one_or_none()
 
     if not guardian:
@@ -320,6 +347,8 @@ async def get_my_guardian(
         email=guardian.email,
         phone=guardian.phone,
     )
+
+
 
 
 # ── Local Auth Flows ──

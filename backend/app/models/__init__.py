@@ -16,6 +16,7 @@ from app.models.guardian import Guardian, GuardianSession, GuardianAlert
 from app.models.emergency import EmergencyEvent
 from app.models.fall_event import FallEvent
 from app.models.safe_zone import SafeZone
+from app.models.monitored_route import MonitoredRoute
 from app.models.wandering_event import WanderingEvent
 from app.models.pickup_authorization import PickupAuthorization
 from app.models.pickup_event import PickupEvent
@@ -26,4 +27,4 @@ from app.models.voice_command import VoiceCommandConfig, VoiceTriggerLog
 from app.models.facility import Facility
 from app.models.guardian_ai_v2 import GuardianBaseline, GuardianRiskScore, GuardianPrediction, GuardianRiskEvent
 
-__all__ = ["User", "Senior", "Device", "Telemetry", "Incident", "Notification", "NotificationJob", "DeviceHealthRuleAuditLog", "DeviceBaseline", "DeviceAnomaly", "BehaviorBaseline", "BehaviorAnomaly", "Guardian", "GuardianSession", "GuardianAlert", "EmergencyEvent", "FallEvent", "SafeZone", "WanderingEvent", "PickupAuthorization", "PickupEvent", "VoiceDistressEvent", "SafetyEvent", "RerouteSuggestion", "VoiceCommandConfig", "VoiceTriggerLog", "Facility"]
+__all__ = ["User", "Senior", "Device", "Telemetry", "Incident", "Notification", "NotificationJob", "DeviceHealthRuleAuditLog", "DeviceBaseline", "DeviceAnomaly", "BehaviorBaseline", "BehaviorAnomaly", "Guardian", "GuardianSession", "GuardianAlert", "EmergencyEvent", "FallEvent", "SafeZone", "MonitoredRoute", "WanderingEvent", "PickupAuthorization", "PickupEvent", "VoiceDistressEvent", "SafetyEvent", "RerouteSuggestion", "VoiceCommandConfig", "VoiceTriggerLog", "Facility"]

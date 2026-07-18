@@ -1,0 +1,10 @@
+__pycache__
+.pytest_cache
+*.pyc
+.env
+.git
+.vscode
+node_modules
+frontend
+mobile
+mobile_v2_working

@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.guardian import Guardian, GuardianSession, GuardianAlert
+from app.models.guardian import GuardianSession, GuardianAlert
 from app.models.user import User
 from app.models.senior import Senior
 
@@ -19,10 +19,7 @@ logger = logging.getLogger(__name__)
 async def _get_linked_user_ids(session: AsyncSession, guardian_email: str, guardian_user_id: str | None = None, user_role: str | None = None) -> list[uuid.UUID]:
     """Find all user_ids that this guardian monitors.
     
-    Sources:
-    1. guardians table: legacy email-based linking
-    2. relationships table: new code-based linking
-    3. admin role: ALL child-role users system-wide (admin oversight)
+    Source of truth: User.guardian_id column in the users table.
     """
     ids: set[uuid.UUID] = set()
 
@@ -34,24 +31,15 @@ async def _get_linked_user_ids(session: AsyncSession, guardian_email: str, guard
         ids.update(row[0] for row in admin_result.all())
         return list(ids)
 
-    # Legacy: guardians table (email match)
-    result = await session.execute(
-        select(Guardian.user_id).where(
-            Guardian.email == guardian_email, Guardian.is_active == True  # noqa: E712
-        )
-    )
-    ids.update(row[0] for row in result.all())
-
-    # New: relationships table (direct ID link)
+    # Use users.guardian_id column directly as the sole source of truth
     if guardian_user_id:
-        from app.models.relationship import Relationship
-        rel_result = await session.execute(
-            select(Relationship.child_id).where(
-                Relationship.guardian_id == uuid.UUID(guardian_user_id),
-                Relationship.status == "accepted",
+        user_result = await session.execute(
+            select(User.id).where(
+                User.guardian_id == uuid.UUID(guardian_user_id),
+                User.is_active == True
             )
         )
-        ids.update(row[0] for row in rel_result.all())
+        ids.update(row[0] for row in user_result.all())
 
     return list(ids)
 
@@ -71,32 +59,8 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
         if not user:
             continue
 
-        # Get guardian entry for relationship info
-        entry_result = await session.execute(
-            select(Guardian).where(
-                Guardian.user_id == uid,
-                Guardian.email == guardian_email,
-                Guardian.is_active == True,  # noqa: E712
-            ).limit(1)
-        )
-        entry = entry_result.scalar_one_or_none()
-
-        # If no legacy entry, check relationships table for relationship info
+        # Relationship is family by default since they are directly linked via guardian_id
         rel_type = "family"
-        if entry:
-            rel_type = entry.relationship
-        else:
-            from app.models.relationship import Relationship
-            rel_result = await session.execute(
-                select(Relationship).where(
-                    Relationship.guardian_id == uuid.UUID(guardian_user_id),
-                    Relationship.child_id == uid,
-                    Relationship.status == "accepted",
-                ).limit(1)
-            )
-            rel = rel_result.scalar_one_or_none()
-            if rel:
-                rel_type = "linked"
 
         # Active session
         sess_result = await session.execute(
@@ -528,15 +492,21 @@ async def request_safety_check(session: AsyncSession, session_id: str, guardian_
     if not gs:
         return {"error": "No active session found"}
 
-    # Verify this guardian is linked to the user
-    link = await session.execute(
-        select(Guardian).where(
-            Guardian.user_id == gs.user_id,
-            Guardian.email == guardian_email,
-            Guardian.is_active == True,  # noqa: E712
-        ).limit(1)
+    # Find the guardian user to get their ID
+    g_res = await session.execute(select(User).where(User.email == guardian_email))
+    g_user = g_res.scalar_one_or_none()
+    if not g_user:
+        return {"error": "Guardian not found"}
+
+    # Verify this guardian is linked to the user via User.guardian_id
+    c_res = await session.execute(
+        select(User).where(
+            User.id == gs.user_id,
+            User.guardian_id == g_user.id,
+            User.is_active == True
+        )
     )
-    if not link.scalar_one_or_none():
+    if not c_res.scalar_one_or_none():
         return {"error": "Not authorized for this session"}
 
     from app.services.guardian_mode_engine import _create_alert

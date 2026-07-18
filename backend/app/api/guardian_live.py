@@ -27,22 +27,19 @@ async def get_protected_users(
     Includes self for personal safety monitoring."""
     users = []
 
-    # 1. Users where current user is listed as guardian (via GuardianRelationship)
+    # 1. Users where current user is listed as guardian (via User.guardian_id)
     rels = (await session.execute(
-        select(GuardianRelationship).where(and_(
-            GuardianRelationship.guardian_user_id == user.id,
-            GuardianRelationship.is_active == True,  # noqa: E712
+        select(User).where(and_(
+            User.guardian_id == user.id,
+            User.is_active == True,
         ))
     )).scalars().all()
 
     seen_ids = set()
-    for rel in rels:
-        if rel.user_id in seen_ids:
+    for u in rels:
+        if u.id in seen_ids:
             continue
-        seen_ids.add(rel.user_id)
-        u = (await session.execute(select(User).where(User.id == rel.user_id))).scalar_one_or_none()
-        if not u:
-            continue
+        seen_ids.add(u.id)
 
         active = (await session.execute(
             select(GuardianSession).where(and_(
@@ -55,7 +52,7 @@ async def get_protected_users(
             "user_id": str(u.id),
             "name": u.full_name or u.email,
             "email": u.email,
-            "relationship": rel.relationship_type,
+            "relationship": "family",
             "has_active_session": active is not None,
             "risk_level": active.risk_level if active else "SAFE",
             "risk_score": round(active.risk_score, 1) if active else 0,
@@ -97,20 +94,20 @@ async def get_live_status(
     except (ValueError, AttributeError):
         raise HTTPException(422, "Invalid user ID format")
 
-    # Allow self-view OR verify guardian relationship
+    # Allow self-view OR verify guardian relationship via User.guardian_id
     is_self = target_uid == user.id
     if not is_self:
         rel = (await session.execute(
-            select(GuardianRelationship).where(and_(
-                GuardianRelationship.guardian_user_id == user.id,
-                GuardianRelationship.user_id == target_uid,
-                GuardianRelationship.is_active == True,  # noqa: E712
+            select(User).where(and_(
+                User.id == target_uid,
+                User.guardian_id == user.id,
+                User.is_active == True,
             )).limit(1)
         )).scalar_one_or_none()
 
         if not rel:
             raise HTTPException(403, "You are not a guardian of this user")
-        relationship = rel.relationship_type
+        relationship = "family"
     else:
         relationship = "self"
 
@@ -279,28 +276,15 @@ _ESC_TIER: dict[str, int] = {
 async def _compute_live_risk(session: AsyncSession, user: User):
     now = datetime.now(timezone.utc)
 
-    # 1. Find all protected children (via Relationship)
+    # Find all users where guardian_id is current user's ID
     rels = (await session.execute(
-        select(GuardianRelationship).where(and_(
-            GuardianRelationship.guardian_user_id == user.id,
-            GuardianRelationship.is_active == True,  # noqa: E712
+        select(User.id).where(and_(
+            User.guardian_id == user.id,
+            User.is_active == True,
         ))
     )).scalars().all()
 
-    # Also check Relationship table
-    from app.models.relationship import Relationship
-    rel2 = (await session.execute(
-        select(Relationship).where(and_(
-            Relationship.guardian_id == user.id,
-            Relationship.status == "accepted",
-        ))
-    )).scalars().all()
-
-    child_ids = set()
-    for r in rels:
-        child_ids.add(r.user_id)
-    for r in rel2:
-        child_ids.add(r.child_id)
+    child_ids = {uid for uid in rels}
 
     results = []
     for child_id in child_ids:
