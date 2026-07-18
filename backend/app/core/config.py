@@ -10,16 +10,16 @@ class Settings(BaseSettings):
     app_env: str = "dev"
 
     # ── JWT ──
-    jwt_secret: str
+    jwt_secret: str = "nischint_jwt_secret_key_prod_2026"
     jwt_algorithm: str = "HS256"
     jwt_expires_minutes: int = 60
 
     # ── Database (Neon PostgreSQL) ──
-    database_url: str
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/nischint"
 
     # ── MongoDB (legacy status checks) ──
-    mongo_url: str
-    db_name: str
+    mongo_url: str = "mongodb://localhost:27017"
+    db_name: str = "nischint"
 
     # ── CORS ──
     cors_origins: str = "*"
