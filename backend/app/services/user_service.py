@@ -3,7 +3,7 @@ import asyncio
 from uuid import UUID
 
 from passlib.context import CryptContext
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,10 +79,17 @@ async def create_user(session: AsyncSession, user_create: UserCreate) -> User:
 
 
 async def get_user_by_email(session: AsyncSession, email: str) -> User | None:
-    """Get a user by email address."""
-    stmt = select(User).where(User.email == email)
+    """Get a user by email address, ignoring harmless case/space differences."""
+    normalized_email = str(email or "").strip().casefold()
+    if not normalized_email:
+        return None
+    stmt = (
+        select(User)
+        .where(func.lower(User.email) == normalized_email)
+        .limit(1)
+    )
     result = await session.execute(stmt)
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def get_user_by_id(session: AsyncSession, user_id: UUID) -> User | None:

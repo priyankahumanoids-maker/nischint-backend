@@ -388,32 +388,35 @@ async def _local_login(login_request: LoginRequest, session: AsyncSession) -> To
     # IP limiter). Stops credential-stuffing without locking out
     # legitimate users behind shared NATs / mobile carriers.
     from app.core.login_backoff import check_lock, record_failure, reset
-    lock = check_lock(login_request.email)
-    if lock.locked:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=(
-                f"Too many failed attempts on this account. "
-                f"Try again in {lock.retry_after}s."
-            ),
-            headers={
-                "Retry-After": str(lock.retry_after),
-                "WWW-Authenticate": "Bearer",
-            },
+    normalized_email = str(login_request.email).strip().casefold()
+    user = await user_service.get_user_by_email(session, normalized_email)
+    password_valid = bool(
+        user
+        and await user_service.verify_password_async(
+            login_request.password,
+            user.password_hash,
         )
+    )
 
-    user = await user_service.get_user_by_email(session, login_request.email)
-
-    if not user:
-        record_failure(login_request.email)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    if not await user_service.verify_password_async(login_request.password, user.password_hash):
-        record_failure(login_request.email)
+    if not password_valid:
+        # Keep the progressive account lock for invalid credentials, but
+        # verify first so the real account owner can recover immediately by
+        # entering the correct password. The per-IP limiter still bounds
+        # password verification traffic.
+        lock = check_lock(normalized_email)
+        if lock.locked:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Too many failed attempts on this account. "
+                    f"Try again in {lock.retry_after}s."
+                ),
+                headers={
+                    "Retry-After": str(lock.retry_after),
+                    "WWW-Authenticate": "Bearer",
+                },
+            )
+        record_failure(normalized_email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -422,7 +425,7 @@ async def _local_login(login_request: LoginRequest, session: AsyncSession) -> To
 
     # Successful auth — clear the failure counter so a forgetful user
     # who finally types the right password isn't penalised.
-    reset(login_request.email)
+    reset(normalized_email)
 
     # Warm the auth user cache so the next call to /api/auth/me (and any
     # other authenticated endpoint within the 30s TTL window) skips the
