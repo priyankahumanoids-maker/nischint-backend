@@ -23,6 +23,16 @@ async def register_push_token(
     session: AsyncSession = Depends(get_db_session),
 ):
     """Register an FCM push token for the current user."""
+    # A physical installation can change accounts. One FCM token must never
+    # remain attached to a previous guardian/protected user after login
+    # changes, otherwise private safety notifications reach the wrong person.
+    await session.execute(
+        text(
+            "DELETE FROM push_tokens "
+            "WHERE token = :tok AND user_id <> :uid"
+        ),
+        {"uid": current_user.id, "tok": body.token},
+    )
     await session.execute(
         text(
             "INSERT INTO push_tokens (user_id, token) VALUES (:uid, :tok) "

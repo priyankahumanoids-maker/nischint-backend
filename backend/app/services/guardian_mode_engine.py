@@ -634,7 +634,14 @@ async def _create_alert(session: AsyncSession, session_id: str, alert_type: str,
     if user_id:
         try:
             from app.services.guardian_notification_dispatcher import dispatch_guardian_alert
-            dispatch_result = await dispatch_guardian_alert(session, alert, user_id, session_id)
+            guardian_ids, _, _ = await _resolve_guardian_ids(session, user_id)
+            dispatch_result = await dispatch_guardian_alert(
+                session,
+                alert,
+                user_id,
+                session_id,
+                guardian_user_ids=guardian_ids,
+            )
             logger.info(f"Alert dispatch: {alert_type} -> push={dispatch_result.get('push_sent',0)}, sms={dispatch_result.get('sms_sent',0)}")
         except Exception as e:
             logger.error(f"Notification dispatch failed: {e}")
@@ -691,7 +698,26 @@ async def _resolve_guardian_ids(session: AsyncSession, child_user_id: str) -> tu
     except Exception as e:
         logger.error(f"RESOLVE_GUARDIAN Path2 failed: {e}")
 
-    # Path 3 FALLBACK: CheckIn table — find guardians who have sent check-ins to this child
+    # Path 3: direct primary guardian link on the protected User.
+    if child and child.guardian_id:
+        guardian_user_ids.add(str(child.guardian_id))
+
+    # Path 4: Guardian Network share-invite links (co-parent/co-guardian).
+    try:
+        from app.models.guardian_network import GuardianRelationship
+        network_result = await session.execute(
+            select(GuardianRelationship).where(
+                GuardianRelationship.user_id == child_uuid,
+                GuardianRelationship.guardian_user_id.isnot(None),
+                GuardianRelationship.is_active.is_(True),
+            )
+        )
+        for rel in network_result.scalars().all():
+            guardian_user_ids.add(str(rel.guardian_user_id))
+    except Exception as e:
+        logger.error(f"RESOLVE_GUARDIAN Path4 failed: {e}")
+
+    # Path 5 FALLBACK: CheckIn table — find guardians who have sent check-ins to this child
     if not guardian_user_ids:
         try:
             from app.models.checkin import CheckIn

@@ -166,6 +166,35 @@ async def _resolve_guardian_ids(session: AsyncSession, child_user_id: str) -> tu
             seen.add(gid)
             out.append(gid)
 
+    # Path 3: Guardian Network relationships (QR/link-based co-guardians).
+    try:
+        from app.models.guardian_network import GuardianRelationship
+        network_rels = (await session.execute(
+            select(GuardianRelationship).where(
+                GuardianRelationship.user_id == cu_uuid,
+                GuardianRelationship.guardian_user_id.isnot(None),
+                GuardianRelationship.is_active.is_(True),
+            )
+        )).scalars().all()
+        for rel in network_rels:
+            gid = str(rel.guardian_user_id)
+            if gid not in seen:
+                seen.add(gid)
+                out.append(gid)
+    except Exception as exc:
+        logger.warning(
+            "[ALERT_TRIGGER] guardian-network resolution failed child=%s: %s",
+            child_user_id,
+            exc,
+        )
+
+    # Path 4: Direct parent link on User record (User.guardian_id).
+    if child_user and child_user.guardian_id:
+        gid = str(child_user.guardian_id)
+        if gid not in seen:
+            seen.add(gid)
+            out.append(gid)
+
     return out, child_name
 
 
@@ -390,6 +419,7 @@ async def trigger_alert(
             await dispatch_guardian_alert(
                 session, alert_obj, user_id, session_id or "",
                 louder=effective_louder,
+                guardian_user_ids=guardian_ids,
             )
             escalation_status = "ok"
         except Exception as e:

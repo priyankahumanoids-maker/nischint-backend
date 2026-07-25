@@ -1,6 +1,7 @@
 # Centralized Configuration via Pydantic Settings
 from functools import lru_cache
 from pathlib import Path
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -13,6 +14,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "nischint_jwt_secret_key_prod_2026"
     jwt_algorithm: str = "HS256"
     jwt_expires_minutes: int = 60
+    family_invite_ttl_minutes: int = Field(default=15, ge=1, le=1440)
 
     # ── Database (Neon PostgreSQL) ──
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/nischint"

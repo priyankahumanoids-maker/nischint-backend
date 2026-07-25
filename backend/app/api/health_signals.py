@@ -269,6 +269,64 @@ async def ingest_wearable_signals(
                     user_id, breach, e,
                 )
 
+            # A real wearable threshold breach must reach linked guardians even
+            # when their app is backgrounded. Route it through the same
+            # persisted alert + high-priority FCM pipeline as phone and BLE
+            # safety events; the deterministic sample timestamp prevents
+            # duplicate notifications when Health Connect replays a sample.
+            try:
+                from app.services.alert_trigger import trigger_alert
+
+                alert_kind = (
+                    "fall_detected"
+                    if breach == "FALL_DETECTED"
+                    else "health_anomaly"
+                )
+                alert_severity = (
+                    "critical"
+                    if breach == "FALL_DETECTED"
+                    else "high"
+                )
+                alert_location = (
+                    {"lat": brain_lat, "lng": brain_lng}
+                    if brain_lat != 0.0 or brain_lng != 0.0
+                    else None
+                )
+                await trigger_alert(
+                    session,
+                    kind=alert_kind,
+                    user_id=user_id,
+                    severity=alert_severity,
+                    message=(
+                        f"Wearable {sig.type.replace('_', ' ')} "
+                        f"reading needs attention ({sig.value} {sig.unit})."
+                    ),
+                    details=(
+                        f"Threshold: {breach}. Source: {sig.source}. "
+                        "This alert is based on the recorded wearable sample."
+                    ),
+                    location=alert_location,
+                    sse_event_type=f"wearable_{breach.lower()}",
+                    sse_payload_extras={
+                        **breach_entry,
+                        "device_id": device_id_clean,
+                        "device_model": device_model_clean,
+                    },
+                    louder=breach == "FALL_DETECTED",
+                    idempotency_key=f"{breach}:{sig.timestamp}:{idem}",
+                    cooldown_s=60,
+                )
+            except Exception as e:
+                # Signal ingestion remains available if notification delivery is
+                # temporarily degraded; alert dispatch records its own errors.
+                logger.exception(
+                    "[HC-01 threshold_breach] guardian dispatch failed "
+                    "user_id=%s tag=%s err=%s",
+                    user_id,
+                    breach,
+                    e,
+                )
+
     if pipe is not None:
         try:
             pipe.execute()

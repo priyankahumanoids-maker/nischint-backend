@@ -11,6 +11,7 @@
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
 import redis
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 _pool = None
 _client = None
 _available = False
+_local_cache = {}
 
 PREFIX = "nischint"
 
@@ -82,7 +84,13 @@ def set_json(namespace: str, key: str, data, ttl: int | None = None):
     """Store JSON-serializable data in Redis with optional TTL (seconds)."""
     c = _get_client()
     if not c:
-        return False
+        full_key = _key(namespace, key)
+        expires_at = time.time() + ttl if ttl else None
+        _local_cache[full_key] = {
+            "data": data,
+            "expires_at": expires_at
+        }
+        return True
     try:
         full_key = _key(namespace, key)
         c.set(full_key, json.dumps(data, default=str))
@@ -98,7 +106,14 @@ def get_json(namespace: str, key: str):
     """Retrieve and parse JSON data from Redis. Returns None on miss or failure."""
     c = _get_client()
     if not c:
-        return None
+        full_key = _key(namespace, key)
+        cached = _local_cache.get(full_key)
+        if not cached:
+            return None
+        if cached["expires_at"] and time.time() > cached["expires_at"]:
+            del _local_cache[full_key]
+            return None
+        return cached["data"]
     try:
         raw = c.get(_key(namespace, key))
         if raw is None:
@@ -113,7 +128,10 @@ def delete_key(namespace: str, key: str) -> bool:
     """Delete a specific key."""
     c = _get_client()
     if not c:
-        return False
+        full_key = _key(namespace, key)
+        if full_key in _local_cache:
+            del _local_cache[full_key]
+        return True
     try:
         c.delete(_key(namespace, key))
         return True
@@ -137,11 +155,15 @@ def mark_user_ping(user_id: str, ts_iso: str | None = None) -> bool:
     pipeline is alive (location share, WS auth, journey ack, etc.).
     """
     c = _get_client()
+    ts = ts_iso or datetime.now(timezone.utc).isoformat()
     if not c:
-        return False
+        full_key = _key(USER_PING_NAMESPACE, user_id)
+        _local_cache[full_key] = {
+            "data": ts,
+            "expires_at": time.time() + USER_PING_TTL
+        }
+        return True
     try:
-        from datetime import datetime, timezone
-        ts = ts_iso or datetime.now(timezone.utc).isoformat()
         c.set(_key(USER_PING_NAMESPACE, user_id), ts, ex=USER_PING_TTL)
         return True
     except Exception as e:
@@ -157,7 +179,16 @@ def get_user_pings(user_ids: list[str]) -> dict[str, str]:
         return {}
     c = _get_client()
     if not c:
-        return {}
+        out: dict[str, str] = {}
+        for uid in user_ids:
+            full_key = _key(USER_PING_NAMESPACE, uid)
+            cached = _local_cache.get(full_key)
+            if cached:
+                if cached["expires_at"] and time.time() > cached["expires_at"]:
+                    del _local_cache[full_key]
+                    continue
+                out[uid] = cached["data"]
+        return out
     try:
         keys = [_key(USER_PING_NAMESPACE, uid) for uid in user_ids]
         vals = c.mget(keys)

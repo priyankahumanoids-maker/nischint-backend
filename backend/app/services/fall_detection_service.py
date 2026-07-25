@@ -168,6 +168,46 @@ async def report_fall(
     await broadcaster.broadcast_to_user(user_id, "fall_detected", event_data)
     await broadcaster.broadcast_to_operators("fall_detected", event_data)
 
+    # Persist and dispatch the verified sensor event to every linked
+    # parent/co-guardian. This central path provides closed-app FCM,
+    # alert-history rows, deep-link identifiers, and external
+    # SACHET/NDMA context when a real location is available.
+    alert_location = None
+    location_available = not (
+        lat == 0
+        and lng == 0
+        and isinstance(sensor_data, dict)
+        and sensor_data.get("location_available") is False
+    )
+    if location_available:
+        alert_location = {"lat": lat, "lng": lng}
+    try:
+        from app.services.alert_trigger import trigger_alert
+        dispatch = await trigger_alert(
+            session,
+            kind="fall_detected",
+            user_id=user_id,
+            severity="critical",
+            message=(
+                f"Possible fall detected by motion sensors "
+                f"({round(confidence * 100)}% confidence)."
+            ),
+            details=(
+                "Five-stage motion check: impact, free-fall, orientation, "
+                "post-impact motion, and immobility."
+            ),
+            location=alert_location,
+            sse_event_type="fall_detected",
+            sse_payload_extras=event_data,
+            louder=True,
+            idempotency_key=event_id,
+            cooldown_s=COOLDOWN_SECONDS,
+        )
+        event_data["guardian_alert_id"] = dispatch.alert_id
+        event_data["guardians_notified"] = dispatch.guardians_notified
+    except Exception as exc:
+        logger.error("Guardian fall dispatch failed event=%s: %s", event_id, exc)
+
     logger.warning(f"Fall detected: user={user_id}, confidence={confidence:.2f}, marker={marker_level}")
 
     await session.commit()

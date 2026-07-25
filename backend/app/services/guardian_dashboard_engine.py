@@ -9,11 +9,30 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.guardian import GuardianSession, GuardianAlert
+from app.models.guardian import Guardian, GuardianSession, GuardianAlert
 from app.models.user import User
 from app.models.senior import Senior
 
 logger = logging.getLogger(__name__)
+DEVICE_TELEMETRY_FRESHNESS = timedelta(minutes=15)
+
+
+def _fresh_device_telemetry(raw: object, now: datetime) -> tuple[dict | None, datetime | None]:
+    """Return only recent, real protected-device telemetry."""
+    if not isinstance(raw, dict):
+        return None, None
+    updated_raw = raw.get("updated_at")
+    if not updated_raw:
+        return None, None
+    try:
+        updated_at = datetime.fromisoformat(str(updated_raw).replace("Z", "+00:00"))
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        if now - updated_at > DEVICE_TELEMETRY_FRESHNESS:
+            return None, updated_at
+    except (TypeError, ValueError):
+        return None, None
+    return raw, updated_at
 
 
 async def _get_linked_user_ids(session: AsyncSession, guardian_email: str, guardian_user_id: str | None = None, user_role: str | None = None) -> list[uuid.UUID]:
@@ -26,20 +45,79 @@ async def _get_linked_user_ids(session: AsyncSession, guardian_email: str, guard
     # Admin sees ALL children across the system (oversight capability).
     if (user_role or "").lower() == "admin":
         admin_result = await session.execute(
-            select(User.id).where(User.role.in_(["child", "woman", "senior"]))
+            select(User.id).where(
+                User.role.in_(
+                    [
+                        "child",
+                        "kid",
+                        "woman",
+                        "senior",
+                        "family",
+                        "family_member",
+                        "protected_member",
+                    ]
+                )
+            )
         )
         ids.update(row[0] for row in admin_result.all())
         return list(ids)
 
-    # Use users.guardian_id column directly as the sole source of truth
+    # Legacy/contact-based guardian records remain a valid relationship
+    # source for existing families.
+    if guardian_email:
+        guardian_rows = await session.execute(
+            select(Guardian.user_id).where(
+                Guardian.email == guardian_email,
+                Guardian.is_active.is_(True),
+            )
+        )
+        ids.update(row[0] for row in guardian_rows.all())
+
+    # Direct primary-guardian link.
     if guardian_user_id:
+        guardian_uuid = uuid.UUID(guardian_user_id)
         user_result = await session.execute(
             select(User.id).where(
-                User.guardian_id == uuid.UUID(guardian_user_id),
+                User.guardian_id == guardian_uuid,
                 User.is_active == True
             )
         )
         ids.update(row[0] for row in user_result.all())
+
+        # Accepted invite/code links.
+        try:
+            from app.models.relationship import Relationship
+            rel_result = await session.execute(
+                select(Relationship.child_id).where(
+                    Relationship.guardian_id == guardian_uuid,
+                    Relationship.status == "accepted",
+                )
+            )
+            ids.update(row[0] for row in rel_result.all())
+        except Exception as exc:
+            logger.warning(
+                "Guardian dashboard Relationship lookup failed guardian=%s: %s",
+                guardian_user_id,
+                exc,
+            )
+
+        # Guardian-network links include co-parents/co-guardians accepted
+        # through the share-invite flow.
+        try:
+            from app.models.guardian_network import GuardianRelationship
+            network_result = await session.execute(
+                select(GuardianRelationship.user_id).where(
+                    GuardianRelationship.guardian_user_id == guardian_uuid,
+                    GuardianRelationship.is_active.is_(True),
+                )
+            )
+            ids.update(row[0] for row in network_result.all())
+        except Exception as exc:
+            logger.warning(
+                "Guardian dashboard network lookup failed guardian=%s: %s",
+                guardian_user_id,
+                exc,
+            )
 
     return list(ids)
 
@@ -70,6 +148,28 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
             ).order_by(GuardianSession.started_at.desc()).limit(1)
         )
         active_session = sess_result.scalar_one_or_none()
+
+        # Latest passive/foreground snapshot from the protected phone.
+        # A 15-minute truth window prevents a stale battery value from being
+        # presented as if it were the device's current state.
+        telemetry_raw = None
+        try:
+            from app.services.redis_service import get_json
+
+            telemetry_raw = get_json("protected_telemetry", str(uid))
+        except Exception:
+            pass
+        if telemetry_raw is None and active_session:
+            telemetry_raw = active_session.current_location
+        device_telemetry, telemetry_updated_at = _fresh_device_telemetry(
+            telemetry_raw,
+            now,
+        )
+        battery_pct = (
+            device_telemetry.get("battery_pct")
+            if device_telemetry is not None
+            else None
+        )
 
         # Active emergency
         emer_result = await session.execute(
@@ -116,7 +216,21 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                 if isinstance(last_trail, dict) and "lat" in last_trail:
                     location = {"lat": last_trail["lat"], "lng": last_trail["lng"]}
 
-        # 2. Active session
+        # 2. Fresh passive or foreground protected-device telemetry
+        if (
+            not location
+            and device_telemetry
+            and device_telemetry.get("lat") is not None
+            and device_telemetry.get("lng") is not None
+        ):
+            location = {
+                "lat": device_telemetry["lat"],
+                "lng": device_telemetry["lng"],
+            }
+            location_ts = telemetry_updated_at
+            location_type = "live"
+
+        # 3. Active session
         if not location and active_session and active_session.current_location:
             loc = active_session.current_location
             if isinstance(loc, dict) and "lat" in loc:
@@ -124,7 +238,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                 location_ts = active_session.previous_update_at or active_session.started_at
                 location_type = "live"
 
-        # 3. Last ended session with a location
+        # 4. Last ended session with a location
         if not location:
             ended_sess = await session.execute(
                 select(GuardianSession).where(
@@ -141,7 +255,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                     location_ts = last_sess.ended_at or last_sess.previous_update_at or last_sess.started_at
                     location_type = "recent"
 
-        # 4. Last trail point (via location_shares for this user)
+        # 5. Last trail point (via location_shares for this user)
         if not location:
             from app.models.location_trail import LocationTrailPoint
             from app.models.location_share import LocationShare
@@ -158,7 +272,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                 location_ts = trail_row[2]
                 location_type = "recent"
 
-        # 5. Last resolved/cancelled emergency with coordinates
+        # 6. Last resolved/cancelled emergency with coordinates
         if not location:
             past_emer = await session.execute(
                 select(EmergencyEvent).where(
@@ -199,6 +313,14 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
             "location": location,
             "location_type": location_type,
             "last_updated": last_updated,
+            "battery": battery_pct,
+            "battery_percent": battery_pct,
+            "battery_updated_at": (
+                telemetry_updated_at.isoformat()
+                if device_telemetry is not None and telemetry_updated_at
+                else None
+            ),
+            "telemetry_fresh": device_telemetry is not None,
             "has_active_session": active_session is not None,
             "active_session": None,
         }
@@ -317,52 +439,44 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
 
     alerts_list: list[dict] = []
 
-    # ── Part 1: Session-linked alerts (GuardianAlert) ──
+    # ── Part 1: GuardianAlert rows (standalone or session-linked) ──
     if user_ids:
-        sess_result = await session.execute(
-            select(GuardianSession.id, GuardianSession.user_id).where(
-                GuardianSession.user_id.in_(user_ids)
-            )
+        user_result = await session.execute(select(User).where(User.id.in_(user_ids)))
+        user_names = {u.id: u.full_name or u.email for u in user_result.scalars().all()}
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        alerts_result = await session.execute(
+            select(GuardianAlert).where(
+                GuardianAlert.user_id.in_(user_ids),
+                GuardianAlert.created_at >= cutoff,
+            ).order_by(GuardianAlert.created_at.desc()).limit(limit)
         )
-        session_map = {row[0]: row[1] for row in sess_result.all()}
+        alert_rows = alerts_result.scalars().all()
 
-        if session_map:
-            user_result = await session.execute(select(User).where(User.id.in_(set(session_map.values()))))
-            user_names = {u.id: u.full_name or u.email for u in user_result.scalars().all()}
-
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-            alerts_result = await session.execute(
+        # Fallback: if 24h returns empty, get latest 5 regardless of age
+        if not alert_rows:
+            fallback_result = await session.execute(
                 select(GuardianAlert).where(
-                    GuardianAlert.session_id.in_(list(session_map.keys())),
-                    GuardianAlert.created_at >= cutoff,
-                ).order_by(GuardianAlert.created_at.desc()).limit(limit)
+                    GuardianAlert.user_id.in_(user_ids),
+                ).order_by(GuardianAlert.created_at.desc()).limit(5)
             )
-            alert_rows = alerts_result.scalars().all()
+            alert_rows = fallback_result.scalars().all()
 
-            # Fallback: if 24h returns empty, get latest 5 regardless of age
-            if not alert_rows:
-                fallback_result = await session.execute(
-                    select(GuardianAlert).where(
-                        GuardianAlert.session_id.in_(list(session_map.keys())),
-                    ).order_by(GuardianAlert.created_at.desc()).limit(5)
-                )
-                alert_rows = fallback_result.scalars().all()
-
-            for a in alert_rows:
-                a_type = a.alert_type
-                alerts_list.append({
-                    "id": str(a.id),
-                    "session_id": str(a.session_id),
-                    "user_name": user_names.get(session_map.get(a.session_id), "Unknown"),
-                    "alert_type": a_type,
-                    "type": a_type,
-                    "severity": a.severity,
-                    "message": a.message,
-                    "details": a.details,
-                    "recommendation": a.recommendation,
-                    "location": a.location,
-                    "created_at": a.created_at.isoformat() if a.created_at else None,
-                })
+        for a in alert_rows:
+            a_type = a.alert_type
+            alerts_list.append({
+                "id": str(a.id),
+                "session_id": str(a.session_id) if a.session_id else None,
+                "user_name": user_names.get(a.user_id, "Unknown"),
+                "alert_type": a_type,
+                "type": a_type,
+                "severity": a.severity,
+                "message": a.message,
+                "details": a.details,
+                "recommendation": a.recommendation,
+                "location": a.location,
+                "created_at": a.created_at.isoformat() if a.created_at else None,
+            })
 
     # ── Part 2: Check-in records (all states — pending, safe, help, expired) ──
     guardian_user_result = await session.execute(

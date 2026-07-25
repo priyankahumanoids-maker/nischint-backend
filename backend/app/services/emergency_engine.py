@@ -130,6 +130,19 @@ async def trigger_silent_sos(
     child_user = child_result.scalar_one_or_none()
     child_name = child_user.full_name if child_user else "Child"
 
+    # Create GuardianAlert record so GET /guardian/dashboard/alerts surfaces the emergency
+    from app.models.guardian import GuardianAlert
+    alert = GuardianAlert(
+        user_id=uuid.UUID(user_id),
+        alert_type="emergency_triggered",
+        severity="critical",
+        message=f"EMERGENCY: {child_name} triggered SOS!",
+        details=f"Silent SOS triggered. Emergency Event: {event_id}",
+        location={"lat": lat, "lng": lng},
+    )
+    session.add(alert)
+    await session.commit()
+
     sse_payload = {
         "event": "SOS_TRIGGERED",
         "event_id": event_id,
@@ -317,16 +330,14 @@ async def cancel_emergency(
     }
     await broadcaster.broadcast_to_operators("emergency_cancelled", cancel_payload)
 
-    from app.models.guardian import Guardian
-    g_result = await session.execute(
-        select(Guardian).where(Guardian.user_id == event.user_id, Guardian.is_active.is_(True))
-    )
-    for gc in g_result.scalars().all():
-        if gc.email:
-            gu_result = await session.execute(select(User).where(User.email == gc.email))
-            gu = gu_result.scalar_one_or_none()
-            if gu:
-                await broadcaster.broadcast_to_user(str(gu.id), "emergency_cancelled", cancel_payload)
+    from app.services.alert_trigger import _resolve_guardian_ids
+    guardian_ids, _ = await _resolve_guardian_ids(session, user_id)
+    for guardian_id in guardian_ids:
+        await broadcaster.broadcast_to_user(
+            guardian_id,
+            "emergency_cancelled",
+            cancel_payload,
+        )
     logger.info(f"[SOS-SSE] Cancellation broadcast to operators + guardians")
 
     return {
@@ -359,6 +370,13 @@ async def resolve_emergency(
     delete_key("emergency", event_id)
     _update_active_list(str(event.user_id), event_id, "remove")
 
+    await _notify_guardians_all_clear(
+        session,
+        str(event.user_id),
+        event_id,
+        "resolved",
+    )
+
     logger.info(f"Emergency RESOLVED: event={event_id}")
 
     # Broadcast resolution via SSE to operators + guardians
@@ -379,16 +397,14 @@ async def resolve_emergency(
     }
     await broadcaster.broadcast_to_operators("emergency_resolved", resolve_payload)
 
-    from app.models.guardian import Guardian
-    g_result = await session.execute(
-        select(Guardian).where(Guardian.user_id == event.user_id, Guardian.is_active.is_(True))
-    )
-    for gc in g_result.scalars().all():
-        if gc.email:
-            gu_result = await session.execute(select(User).where(User.email == gc.email))
-            gu = gu_result.scalar_one_or_none()
-            if gu:
-                await broadcaster.broadcast_to_user(str(gu.id), "emergency_resolved", resolve_payload)
+    from app.services.alert_trigger import _resolve_guardian_ids
+    guardian_ids, _ = await _resolve_guardian_ids(session, user_id)
+    for guardian_id in guardian_ids:
+        await broadcaster.broadcast_to_user(
+            guardian_id,
+            "emergency_resolved",
+            resolve_payload,
+        )
     logger.info(f"[SOS-SSE] Resolution broadcast to operators + guardians")
 
     return {
@@ -477,79 +493,125 @@ async def _notify_guardians(
     trigger_source: str,
     timestamp: datetime,
 ) -> int:
-    """Send push + SMS to all linked guardians. Returns count notified."""
-    result = await session.execute(
-        select(Guardian).where(
-            Guardian.user_id == uuid.UUID(user_id),
-            Guardian.is_active.is_(True),
-        )
-    )
-    guardians = result.scalars().all()
+    """Send push + SMS to all linked guardians using unified resolution. Returns count notified."""
+    from app.models.user import User
+    from app.services.alert_trigger import _resolve_guardian_ids
+    guardian_ids, child_name = await _resolve_guardian_ids(session, user_id)
 
-    if not guardians:
+    if not guardian_ids:
         logger.warning(f"No guardians found for user {user_id}")
         return 0
 
     notified = 0
-    for g in guardians:
+    for gid in guardian_ids:
         try:
             # Push notification
-            prefs = g.notification_pref or {}
-            if prefs.get("push", True):
-                try:
-                    from app.services.push_service import send_push_to_user
-                    from app.services.notification_formatter import push_sos
-                    title, body = push_sos(g.name or "Your loved one", {"lat": lat, "lng": lng})
-                    await send_push_to_user(
-                        session=session,
-                        user_id=g.user_id,
-                        title=title,
-                        body=body,
-                    )
-                except Exception as push_err:
-                    logger.warning(f"Push failed for guardian {g.id}: {push_err}")
+            try:
+                from app.services.push_service import send_push_to_user
+                from app.services.notification_formatter import push_sos
+                title, body = push_sos(child_name or "Your loved one", {"lat": lat, "lng": lng})
+                await send_push_to_user(
+                    session=session,
+                    user_id=uuid.UUID(gid),
+                    title=title,
+                    body=body,
+                    data={
+                        "type": "EMERGENCY_TRIGGERED",
+                        "event_type": "emergency_triggered",
+                        "alert_type": "emergency_triggered",
+                        "event_id": event_id,
+                        "child_id": user_id,
+                        "child_name": child_name or "Protected member",
+                        "lat": lat,
+                        "lng": lng,
+                        "severity": "critical",
+                        "screen": "alerts",
+                    },
+                    channel_id="critical_safety",
+                    louder=True,
+                )
+            except Exception as push_err:
+                logger.warning(f"Push failed for guardian {gid}: {push_err}")
 
             # SMS fallback
-            if prefs.get("sms", True) and g.phone:
-                try:
+            try:
+                g_user = (await session.execute(select(User).where(User.id == uuid.UUID(gid)))).scalar_one_or_none()
+                if g_user and g_user.phone:
                     from app.services.sms_service import send_sos_sms
                     send_sos_sms(
-                        to=g.phone,
-                        user_name=g.name or "Your loved one",
+                        to=g_user.phone,
+                        user_name=child_name or "Your loved one",
                         location={"lat": lat, "lng": lng},
                     )
-                except Exception as sms_err:
-                    logger.warning(f"SMS failed for guardian {g.id}: {sms_err}")
+            except Exception as sms_err:
+                logger.warning(f"SMS failed for guardian {gid}: {sms_err}")
 
             notified += 1
         except Exception as e:
-            logger.error(f"Failed to notify guardian {g.id}: {e}")
+            logger.error(f"Failed to notify guardian {gid}: {e}")
 
-    logger.info(f"Emergency {event_id}: notified {notified}/{len(guardians)} guardians")
+    logger.info(f"Emergency {event_id}: notified {notified}/{len(guardian_ids)} guardians")
     return notified
 
 
 async def _notify_guardians_cancel(session: AsyncSession, user_id: str, event_id: str):
     """Notify guardians that the emergency was cancelled."""
-    result = await session.execute(
-        select(Guardian).where(
-            Guardian.user_id == uuid.UUID(user_id),
-            Guardian.is_active.is_(True),
-        )
+    await _notify_guardians_all_clear(
+        session,
+        user_id,
+        event_id,
+        "cancelled",
     )
-    for g in result.scalars().all():
+
+
+async def _notify_guardians_all_clear(
+    session: AsyncSession,
+    user_id: str,
+    event_id: str,
+    status: str,
+):
+    """Push a named all-clear to every linked guardian account."""
+    from app.services.alert_trigger import _resolve_guardian_ids
+    from app.services.push_service import send_push_to_user
+    from app.services.notification_formatter import push_emergency_cancelled
+
+    guardian_ids, child_name = await _resolve_guardian_ids(session, user_id)
+    display_name = child_name or "Protected member"
+    title, body = push_emergency_cancelled(display_name)
+    event_type = (
+        "emergency_resolved"
+        if status == "resolved"
+        else "emergency_cancelled"
+    )
+
+    for guardian_id in guardian_ids:
         try:
-            from app.services.push_service import send_push_to_user
-            from app.services.notification_formatter import push_emergency_cancelled
-            title, body = push_emergency_cancelled(g.name or "User")
             await send_push_to_user(
                 session=session,
-                user_id=g.user_id,
+                user_id=uuid.UUID(guardian_id),
                 title=title,
                 body=body,
+                data={
+                    "type": event_type.upper(),
+                    "eventType": event_type,
+                    "event_type": event_type,
+                    "alert_type": event_type,
+                    "event_id": event_id,
+                    "child_id": user_id,
+                    "child_name": display_name,
+                    "user_name": display_name,
+                    "severity": "low",
+                    "screen": "alerts",
+                },
+                channel_id="safety-alerts",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "All-clear push failed guardian=%s event=%s: %s",
+                guardian_id,
+                event_id,
+                exc,
+            )
 
 
 # ── Redis Active List Management ──

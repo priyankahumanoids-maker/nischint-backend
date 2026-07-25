@@ -157,11 +157,10 @@ async def _resolve_device(db: AsyncSession, device_id: str) -> dict | None:
 
     user_id = str(row.user_id)
 
-    # Resolve guardian IDs
-    g = await db.execute(text("""
-        SELECT guardian_id FROM relationships WHERE child_id = :uid AND status = 'accepted'
-    """), {"uid": user_id})
-    guardian_ids = [str(r2.guardian_id) for r2 in g.fetchall()]
+    # Resolve every real linked primary/co-guardian using the canonical
+    # relationship resolver (direct link + code invite + guardian network).
+    from app.services.alert_trigger import _resolve_guardian_ids
+    guardian_ids, _ = await _resolve_guardian_ids(db, user_id)
 
     # Last known location from guardian_sessions
     loc = await db.execute(text("""
@@ -355,27 +354,57 @@ async def ingest_event(
 
     await db.commit()
 
-    # SSE broadcast to guardians (non-blocking)
-    import asyncio
-    sse_event_type = f"wearable_{req.event_type.lower()}"
-    for gid in context["guardian_ids"]:
-        asyncio.create_task(broadcaster.broadcast_to_user(gid, sse_event_type, enriched))
-
-    # Trigger escalation for emergency events (non-blocking)
-    escalation_triggered = False
-    if alert_category == "EMERGENCY":
+    # Route real hardware events through the same persisted alert +
+    # FCM/SMS pipeline as phone SOS/fall events. DEVICE_TEST remains an
+    # audit-only diagnostic and never becomes a family safety alert.
+    wearable_kind = {
+        "BUTTON_PRESS": "sos",
+        "BUTTON_LONG_PRESS": "sos",
+        "BUTTON_DOUBLE_PRESS": "help_requested",
+        "FALL_DETECTED": "fall_detected",
+        "IMPACT_DETECTED": "wearable_impact",
+        "TAMPER_DETECTED": "wearable_tamper",
+        "GEOFENCE_BREACH": "geofence_breach",
+        "HEARTRATE_ANOMALY": "health_anomaly",
+    }.get(req.event_type)
+    severity = {
+        "BUTTON_PRESS": "critical",
+        "BUTTON_LONG_PRESS": "critical",
+        "BUTTON_DOUBLE_PRESS": "critical",
+        "FALL_DETECTED": "critical",
+        "IMPACT_DETECTED": "high",
+        "TAMPER_DETECTED": "high",
+        "GEOFENCE_BREACH": "high",
+        "HEARTRATE_ANOMALY": "high",
+    }.get(req.event_type, "medium")
+    event_label = req.event_type.replace("_", " ").title()
+    alert_dispatch = None
+    if wearable_kind:
         try:
-            from app.services.auto_escalation_engine import _trigger_escalation
-            asyncio.create_task(_trigger_escalation(
-                event_id=req.event_id or str(uuid.uuid4()),
+            from app.services.alert_trigger import trigger_alert
+            alert_dispatch = await trigger_alert(
+                db,
+                kind=wearable_kind,
                 user_id=context["user_id"],
-                child_name=context["user_name"] or "Unknown",
-                alert_type="wearable_emergency",
-            ))
-            escalation_triggered = True
-            logger.info(f"[WEARABLE_ESCALATION] Triggered for user={context['user_id']}")
-        except Exception as e:
-            logger.error(f"[WEARABLE_ESCALATION_FAIL] {e}")
+                severity=severity,
+                message=(
+                    f"{event_label} reported by paired "
+                    f"{context.get('device_uid') or 'wearable'}."
+                ),
+                details=(
+                    "Source: paired BLE wearable/keychain/band. "
+                    f"Hardware event ID: {req.event_id or 'not supplied'}."
+                ),
+                location=context["location"],
+                sse_event_type=f"wearable_{req.event_type.lower()}",
+                sse_payload_extras=enriched,
+                louder=severity == "critical",
+                idempotency_key=req.event_id or f"{req.device_id}:{req.event_type}",
+                cooldown_s=60,
+            )
+            await db.commit()
+        except Exception as exc:
+            logger.error("[WEARABLE_ALERT_DISPATCH_FAIL] %s", exc)
 
     logger.info(f"[WEARABLE_EVENT] type={req.event_type} -> {alert_category} "
                 f"user={context['user_id']} guardians={len(context['guardian_ids'])}")
@@ -385,8 +414,19 @@ async def ingest_event(
         "event_id": req.event_id,
         "alert_category": alert_category,
         "user_id": context["user_id"],
-        "guardians_notified": len(context["guardian_ids"]),
-        "escalation_triggered": escalation_triggered,
+        "guardians_notified": (
+            alert_dispatch.guardians_notified
+            if alert_dispatch is not None
+            else 0
+        ),
+        "alert_id": (
+            alert_dispatch.alert_id
+            if alert_dispatch is not None
+            else None
+        ),
+        "escalation_triggered": bool(
+            alert_dispatch is not None and severity == "critical"
+        ),
     }
 
 
@@ -437,17 +477,34 @@ async def device_heartbeat(
 
     await db.commit()
 
-    # Low battery alert (broadcast to guardians if < 20%)
+    # Low battery alert from an actual BLE Battery Service reading.
     if req.battery is not None and req.battery < 20 and device.user_id:
-        g = await db.execute(text("""
-            SELECT guardian_id FROM relationships WHERE child_id = :uid AND status = 'accepted'
-        """), {"uid": str(device.user_id)})
-        for row in g.fetchall():
-            await broadcaster.broadcast_to_user(str(row.guardian_id), "device_low_battery", {
-                "device_id": req.device_id,
-                "battery": req.battery,
-                "user_id": str(device.user_id),
-            })
+        try:
+            from app.services.alert_trigger import trigger_alert
+            dispatch = await trigger_alert(
+                db,
+                kind="low_battery",
+                user_id=str(device.user_id),
+                severity="high" if req.battery <= 10 else "medium",
+                message=f"Paired wearable battery is {req.battery}%.",
+                details=(
+                    "Battery value was read from the paired device's "
+                    "standard BLE Battery Service."
+                ),
+                location=None,
+                sse_event_type="device_low_battery",
+                sse_payload_extras={
+                    "device_id": req.device_id,
+                    "battery": req.battery,
+                    "user_id": str(device.user_id),
+                    "source": "ble_battery_service",
+                },
+                idempotency_key=f"{req.device_id}:below20",
+                cooldown_s=1800,
+            )
+            await db.commit()
+        except Exception as exc:
+            logger.error("[WEARABLE_LOW_BATTERY_DISPATCH_FAIL] %s", exc)
 
     return {"status": "ok", "device_id": req.device_id}
 

@@ -117,7 +117,21 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
             session,
             child_uuid,
             "Safety Check",
-            f"{guardian.full_name or 'Your parent'} is checking on you — are you safe?",
+            "Your guardian is checking on you. Are you safe?",
+            data={
+                "type": "CHECKIN_REQUEST",
+                "eventType": "checkin_pending",
+                "event_type": "checkin_pending",
+                "check_in_id": check_in_id,
+                "child_id": child_id,
+                "child_name": child_name,
+                "guardian_id": guardian_id,
+                "guardian_name": guardian.full_name or "Your guardian",
+                "created_at": created_at,
+                "expires_in_seconds": CHECKIN_EXPIRY_MINUTES * 60,
+                "screen": "home",
+            },
+            channel_id="safety-alerts",
         )
         logger.info(f"CHECKIN_PUSH_SENT child={child_id}")
     except Exception as e:
@@ -137,6 +151,7 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
             "guardian_name": guardian.full_name or "Your parent",
             "status": "pending",
             "created_at": created_at,
+            "expires_in_seconds": CHECKIN_EXPIRY_MINUTES * 60,
         }
         await broadcaster.broadcast_to_user(guardian_id, "checkin_pending", pending_payload)
         logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_pending user={guardian_id} checkin={check_in_id}")
@@ -226,38 +241,64 @@ async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: 
     child = child_result.scalar_one_or_none()
     child_name = child.full_name if child else "Your child"
     guardian_id_str = str(ci.guardian_id)
+    from app.services.alert_trigger import _resolve_guardian_ids
+    linked_guardian_ids, _ = await _resolve_guardian_ids(session, child_id)
+    guardian_recipient_ids = list(dict.fromkeys([
+        guardian_id_str,
+        *linked_guardian_ids,
+    ]))
 
     # ── Step A: Push notification ──
     push_count = 0
     if response == "safe":
-        try:
-            from app.services.push_service import send_push_to_user
-            push_count = await send_push_to_user(
-                session, ci.guardian_id,
-                "All Clear",
-                f"{child_name} confirmed they are safe.",
-            )
-            logger.info(f"CHECKIN_RESPOND Push sent to guardian {guardian_id_str}: count={push_count}")
-        except Exception as e:
-            logger.warning(f"CHECKIN_RESPOND Push failed for safe response: {e}")
+        from app.services.push_service import send_push_to_user
+        for recipient_id in guardian_recipient_ids:
+            try:
+                push_count += await send_push_to_user(
+                    session, uuid.UUID(recipient_id),
+                    "All Clear",
+                    f"{child_name} confirmed they are safe.",
+                    data={
+                        "type": "CHECKIN_SAFE",
+                        "eventType": "checkin_safe",
+                        "event_type": "checkin_safe",
+                        "child_id": str(ci.child_id),
+                        "child_name": child_name,
+                        "check_in_id": str(ci.id),
+                        "checkin_id": str(ci.id),
+                        "screen": "alerts",
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    f"CHECKIN_RESPOND safe push failed guardian={recipient_id}: {e}"
+                )
 
     elif response == "help":
-        try:
-            from app.services.push_service import send_push_to_user
-            push_count = await send_push_to_user(
-                session, ci.guardian_id,
-                f"URGENT: {child_name} needs help!",
-                f"{child_name} responded to your safety check requesting help!",
-                data={
-                    "type": "CHECKIN_HELP",
-                    "child_id": str(ci.child_id),
-                    "child_name": child_name,
-                    "checkin_id": str(ci.id),
-                },
-            )
-            logger.info(f"CHECKIN_RESPOND Push sent to guardian {guardian_id_str}: count={push_count}")
-        except Exception as e:
-            logger.warning(f"CHECKIN_RESPOND Push failed for help response: {e}")
+        from app.services.push_service import send_push_to_user
+        for recipient_id in guardian_recipient_ids:
+            try:
+                push_count += await send_push_to_user(
+                    session, uuid.UUID(recipient_id),
+                    f"URGENT: {child_name} needs help!",
+                    f"{child_name} responded to your safety check requesting help!",
+                    data={
+                        "type": "CHECKIN_HELP",
+                        "eventType": "checkin_help",
+                        "event_type": "checkin_help",
+                        "child_id": str(ci.child_id),
+                        "child_name": child_name,
+                        "check_in_id": str(ci.id),
+                        "checkin_id": str(ci.id),
+                        "screen": "alerts",
+                    },
+                    channel_id="critical_safety",
+                    louder=True,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"CHECKIN_RESPOND help push failed guardian={recipient_id}: {e}"
+                )
 
     # ── Step B: Broadcast real-time SSE event to guardian + child + operators ──
     response_payload = {
@@ -271,8 +312,16 @@ async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: 
     try:
         from app.services.event_broadcaster import broadcaster
         event_type = "checkin_help" if response == "help" else "checkin_safe"
-        await broadcaster.broadcast_to_user(guardian_id_str, event_type, response_payload)
-        logger.info(f"[SSE_CHECKIN_EMIT] type={event_type} user={guardian_id_str} checkin={check_in_id}")
+        for recipient_id in guardian_recipient_ids:
+            await broadcaster.broadcast_to_user(
+                recipient_id,
+                event_type,
+                response_payload,
+            )
+            logger.info(
+                f"[SSE_CHECKIN_EMIT] type={event_type} "
+                f"user={recipient_id} checkin={check_in_id}"
+            )
         await broadcaster.broadcast_to_user(child_id, event_type, response_payload)
         logger.info(f"[SSE_CHECKIN_EMIT] type={event_type} user={child_id} checkin={check_in_id}")
         await broadcaster.broadcast_to_operators(event_type, response_payload)
@@ -482,16 +531,39 @@ async def expire_stale_checkins(session: AsyncSession) -> int:
         child = child_result.scalar_one_or_none()
         child_name = child.full_name if child else "Your child"
 
-        # Notify guardian: no response
-        try:
-            from app.services.push_service import send_push_to_user
-            await send_push_to_user(
-                session, ci.guardian_id,
-                "No Response",
-                f"{child_name} did not respond to your safety check within 15 minutes.",
-            )
-        except Exception as e:
-            logger.warning(f"Failed to send expiry push: {e}")
+        from app.services.alert_trigger import _resolve_guardian_ids
+        linked_guardian_ids, _ = await _resolve_guardian_ids(
+            session,
+            str(ci.child_id),
+        )
+        guardian_recipient_ids = list(dict.fromkeys([
+            str(ci.guardian_id),
+            *linked_guardian_ids,
+        ]))
+
+        from app.services.push_service import send_push_to_user
+        for recipient_id in guardian_recipient_ids:
+            try:
+                await send_push_to_user(
+                    session,
+                    uuid.UUID(recipient_id),
+                    "No Response",
+                    f"{child_name} did not respond to the safety check within 15 minutes.",
+                    data={
+                        "type": "CHECKIN_EXPIRED",
+                        "eventType": "checkin_expired",
+                        "event_type": "checkin_expired",
+                        "check_in_id": str(ci.id),
+                        "child_id": str(ci.child_id),
+                        "child_name": child_name,
+                        "severity": "high",
+                        "screen": "alerts",
+                    },
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to send expiry push guardian={recipient_id}: {e}"
+                )
 
         # Broadcast checkin_expired to both guardian and child via SSE
         try:
@@ -504,8 +576,16 @@ async def expire_stale_checkins(session: AsyncSession) -> int:
                 "status": "expired",
                 "expired_at": now.isoformat(),
             }
-            await broadcaster.broadcast_to_user(str(ci.guardian_id), "checkin_expired", expired_payload)
-            logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_expired user={ci.guardian_id} checkin={ci.id}")
+            for recipient_id in guardian_recipient_ids:
+                await broadcaster.broadcast_to_user(
+                    recipient_id,
+                    "checkin_expired",
+                    expired_payload,
+                )
+                logger.info(
+                    f"[SSE_CHECKIN_EMIT] type=checkin_expired "
+                    f"user={recipient_id} checkin={ci.id}"
+                )
             await broadcaster.broadcast_to_user(str(ci.child_id), "checkin_expired", expired_payload)
             logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_expired user={ci.child_id} checkin={ci.id}")
         except Exception as e:

@@ -11,6 +11,7 @@ Endpoints:
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -53,6 +54,13 @@ class LocationUpdateRequest(BaseModel):
     user_id: str | None = Field(None, description="Defaults to the authenticated user")
     lat: float = Field(..., ge=-90, le=90)
     lng: float = Field(..., ge=-180, le=180)
+    battery_pct: int | None = Field(None, ge=0, le=100)
+    accuracy_m: float | None = Field(None, ge=0)
+    speed_mps: float | None = Field(None, ge=0)
+    captured_at: datetime | None = Field(
+        None,
+        description="Native device fix time; server receipt time is used when omitted",
+    )
 
 
 # ── Authorization helpers ──
@@ -243,7 +251,11 @@ async def location_update(
     Protected user pings their current lat/lng. Backend evaluates against their
     active safety zone and emits SSE events with emotional copy on transitions.
     """
-    from app.services.geofence_alerts import evaluate_user_location
+    from app.services.geofence_alerts import (
+        evaluate_environmental_hazard,
+        evaluate_user_location,
+        record_protected_telemetry,
+    )
 
     target_id = req.user_id or str(user.id)
     # Users may only update their OWN location via this endpoint (ownership guard).
@@ -251,7 +263,38 @@ async def location_update(
     if target_id != str(user.id) and not _is_admin(user):
         raise HTTPException(status_code=403, detail="You can only update your own location.")
 
+    telemetry = await record_protected_telemetry(
+        session,
+        target_id,
+        req.lat,
+        req.lng,
+        battery_pct=req.battery_pct,
+        accuracy_m=req.accuracy_m,
+        speed_mps=req.speed_mps,
+        captured_at=req.captured_at,
+    )
+    # A delayed offline fix is useful as truthful last-known state, but must not
+    # replay historical safe-zone/environmental alerts when the phone reconnects.
+    if not telemetry["is_current"]:
+        await session.commit()
+        return {
+            "state": "stale",
+            "message": "Last known location recorded; waiting for a current device fix.",
+            "distance_m": None,
+            "radius_m": None,
+            "zone_id": None,
+            "telemetry": telemetry,
+            "environmental": [],
+        }
+
     result = await evaluate_user_location(session, target_id, req.lat, req.lng)
+    environmental = await evaluate_environmental_hazard(
+        session,
+        target_id,
+        req.lat,
+        req.lng,
+    )
+    await session.commit()
     return {
         "state": result.state,
         "message": result.message,
@@ -261,6 +304,27 @@ async def location_update(
         "zone_name": result.zone_name,
         "transition": result.transition,
         "breach_alert_fired": result.breach_alert_fired,
+        "telemetry": {
+            "battery_pct": telemetry.get("battery_pct"),
+            "updated_at": telemetry.get("updated_at"),
+            "source": telemetry.get("source"),
+        },
+        "environmental_hazard": {
+            "matched": bool(environmental.get("matched")),
+            "source": (
+                (environmental.get("strongest") or {}).get("source")
+                if environmental.get("matched")
+                else None
+            ),
+            "title": (
+                (environmental.get("strongest") or {}).get("title")
+                if environmental.get("matched")
+                else None
+            ),
+            "alert_dispatched": bool(
+                environmental.get("guardian_alert_dispatched")
+            ),
+        },
     }
 
 

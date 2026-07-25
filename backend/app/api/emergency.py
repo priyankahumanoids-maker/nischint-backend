@@ -76,8 +76,19 @@ async def silent_sos(
         "woman":    True,
         "elderly":  True,
         "senior":   True,
+        "family":   True,
+        "family_member": True,
+        "family-member": True,
+        "member": True,
+        "protected_member": True,
+        "protected_child": True,
         "guardian": False,
         "parent":   False,
+        "co_guardian": False,
+        "co-guardian": False,
+        "co_parent": False,
+        "co-parent": False,
+        "coparent": False,
         "operator": False,
         "admin":    False,
     }
@@ -85,7 +96,7 @@ async def silent_sos(
     if not CAN_TRIGGER_SOS.get(user_role, False):
         raise HTTPException(
             status_code=403,
-            detail=f"Role '{user_role or 'unknown'}' cannot trigger SOS. Only protected users (child/woman/elderly) may emit emergency events.",
+            detail=f"Role '{user_role or 'unknown'}' cannot trigger SOS. Only protected members may emit emergency events.",
         )
 
     # ── Critical UX Rule: if active emergency exists, return it (never block panicking user) ──
@@ -156,6 +167,8 @@ async def silent_sos(
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
+
+    await session.commit()
 
     return JSONResponse(content=result, headers=_rate_limit_headers(user_rl))
 

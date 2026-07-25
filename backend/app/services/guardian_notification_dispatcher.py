@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.guardian import Guardian, GuardianAlert
+from app.models.user import User
 from app.services.notification_service import _send_twilio_sms
 from app.services.push_service import send_push_to_user
 from app.core.config import settings
@@ -29,6 +30,16 @@ DISPATCH_RULES = {
     "emergency":     {"push": True,  "sms": True,  "priority": "CRITICAL"},
     "arrived":       {"push": True,  "sms": False, "priority": "INFO"},
     "safety_confirmed": {"push": False, "sms": False, "priority": "INFO"},
+    "sos":            {"push": True,  "sms": True,  "priority": "CRITICAL"},
+    "fall_detected":  {"push": True,  "sms": True,  "priority": "CRITICAL"},
+    "help_requested": {"push": True,  "sms": True,  "priority": "CRITICAL"},
+    "geofence_breach": {"push": True, "sms": False, "priority": "HIGH"},
+    "geofence_recovery": {"push": True, "sms": False, "priority": "INFO"},
+    "environmental_hazard": {"push": True, "sms": False, "priority": "HIGH"},
+    "low_battery": {"push": True, "sms": False, "priority": "MEDIUM"},
+    "wearable_impact": {"push": True, "sms": False, "priority": "HIGH"},
+    "wearable_tamper": {"push": True, "sms": False, "priority": "HIGH"},
+    "health_anomaly": {"push": True, "sms": False, "priority": "HIGH"},
 }
 
 
@@ -44,8 +55,22 @@ def _mark_sms_sent(guardian_id: str, alert_type: str):
 
 
 def _format_push_title(alert_type: str, severity: str) -> str:
-    if alert_type == "emergency":
+    if alert_type in ("emergency", "sos"):
         return "\U0001F534 NISCHINT ALERT"
+    if alert_type == "fall_detected":
+        return "\U0001F534 NISCHINT POSSIBLE FALL"
+    if alert_type == "help_requested":
+        return "\U0001F534 NISCHINT HELP REQUEST"
+    if alert_type == "geofence_breach":
+        return "\U0001F7E1 NISCHINT SAFETY ZONE"
+    if alert_type == "geofence_recovery":
+        return "\U0001F7E2 NISCHINT BACK IN SAFE AREA"
+    if alert_type == "environmental_hazard":
+        return "\U0001F7E0 NISCHINT AREA WARNING"
+    if alert_type == "low_battery":
+        return "\U0001F7E1 NISCHINT LOW BATTERY"
+    if alert_type in ("wearable_impact", "wearable_tamper", "health_anomaly"):
+        return "\U0001F7E1 NISCHINT DEVICE ALERT"
     if alert_type == "zone_risk":
         return "\U0001F7E1 NISCHINT ALERT"
     if alert_type == "idle":
@@ -84,6 +109,7 @@ async def dispatch_guardian_alert(
     session_id: str,
     *,
     louder: bool = False,
+    guardian_user_ids: list[str] | None = None,
 ) -> dict:
     """Dispatch a guardian alert to all guardians via their preferred channels.
 
@@ -106,7 +132,12 @@ async def dispatch_guardian_alert(
         )
     )
     guardians = result.scalars().all()
-    if not guardians:
+    resolved_guardian_user_ids = {
+        uuid.UUID(str(guardian_id))
+        for guardian_id in (guardian_user_ids or [])
+    }
+
+    if not guardians and not resolved_guardian_user_ids:
         logger.info(f"No active guardians for user {user_id}")
         return {"dispatched": False, "reason": "no_guardians", "push_sent": 0, "sms_sent": 0}
 
@@ -115,6 +146,39 @@ async def dispatch_guardian_alert(
     sms_skipped = 0
     errors = []
     sent_push_user_ids: set[uuid.UUID] = set()
+    title = _format_push_title(alert.alert_type, alert.severity)
+    if louder:
+        title = f"\U0001F6A8 {title} \u2014 ESCALATED"
+    body = f"{alert.message}"
+    if alert.details:
+        body += f" \u2014 {alert.details}"
+    child_result = await session.execute(
+        select(User).where(User.id == uuid.UUID(user_id))
+    )
+    child = child_result.scalar_one_or_none()
+    child_name = (
+        (child.full_name or child.email)
+        if child
+        else "Protected member"
+    )
+    payload_data = {
+        "type": "SAFETY_ALERT",
+        "alert_id": str(alert.id),
+        "session_id": session_id,
+        "event_type": alert.alert_type,
+        "alert_type": alert.alert_type,
+        "severity": alert.severity,
+        "child_id": user_id,
+        "child_name": child_name,
+        "user_name": child_name,
+        "message": alert.message,
+        "screen": "alerts",
+    }
+    if alert.location:
+        if alert.location.get("lat") is not None:
+            payload_data["lat"] = alert.location["lat"]
+        if alert.location.get("lng") is not None:
+            payload_data["lng"] = alert.location["lng"]
 
     for g in guardians:
         prefs = g.notification_pref or {}
@@ -125,24 +189,9 @@ async def dispatch_guardian_alert(
         # ships. Each guardian's User row owns the push tokens.
         if rules["push"] and prefs.get("push", True):
             try:
-                title = _format_push_title(alert.alert_type, alert.severity)
-                if louder:
-                    title = f"\U0001F6A8 {title} \u2014 ESCALATED"
-                body = f"{alert.message}"
-                if alert.details:
-                    body += f" \u2014 {alert.details}"
-                payload_data = {
-                    "type": "SAFETY_ALERT",
-                    "alert_id": str(alert.id),
-                    "session_id": session_id,
-                    "alert_type": alert.alert_type,
-                    "severity": alert.severity,
-                }
-                
                 # Resolve target guardian account user ID
                 target_user_id = None
                 if g.email:
-                    from app.models.user import User
                     gu_result = await session.execute(
                         select(User.id).where(User.email == g.email)
                     )
@@ -150,7 +199,6 @@ async def dispatch_guardian_alert(
 
                 # Fallback: check if child has a primary guardian_id set in User table
                 if not target_user_id:
-                    from app.models.user import User
                     child_res = await session.execute(
                         select(User.guardian_id).where(User.id == uuid.UUID(user_id))
                     )
@@ -199,9 +247,42 @@ async def dispatch_guardian_alert(
                 logger.error(f"SMS error for guardian {g.name}: {e}")
                 errors.append(f"sms:{g.name}:{e}")
 
+    # Invite-code relationships resolve directly to guardian User IDs and may
+    # not have a legacy Guardian row. Dispatch to those accounts as well so
+    # closed-app FCM delivery works for QR/code-linked families.
+    if rules["push"]:
+        for target_user_id in resolved_guardian_user_ids:
+            if target_user_id in sent_push_user_ids:
+                continue
+            try:
+                sent = await send_push_to_user(
+                    session,
+                    target_user_id,
+                    title,
+                    body,
+                    data=payload_data,
+                    channel_id="safety-alerts",
+                    louder=louder,
+                )
+                push_sent += sent
+                sent_push_user_ids.add(target_user_id)
+                logger.info(
+                    f"PUSH{' LOUDER' if louder else ''} "
+                    f"[{alert.alert_type}] to linked guardian user "
+                    f"{target_user_id}: sent={sent}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Push error for linked guardian user {target_user_id}: {e}"
+                )
+                errors.append(f"push:{target_user_id}:{e}")
+
     result = {
         "dispatched": True,
-        "guardians_count": len(guardians),
+        "guardians_count": max(
+            len(guardians),
+            len(set(resolved_guardian_user_ids) | sent_push_user_ids),
+        ),
         "push_sent": push_sent,
         "sms_sent": sms_sent,
         "sms_skipped_rate_limit": sms_skipped,

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
 from app.core.cognito import is_cognito_enabled
+from app.core.config import settings
 from app.core.rate_limiter import limiter
 from app.core.security import create_access_token
 from app.models.user import User
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-INVITE_CODE_TTL_MINUTES = 15
+INVITE_CODE_TTL_MINUTES = settings.family_invite_ttl_minutes
 
 
 def _generate_invite_code() -> str:
@@ -192,7 +193,8 @@ async def generate_invite_code(
 ):
     """
     Guardian generates a 6-character invite code.
-    Stores it in users.invite_code + users.invite_code_expires_at (15-minute TTL).
+    Stores it in users.invite_code + users.invite_code_expires_at using the
+    server-configured FAMILY_INVITE_TTL_MINUTES (15 minutes by default).
     Calling again overwrites the previous code.
     """
     from datetime import datetime, timezone

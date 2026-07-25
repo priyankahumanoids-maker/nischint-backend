@@ -153,7 +153,7 @@ def push_resolved(name: str, incident_type: str) -> tuple:
 def push_emergency_cancelled(name: str) -> tuple:
     t = _now_str()
     title = "\U0001F7E2 NISCHINT ALL CLEAR"
-    body = f"{name} \u2014 SOS cancelled, user is safe. {t}"
+    body = f"{name} is safe now. SOS has been resolved. {t}"
     return title, body
 
 

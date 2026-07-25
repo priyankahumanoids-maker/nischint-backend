@@ -10,7 +10,7 @@ from typing import Optional, List
 from sqlalchemy import select, and_, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db_session
+from app.api.deps import get_current_user, get_db_session
 from app.core.roles import require_role
 from app.models.user import User
 from app.models.guardian_network import GuardianRelationship, EmergencyContact, GuardianInvite
@@ -92,6 +92,98 @@ def _serialize_contact(c: EmergencyContact) -> dict:
         "is_active": c.is_active,
         "notes": c.notes,
         "created_at": c.created_at.isoformat(),
+    }
+
+
+@router.get("/family-profile")
+async def get_family_profile(
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Return the authenticated member, linked guardians and shared contacts.
+
+    Protected members can read the real safety network belonging to their
+    linked guardian accounts. This keeps child Settings consistent with the
+    contacts configured by a parent without exposing unrelated families.
+    """
+    from app.services.alert_trigger import _resolve_guardian_ids
+
+    guardian_ids, _ = await _resolve_guardian_ids(session, str(user.id))
+    primary_guardian_id = (
+        str(user.guardian_id) if getattr(user, "guardian_id", None) else None
+    )
+
+    if primary_guardian_id:
+        guardian_ids = [
+            primary_guardian_id,
+            *[gid for gid in guardian_ids if gid != primary_guardian_id],
+        ]
+    elif user.role in ("guardian", "parent", "admin"):
+        guardian_ids = [str(user.id)]
+
+    guardian_users = []
+    if guardian_ids:
+        guardian_uuids = [uuid_mod.UUID(gid) for gid in guardian_ids]
+        guardian_rows = (
+            await session.execute(select(User).where(User.id.in_(guardian_uuids)))
+        ).scalars().all()
+        guardian_by_id = {str(row.id): row for row in guardian_rows}
+        for index, guardian_id in enumerate(guardian_ids):
+            guardian = guardian_by_id.get(guardian_id)
+            if not guardian:
+                continue
+            guardian_users.append({
+                "id": str(guardian.id),
+                "full_name": guardian.full_name,
+                "email": guardian.email,
+                "phone": guardian.phone,
+                "priority": index + 1,
+                "is_primary": guardian_id == primary_guardian_id or index == 0,
+                "relationship": (
+                    "Primary Guardian"
+                    if guardian_id == primary_guardian_id or index == 0
+                    else "Co-Guardian"
+                ),
+            })
+
+    # Parent-configured contacts are family-wide. Include contacts owned by
+    # the protected member or any of their linked guardian accounts.
+    contact_owner_ids = {user.id}
+    contact_owner_ids.update(uuid_mod.UUID(gid) for gid in guardian_ids)
+    contact_rows = (
+        await session.execute(
+            select(EmergencyContact)
+            .where(and_(
+                EmergencyContact.user_id.in_(contact_owner_ids),
+                EmergencyContact.is_active == True,
+            ))
+            .order_by(EmergencyContact.priority, EmergencyContact.created_at)
+        )
+    ).scalars().all()
+
+    contacts = []
+    seen_contacts = set()
+    for contact in contact_rows:
+        dedup_key = (
+            "".join(ch for ch in (contact.phone or "") if ch.isdigit()),
+            (contact.name or "").strip().lower(),
+        )
+        if dedup_key in seen_contacts:
+            continue
+        seen_contacts.add(dedup_key)
+        contacts.append(_serialize_contact(contact))
+
+    return {
+        "member": {
+            "id": str(user.id),
+            "full_name": user.full_name,
+            "email": user.email,
+            "phone": user.phone,
+            "role": user.role,
+        },
+        "guardians": guardian_users,
+        "emergency_contacts": contacts,
+        "total_contacts": len(guardian_users) + len(contacts),
     }
 
 
@@ -287,7 +379,7 @@ async def get_escalation_chain(
 @router.get("/emergency-contacts")
 async def list_emergency_contacts(
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(require_role("admin", "operator", "guardian")),
+    user: User = Depends(require_role("admin", "operator", "guardian", "parent")),
 ):
     """List emergency contacts for the user."""
     rows = (await session.execute(
@@ -305,7 +397,7 @@ async def list_emergency_contacts(
 async def add_emergency_contact(
     body: EmergencyContactCreate,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(require_role("admin", "operator", "guardian")),
+    user: User = Depends(require_role("admin", "operator", "guardian", "parent")),
 ):
     """Add an emergency contact."""
     contact = EmergencyContact(
@@ -328,7 +420,7 @@ async def update_emergency_contact(
     contact_id: str,
     body: EmergencyContactUpdate,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(require_role("admin", "operator", "guardian")),
+    user: User = Depends(require_role("admin", "operator", "guardian", "parent")),
 ):
     """Update an emergency contact."""
     try:
@@ -356,7 +448,7 @@ async def update_emergency_contact(
 async def delete_emergency_contact(
     contact_id: str,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(require_role("admin", "operator", "guardian")),
+    user: User = Depends(require_role("admin", "operator", "guardian", "parent")),
 ):
     """Delete an emergency contact (soft delete)."""
     try:

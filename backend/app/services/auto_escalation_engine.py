@@ -269,7 +269,33 @@ async def _trigger_guardian_failsafe(event_id: str, child_user_id: str, child_na
                 logger.warning(f"[SEQ_COLLECT] GuardianRelationship failed: {e}")
 
             # 4b. Guardians from Relationship table (primary link)
+            resolved_guardian_ids: list[str] = []
             try:
+                from app.services.alert_trigger import _resolve_guardian_ids
+                resolved_guardian_ids, _ = await _resolve_guardian_ids(
+                    session,
+                    child_user_id,
+                )
+                for guardian_id in resolved_guardian_ids:
+                    gu = await session.execute(
+                        select(User).where(User.id == uuid.UUID(guardian_id))
+                    )
+                    guardian_user = gu.scalar_one_or_none()
+                    if (
+                        guardian_user
+                        and guardian_user.phone
+                        and guardian_user.phone not in seen_phones
+                    ):
+                        seen_phones.add(guardian_user.phone)
+                        all_contacts.append(EscalationContact(
+                            phone=guardian_user.phone,
+                            name=guardian_user.full_name or guardian_user.email or "",
+                            source="resolved_guardian",
+                            is_primary=True,
+                            priority=1,
+                            guardian_user_id=str(guardian_user.id),
+                        ))
+
                 rel_result = await session.execute(
                     select(Relationship).where(
                         Relationship.child_id == uuid.UUID(child_user_id),
@@ -285,7 +311,7 @@ async def _trigger_guardian_failsafe(event_id: str, child_user_id: str, child_na
                         seen_phones.add(guardian_user.phone)
                         all_contacts.append(EscalationContact(
                             phone=guardian_user.phone,
-                            name=guardian_user.name or "",
+                            name=guardian_user.full_name or guardian_user.email or "",
                             source="relationship",
                             is_primary=True,  # Relationship table = primary link
                             priority=1,
@@ -323,9 +349,14 @@ async def _trigger_guardian_failsafe(event_id: str, child_user_id: str, child_na
 
             # 4d. Emergency contacts
             try:
+                contact_owner_ids = {uuid.UUID(child_user_id)}
+                contact_owner_ids.update(
+                    uuid.UUID(guardian_id)
+                    for guardian_id in resolved_guardian_ids
+                )
                 ec_result = await session.execute(
                     select(EmergencyContact).where(
-                        EmergencyContact.user_id == uuid.UUID(child_user_id),
+                        EmergencyContact.user_id.in_(contact_owner_ids),
                         EmergencyContact.is_active.is_(True),
                     ).order_by(EmergencyContact.priority)
                 )

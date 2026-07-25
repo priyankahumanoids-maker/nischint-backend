@@ -211,10 +211,19 @@ async def send_push_to_tokens(
                     "data": {k: str(v) for k, v in push_data.items()},
                     "android": {
                         "priority": "high",
+                        # Keep emergency pushes briefly queued if the device is
+                        # reconnecting as the SOS fires. A zero TTL discards the
+                        # alert whenever FCM cannot deliver it immediately.
+                        "ttl": "300s" if louder else "3600s",
                         "notification": android_notif,
                     },
                     "apns": {
-                        "payload": {"aps": apns_aps},
+                        "payload": {
+                            "aps": {
+                                **apns_aps,
+                                "content-available": 1,
+                            }
+                        },
                         "headers": {
                             "apns-priority": "10",
                             **({"apns-push-type": "alert"} if louder else {}),
