@@ -1,6 +1,7 @@
 # Authentication Router — Dual-mode: Local JWT + AWS Cognito
 import logging
 import random
+import uuid
 from datetime import timedelta
 from typing import Optional
 
@@ -12,7 +13,11 @@ from app.api.deps import get_db_session, get_current_user
 from app.core.cognito import is_cognito_enabled
 from app.core.config import settings
 from app.core.rate_limiter import limiter
-from app.core.security import create_access_token
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    decode_refresh_token,
+)
 from app.models.user import User
 from app.schemas.user import RegisterRequest
 from app.services import user_service
@@ -130,16 +135,73 @@ async def get_me(
     }
 
 
+@router.post("/session", response_model=TokenResponse)
+@limiter.limit("10/minute")
+async def upgrade_local_session(
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """Upgrade a valid legacy access-token session to rotating refresh tokens."""
+    claims = {
+        "sub": str(user.id),
+        "role": user.role,
+        "email": user.email,
+        "full_name": user.full_name,
+    }
+    return TokenResponse(
+        access_token=create_access_token(data=claims),
+        refresh_token=create_refresh_token(data={"sub": str(user.id)}),
+        role=user.role,
+        auth_provider="local",
+    )
+
+
 @router.post("/refresh")
+@limiter.limit("30/minute")
 async def refresh(
+    request: Request,
     req: RefreshRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Refresh tokens (Cognito only — local JWTs use re-login)."""
+    """Rotate a local or Cognito refresh token without asking for a password."""
+    local_claims = decode_refresh_token(req.refresh_token)
+    if local_claims:
+        from sqlalchemy import select
+
+        try:
+            refresh_user_id = uuid.UUID(str(local_claims["sub"]))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh session is invalid or expired",
+            )
+        result = await session.execute(
+            select(User).where(User.id == refresh_user_id)
+        )
+        user = result.scalar_one_or_none()
+        if not user or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh session is no longer valid",
+            )
+
+        token_claims = {
+            "sub": str(user.id),
+            "role": user.role,
+            "email": user.email,
+            "full_name": user.full_name,
+        }
+        return TokenResponse(
+            access_token=create_access_token(data=token_claims),
+            refresh_token=create_refresh_token(data={"sub": str(user.id)}),
+            role=user.role,
+            auth_provider="local",
+        )
+
     if not is_cognito_enabled():
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Token refresh requires Cognito auth",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh session is invalid or expired",
         )
     from app.core.cognito import refresh_tokens
     try:
@@ -283,7 +345,12 @@ async def verify_invite_code(
         "email": new_user.email,
         "full_name": new_user.full_name,
     })
-    return TokenResponse(access_token=access_token, role=new_user.role, auth_provider="local")
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=create_refresh_token(data={"sub": str(new_user.id)}),
+        role=new_user.role,
+        auth_provider="local",
+    )
 
 
 # ── My Guardian ──
@@ -380,7 +447,12 @@ async def _local_register(req: RegisterRequest, session: AsyncSession) -> TokenR
         "email": user.email,
         "full_name": user.full_name,
     })
-    return TokenResponse(access_token=access_token, role=user.role, auth_provider="local")
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=create_refresh_token(data={"sub": str(user.id)}),
+        role=user.role,
+        auth_provider="local",
+    )
 
 
 async def _local_login(login_request: LoginRequest, session: AsyncSession) -> TokenResponse:
@@ -440,7 +512,12 @@ async def _local_login(login_request: LoginRequest, session: AsyncSession) -> To
         "full_name": user.full_name,
     })
 
-    return TokenResponse(access_token=access_token, role=user.role, auth_provider="local")
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=create_refresh_token(data={"sub": str(user.id)}),
+        role=user.role,
+        auth_provider="local",
+    )
 
 
 # ── Cognito Auth Flows ──

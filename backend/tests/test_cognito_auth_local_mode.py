@@ -58,8 +58,9 @@ class TestLoginLocalMode:
         assert data["role"] == "guardian", f"Expected guardian role, got {data['role']}"
         assert data["auth_provider"] == "local", f"Expected local auth_provider, got {data['auth_provider']}"
         
-        # Optional Cognito fields should be null in local mode
-        assert data.get("refresh_token") is None, "refresh_token should be null in local mode"
+        # Local sessions now rotate a signed refresh token; Cognito-only fields
+        # remain null.
+        assert data.get("refresh_token"), "local refresh_token should be returned"
         assert data.get("cognito_id_token") is None, "cognito_id_token should be null in local mode"
         
         # Validate token is a non-empty string
@@ -118,8 +119,7 @@ class TestRegisterLocalMode:
         assert data["role"] == "guardian", f"Expected guardian role, got {data['role']}"
         assert data["auth_provider"] == "local", f"Expected local auth_provider, got {data['auth_provider']}"
         
-        # Optional Cognito fields should be null in local mode
-        assert data.get("refresh_token") is None, "refresh_token should be null in local mode"
+        assert data.get("refresh_token"), "local refresh_token should be returned"
         assert data.get("cognito_id_token") is None, "cognito_id_token should be null in local mode"
         
         print(f"PASS: Registration returns correct response shape with auth_provider=local")
@@ -155,19 +155,31 @@ class TestRegisterLocalMode:
 
 
 class TestRefreshEndpointLocalMode:
-    """Test token refresh endpoint - should reject in local mode"""
+    """Test rotating local refresh sessions."""
 
-    def test_refresh_rejected_in_local_mode(self):
-        """POST /api/auth/refresh should return 400 when Cognito is not enabled"""
+    def test_valid_local_refresh_rotates_tokens(self):
+        login = requests.post(
+            f"{BASE_URL}/api/auth/login",
+            json={"email": TEST_GUARDIAN_EMAIL, "password": TEST_GUARDIAN_PASSWORD},
+        )
+        assert login.status_code == 200, login.text
+        refresh_token = login.json()["refresh_token"]
         response = requests.post(
             f"{BASE_URL}/api/auth/refresh",
-            json={"refresh_token": "any_token_value"}
+            json={"refresh_token": refresh_token},
         )
-        assert response.status_code == 400, f"Expected 400, got {response.status_code}"
+        assert response.status_code == 200, response.text
         data = response.json()
-        assert "detail" in data, "Missing error detail"
-        assert "Token refresh requires Cognito auth" in data["detail"], f"Unexpected error: {data['detail']}"
-        print(f"PASS: Refresh rejected in local mode: {data['detail']}")
+        assert data.get("access_token")
+        assert data.get("refresh_token")
+        assert data.get("auth_provider") == "local"
+
+    def test_invalid_local_refresh_is_rejected(self):
+        response = requests.post(
+            f"{BASE_URL}/api/auth/refresh",
+            json={"refresh_token": "invalid-refresh-token"},
+        )
+        assert response.status_code == 401, response.text
 
 
 class TestConfirmEndpointLocalMode:

@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     jwt_secret: str = "nischint_jwt_secret_key_prod_2026"
     jwt_algorithm: str = "HS256"
     jwt_expires_minutes: int = 60
+    jwt_refresh_expires_days: int = Field(default=30, ge=1, le=365)
     family_invite_ttl_minutes: int = Field(default=15, ge=1, le=1440)
 
     # ── Database (Neon PostgreSQL) ──
@@ -73,6 +74,7 @@ class Settings(BaseSettings):
     # ── Device Offline Detection ──
     device_offline_threshold_minutes: int = 10
     device_offline_cooldown_minutes: int = 15
+    location_stale_threshold_seconds: int = Field(default=180, ge=60, le=3600)
 
     # ── Health Rule: Low Battery ──
     rule_low_battery_enabled: bool = True

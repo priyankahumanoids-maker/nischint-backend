@@ -36,6 +36,28 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 
+def create_refresh_token(data: dict) -> str:
+    """Create a long-lived, signed refresh token for local-auth sessions."""
+    to_encode = data.copy()
+    to_encode.update({
+        "type": "refresh",
+        "exp": datetime.now(timezone.utc)
+        + timedelta(days=settings.jwt_refresh_expires_days),
+    })
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_refresh_token(token: str) -> Optional[dict]:
+    """Validate a local refresh token and reject access-token substitution."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh" or not payload.get("sub"):
+            return None
+        return payload
+    except JWTError:
+        return None
+
+
 def verify_token(token: str) -> Optional[str]:
     """
     Verify and decode a JWT token.

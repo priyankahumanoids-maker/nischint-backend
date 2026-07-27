@@ -529,6 +529,20 @@ async def expire_stale_sessions_job():
             logger.error(f"Session lifecycle job error: {e}")
 
 
+async def detect_stale_location_heartbeats_job():
+    """Report enrolled protected phones that stopped sending real fixes."""
+    async with async_session() as session:
+        try:
+            from app.services.location_availability import (
+                detect_stale_location_heartbeats,
+            )
+            count = await detect_stale_location_heartbeats(session)
+            if count:
+                logger.info("Marked %s protected location heartbeat(s) stale", count)
+        except Exception as e:
+            logger.error(f"Location heartbeat watchdog error: {e}")
+
+
 
 def start_scheduler():
     if not scheduler.running:
@@ -575,11 +589,20 @@ def start_scheduler():
             replace_existing=True,
             max_instances=1, coalesce=True, misfire_grace_time=30,
         )
+        scheduler.add_job(
+            detect_stale_location_heartbeats_job,
+            'interval',
+            seconds=60,
+            id='location_heartbeat_watchdog',
+            replace_existing=True,
+            max_instances=1, coalesce=True, misfire_grace_time=30,
+        )
         scheduler.start()
         logger.info(f"Escalation scheduler started - checking every {settings.escalation_check_interval}s")
         logger.info("Device health scheduler started - checking every 300s")
         logger.info("Check-in expiry scheduler started - checking every 60s")
         logger.info("Session lifecycle scheduler started - checking every 60s")
+        logger.info("Location heartbeat watchdog started - checking every 60s")
 
 
 def stop_scheduler():

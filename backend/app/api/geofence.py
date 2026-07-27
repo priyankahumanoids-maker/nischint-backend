@@ -63,6 +63,14 @@ class LocationUpdateRequest(BaseModel):
     )
 
 
+class LocationAvailabilityRequest(BaseModel):
+    available: bool
+    reason: str = Field(..., min_length=1, max_length=80)
+    services_enabled: bool | None = None
+    foreground_permission: str | None = None
+    background_permission: str | None = None
+
+
 # ── Authorization helpers ──
 async def _is_guardian_of(session: AsyncSession, guardian_id: str, child_id: str) -> bool:
     """True if `guardian_id` is linked as a guardian of `child_id`."""
@@ -287,6 +295,15 @@ async def location_update(
             "environmental": [],
         }
 
+    from app.services.location_availability import record_location_availability
+    await record_location_availability(
+        session,
+        target_id,
+        available=True,
+        reason="current_location_fix",
+        source="protected_device",
+    )
+
     result = await evaluate_user_location(session, target_id, req.lat, req.lng)
     environmental = await evaluate_environmental_hazard(
         session,
@@ -326,6 +343,26 @@ async def location_update(
             ),
         },
     }
+
+
+@router.post("/location-availability")
+async def location_availability(
+    req: LocationAvailabilityRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Receive the protected phone's real permission/services state."""
+    from app.services.location_availability import record_location_availability
+
+    state = await record_location_availability(
+        session,
+        str(user.id),
+        available=req.available,
+        reason=req.reason,
+        source="protected_device_status",
+    )
+    await session.commit()
+    return state
 
 
 @router.get("/status/{target_user_id}")
