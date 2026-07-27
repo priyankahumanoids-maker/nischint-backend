@@ -23,20 +23,24 @@ async def register_push_token(
     session: AsyncSession = Depends(get_db_session),
 ):
     """Register an FCM push token for the current user."""
-    # A physical installation can change accounts. One FCM token must never
-    # remain attached to a previous guardian/protected user after login
-    # changes, otherwise private safety notifications reach the wrong person.
-    await session.execute(
-        text(
-            "DELETE FROM push_tokens "
-            "WHERE token = :tok AND user_id <> :uid"
-        ),
-        {"uid": current_user.id, "tok": body.token},
-    )
+    # `push_tokens.token` is the installation-level UNIQUE key. Upsert on that
+    # real constraint so registration works on a fresh guardian installation
+    # and atomically moves a token when the same installation changes account.
+    #
+    # The previous conflict target `(user_id, token)` does not exist in the
+    # staging schema (only `token` is unique), so PostgreSQL rejected new token
+    # registrations before they could be stored. Existing protected-member
+    # tokens could therefore keep receiving pushes while guardian devices had
+    # no closed-app delivery path.
     await session.execute(
         text(
             "INSERT INTO push_tokens (user_id, token) VALUES (:uid, :tok) "
-            "ON CONFLICT (user_id, token) DO NOTHING"
+            "ON CONFLICT (token) DO UPDATE SET "
+            "user_id = EXCLUDED.user_id, "
+            "updated_at = NOW(), "
+            "consecutive_failures = 0, "
+            "last_failure_at = NULL, "
+            "last_failure_reason = NULL"
         ),
         {"uid": current_user.id, "tok": body.token},
     )
