@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     firebase_sa_key_path: str = ""
     firebase_sa_key_json: str = ""
     firebase_project_id: str = "nischint-5f248"
+    firebase_private_key: str = ""
+    firebase_client_email: str = ""
     push_provider: str = "stub"
 
     # ── Escalation Thresholds (minutes) ──

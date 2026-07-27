@@ -233,7 +233,7 @@ async def test_send_push_to_tokens_louder_payload_shape():
     payload = captured["payload"]["message"]
     assert payload["data"]["louder_push"] == "true"
     android = payload["android"]["notification"]
-    assert android["channel_id"] == "critical_safety"
+    assert android["channel_id"] == push_service.CRITICAL_SAFETY_CHANNEL_ID
     assert android["sound"] == "siren_loop"
     assert android["sticky"] is True
     assert android["default_vibrate_timings"] is False
@@ -270,7 +270,7 @@ async def test_send_push_to_tokens_normal_payload_shape():
     payload = captured["payload"]["message"]
     assert "louder_push" not in payload["data"]
     android = payload["android"]["notification"]
-    assert android["channel_id"] == "safety-alerts"
+    assert android["channel_id"] == push_service.GUARDIAN_ALERT_CHANNEL_ID
     assert android["sound"] == "default"
     apns_aps = payload["apns"]["payload"]["aps"]
     assert apns_aps["sound"] == "default"

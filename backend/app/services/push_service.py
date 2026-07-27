@@ -1,4 +1,5 @@
 # Push Notification Service (FCM via HTTP v1)
+import asyncio
 import json
 import logging
 from uuid import UUID
@@ -16,6 +17,12 @@ logger = logging.getLogger(__name__)
 
 FCM_SCOPES = ["https://www.googleapis.com/auth/firebase.messaging"]
 _credentials = None
+GUARDIAN_ALERT_CHANNEL_ID = "nischint_guardian_alerts_v2"
+CRITICAL_SAFETY_CHANNEL_ID = "nischint_critical_safety_v2"
+_LEGACY_CHANNEL_ALIASES = {
+    "safety-alerts": GUARDIAN_ALERT_CHANNEL_ID,
+    "critical_safety": CRITICAL_SAFETY_CHANNEL_ID,
+}
 
 
 def _get_credentials():
@@ -33,6 +40,24 @@ def _get_credentials():
                 _credentials = service_account.Credentials.from_service_account_info(
                     info, scopes=FCM_SCOPES
                 )
+            elif settings.firebase_private_key and settings.firebase_client_email:
+                # The platform handover uses split Firebase environment
+                # variables. Accept that canonical format as well as the JSON
+                # secret so staging push does not silently remain disabled.
+                info = {
+                    "type": "service_account",
+                    "project_id": settings.firebase_project_id,
+                    "private_key": settings.firebase_private_key.replace(
+                        "\\n",
+                        "\n",
+                    ),
+                    "client_email": settings.firebase_client_email,
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+                _credentials = service_account.Credentials.from_service_account_info(
+                    info,
+                    scopes=FCM_SCOPES,
+                )
     return _credentials
 
 
@@ -40,6 +65,8 @@ def _get_access_token() -> str:
     creds = _get_credentials()
     if creds is None:
         raise RuntimeError("Firebase service account not configured")
+    if creds.token and creds.valid:
+        return creds.token
     request = google.auth.transport.requests.Request()
     creds.refresh(request)
     return creds.token
@@ -141,7 +168,7 @@ async def send_push_to_tokens(
     title: str,
     body: str,
     data: dict | None = None,
-    channel_id: str = "safety-alerts",
+    channel_id: str = GUARDIAN_ALERT_CHANNEL_ID,
     *,
     louder: bool = False,
 ) -> int:
@@ -151,32 +178,35 @@ async def send_push_to_tokens(
     profile: aggressive vibration loop, sticky notification, DND
     bypass (when granted client-side), siren_loop sound. Used by the
     escalation engine on the `louder_push` step. Requires the Android
-    client to have created the `critical_safety` channel — without
+    client to have created the current critical channel — without
     that, FCM will silently downgrade to default channel.
     """
-    if not tokens:
+    unique_tokens = list(dict.fromkeys(token for token in tokens if token))
+    if not unique_tokens:
         return 0
 
     project_id = settings.firebase_project_id
     url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
 
     try:
-        access_token = _get_access_token()
+        # Google's auth transport is synchronous. Keep a credential refresh
+        # off the event loop; later pushes reuse the valid cached OAuth token.
+        access_token = await asyncio.to_thread(_get_access_token)
     except Exception as e:
         logger.error(f"Failed to get FCM access token: {e}")
         return 0
 
     push_data = {**(data or {}), "click_action": "FLUTTER_NOTIFICATION_CLICK"}
+    channel_id = _LEGACY_CHANNEL_ALIASES.get(channel_id, channel_id)
     if louder:
         push_data["louder_push"] = "true"
         # Force the critical-safety channel regardless of caller's
         # `channel_id` — the louder_push contract is "this MUST land
         # on the critical channel or not at all".
-        channel_id = "critical_safety"
+        channel_id = CRITICAL_SAFETY_CHANNEL_ID
 
-    sent = 0
     async with httpx.AsyncClient() as client:
-        for token in tokens:
+        async def send_one(token: str) -> int:
             android_notif = {
                 "channel_id": channel_id,
                 "notification_priority": "PRIORITY_MAX",
@@ -242,8 +272,8 @@ async def send_push_to_tokens(
                         f"[FCM_PUSH_SENT]{' LOUDER' if louder else ''} "
                         f"to={mask_token(token)} title={title}"
                     )
-                    sent += 1
                     await _record_token_success(token)
+                    return 1
                 else:
                     logger.warning(f"[FCM_PUSH_FAIL] {resp.status_code}: {resp.text}")
                     if _is_dead_token_response(resp.status_code, resp.text):
@@ -252,7 +282,15 @@ async def send_push_to_tokens(
                         await _record_token_failure(token, reason=f"http={resp.status_code}")
             except Exception as e:
                 logger.error(f"[FCM_PUSH_ERROR] {e}")
-    return sent
+            return 0
+
+        # A user can have stale phone/install tokens alongside the current
+        # token. Send concurrently so a dead token never delays the active
+        # guardian device.
+        results = await asyncio.gather(
+            *(send_one(token) for token in unique_tokens),
+        )
+    return sum(results)
 
 
 async def send_push_to_user(
@@ -261,7 +299,7 @@ async def send_push_to_user(
     title: str,
     body: str,
     data: dict | None = None,
-    channel_id: str = "safety-alerts",
+    channel_id: str = GUARDIAN_ALERT_CHANNEL_ID,
     *,
     louder: bool = False,
 ) -> int:
