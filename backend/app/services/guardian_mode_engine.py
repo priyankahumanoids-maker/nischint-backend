@@ -96,13 +96,14 @@ def _guardian_to_dict(g: Guardian) -> dict:
 async def start_session(
     session: AsyncSession, user_id: str, lat: float, lng: float,
     dest_lat: float | None = None, dest_lng: float | None = None,
+    dest_name: str | None = None,
 ) -> dict:
     now = datetime.now(timezone.utc)
     zone = await check_zone(session, user_id, lat, lng, now)
 
     gs = GuardianSession(
         user_id=uuid.UUID(user_id), status="active",
-        destination={"lat": dest_lat, "lng": dest_lng} if dest_lat else None,
+        destination={"lat": dest_lat, "lng": dest_lng, "name": dest_name} if dest_lat is not None else None,
         current_location={"lat": lat, "lng": lng},
         risk_level=zone["risk_level"], risk_score=zone["risk_score"],
         zone_name=zone["zone_name"],
@@ -214,7 +215,8 @@ async def get_active_sessions(session: AsyncSession) -> list[dict]:
             "risk_level": gs.risk_level, "risk_score": gs.risk_score,
             "zone_name": gs.zone_name, "is_idle": gs.is_idle,
             "route_deviated": gs.route_deviated, "escalation_level": gs.escalation_level,
-            "location": gs.current_location, "eta_minutes": gs.eta_minutes,
+            "location": gs.current_location, "destination": gs.destination,
+            "eta_minutes": gs.eta_minutes,
             "location_updates": gs.location_updates,
         })
     sessions.sort(key=lambda x: x["risk_score"], reverse=True)

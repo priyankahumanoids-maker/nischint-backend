@@ -507,7 +507,7 @@ async def check_device_health():
 
 
 async def expire_stale_checkins_job():
-    """Background job: expire pending check-ins older than 5 min."""
+    """Background job: escalate unanswered one-minute safety checks."""
     async with async_session() as session:
         try:
             from app.services.checkin_service import expire_stale_checkins
@@ -576,7 +576,7 @@ def start_scheduler():
         scheduler.add_job(
             expire_stale_checkins_job,
             'interval',
-            seconds=60,
+            seconds=10,
             id='checkin_expiry',
             replace_existing=True,
             max_instances=1, coalesce=True, misfire_grace_time=30,

@@ -18,6 +18,7 @@ class LocationInput(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lng: float = Field(..., ge=-180, le=180)
     accuracy: Optional[float] = None
+    name: Optional[str] = Field(None, max_length=240)
 
 
 class AddGuardianRequest(BaseModel):
@@ -86,6 +87,7 @@ async def start_session(
         session, str(user.id), req.location.lat, req.location.lng,
         dest_lat=req.destination.lat if req.destination else None,
         dest_lng=req.destination.lng if req.destination else None,
+        dest_name=req.destination.name if req.destination else None,
     )
 
 

@@ -151,6 +151,25 @@ def _is_admin(user) -> bool:
     return (getattr(user, "role", None) or "").lower() in ("admin", "operator")
 
 
+async def _can_manage_safety(session: AsyncSession, user: User, target_user_id: str) -> bool:
+    """Only admins and linked primary guardians may mutate safety assignments.
+
+    Protected members can view assignments made for them, but cannot create,
+    edit, or delete those records. Co-guardians/co-parents remain read-only.
+    """
+    if _is_admin(user):
+        return True
+    caller_id = str(user.id)
+    if caller_id == target_user_id:
+        return False
+    role = (getattr(user, "role", None) or "").lower().replace("-", "_")
+    if role in ("co_guardian", "co_parent", "coparent"):
+        return False
+    if role not in ("guardian", "parent", "primary_guardian"):
+        return False
+    return await _is_guardian_of(session, caller_id, target_user_id)
+
+
 # ── Endpoints ──
 @router.post("/zone-for-user")
 async def create_zone_for_user(
@@ -161,14 +180,8 @@ async def create_zone_for_user(
     """Guardian creates/updates a safety zone for a linked protected user."""
     caller_id = str(user.id)
 
-    # Authorization: admin OR guardian-of-child OR the user themselves
-    if req.user_id != caller_id and not _is_admin(user):
-        ok = await _is_guardian_of(session, caller_id, req.user_id)
-        if not ok:
-            raise HTTPException(
-                status_code=403,
-                detail="You are not authorized to manage this user's safety zones.",
-            )
+    if not await _can_manage_safety(session, user, req.user_id):
+        raise HTTPException(status_code=403, detail="Only a Primary Guardian can manage safety zones.")
 
     zone = SafeZone(
         user_id=uuid.UUID(req.user_id),
@@ -253,9 +266,8 @@ async def update_zone(
     if not zone or not zone.active:
         raise HTTPException(status_code=404, detail="Zone not found")
     caller_id = str(user.id)
-    if str(zone.user_id) != caller_id and not _is_admin(user):
-        if not await _is_guardian_of(session, caller_id, str(zone.user_id)):
-            raise HTTPException(status_code=403, detail="Not authorized to edit this zone.")
+    if not await _can_manage_safety(session, user, str(zone.user_id)):
+        raise HTTPException(status_code=403, detail="Only a Primary Guardian can edit this zone.")
     zone.name = req.name
     zone.address = req.address
     zone.lat = req.center_lat
@@ -285,10 +297,8 @@ async def deactivate_zone(
     if not z:
         raise HTTPException(status_code=404, detail="Zone not found")
     caller_id = str(user.id)
-    if str(z.user_id) != caller_id and not _is_admin(user):
-        ok = await _is_guardian_of(session, caller_id, str(z.user_id))
-        if not ok:
-            raise HTTPException(status_code=403, detail="Not authorized to remove this zone.")
+    if not await _can_manage_safety(session, user, str(z.user_id)):
+        raise HTTPException(status_code=403, detail="Only a Primary Guardian can remove this zone.")
     z.active = False
     await session.commit()
     try:
@@ -596,13 +606,8 @@ async def create_route_for_user(
     """Guardian creates a monitored route corridor for a linked protected user."""
     caller_id = str(user.id)
 
-    if req.user_id != caller_id and not _is_admin(user):
-        ok = await _is_guardian_of(session, caller_id, req.user_id)
-        if not ok:
-            raise HTTPException(
-                status_code=403,
-                detail="You are not authorized to manage this user's routes.",
-            )
+    if not await _can_manage_safety(session, user, req.user_id):
+        raise HTTPException(status_code=403, detail="Only a Primary Guardian can manage monitored routes.")
 
     route_obj = MonitoredRoute(
         user_id=uuid.UUID(req.user_id),
@@ -690,10 +695,8 @@ async def deactivate_route(
         raise HTTPException(status_code=404, detail="Route not found")
 
     caller_id = str(user.id)
-    if str(r.user_id) != caller_id and not _is_admin(user):
-        ok = await _is_guardian_of(session, caller_id, str(r.user_id))
-        if not ok:
-            raise HTTPException(status_code=403, detail="Not authorized to remove this route.")
+    if not await _can_manage_safety(session, user, str(r.user_id)):
+        raise HTTPException(status_code=403, detail="Only a Primary Guardian can remove this route.")
 
     r.active = False
     await session.commit()
@@ -714,9 +717,8 @@ async def update_route(
     if not route or not route.active:
         raise HTTPException(status_code=404, detail="Route not found")
     caller_id = str(user.id)
-    if str(route.user_id) != caller_id and not _is_admin(user):
-        if not await _is_guardian_of(session, caller_id, str(route.user_id)):
-            raise HTTPException(status_code=403, detail="Not authorized to edit this route.")
+    if not await _can_manage_safety(session, user, str(route.user_id)):
+        raise HTTPException(status_code=403, detail="Only a Primary Guardian can edit this route.")
     route.name = req.name
     route.origin_name = req.origin_name
     route.origin_lat = req.origin_lat

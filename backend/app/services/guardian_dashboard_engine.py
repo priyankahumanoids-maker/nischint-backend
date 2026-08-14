@@ -476,6 +476,10 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
                 "recommendation": a.recommendation,
                 "location": a.location,
                 "created_at": a.created_at.isoformat() if a.created_at else None,
+                "ack_status": a.ack_status,
+                "ack_type": a.ack_type,
+                "acknowledged": a.ack_status == "acknowledged" or a.ack_type == "resolved",
+                "acked_at": a.acked_at.isoformat() if a.acked_at else None,
             })
 
     # ── Part 2: Check-in records (all states — pending, safe, help, expired) ──

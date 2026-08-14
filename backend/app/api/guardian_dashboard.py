@@ -3,10 +3,15 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from datetime import datetime, timezone
+import uuid
+
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
 from app.models.user import User
+from app.models.guardian import GuardianAlert
 
 router = APIRouter(prefix="/guardian/dashboard", tags=["guardian-dashboard"])
 
@@ -102,6 +107,34 @@ async def acknowledge_alert(
     """Guardian acknowledges an alert — cancels the guardian failsafe escalation timer."""
     import logging
     logger = logging.getLogger(__name__)
+
+    from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+    linked_user_ids = await _get_linked_user_ids(
+        session,
+        user.email,
+        str(user.id),
+        getattr(user, "role", None),
+    )
+    try:
+        event_uuid = uuid.UUID(req.event_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid alert ID")
+
+    alert = (await session.execute(
+        select(GuardianAlert).where(
+            GuardianAlert.id == event_uuid,
+            GuardianAlert.user_id.in_(linked_user_ids),
+        )
+    )).scalar_one_or_none()
+    if alert is None:
+        raise HTTPException(status_code=404, detail="Alert not found for this guardian")
+
+    alert.ack_status = "acknowledged"
+    alert.ack_type = "resolved"
+    alert.acked_by = user.id
+    alert.acked_at = datetime.now(timezone.utc)
+    await session.flush()
 
     from app.services.auto_escalation_engine import cancel_guardian_failsafe
     cancelled = cancel_guardian_failsafe(req.event_id)

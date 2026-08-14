@@ -13,7 +13,7 @@ from app.models.guardian import Guardian
 
 logger = logging.getLogger(__name__)
 
-CHECKIN_EXPIRY_MINUTES = 15
+CHECKIN_EXPIRY_SECONDS = 60
 
 
 # ── DLQ for check-in audit rows that failed to persist ─────────────
@@ -128,7 +128,7 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
                 "guardian_id": guardian_id,
                 "guardian_name": guardian.full_name or "Your guardian",
                 "created_at": created_at,
-                "expires_in_seconds": CHECKIN_EXPIRY_MINUTES * 60,
+                "expires_in_seconds": CHECKIN_EXPIRY_SECONDS,
                 "screen": "home",
             },
             channel_id="safety-alerts",
@@ -151,7 +151,7 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
             "guardian_name": guardian.full_name or "Your parent",
             "status": "pending",
             "created_at": created_at,
-            "expires_in_seconds": CHECKIN_EXPIRY_MINUTES * 60,
+            "expires_in_seconds": CHECKIN_EXPIRY_SECONDS,
         }
         await broadcaster.broadcast_to_user(guardian_id, "checkin_pending", pending_payload)
         logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_pending user={guardian_id} checkin={check_in_id}")
@@ -184,12 +184,14 @@ async def get_pending_checkins(session: AsyncSession, child_id: str) -> list[dic
 
     checkins = []
     for ci in result.scalars().all():
-        # Auto-expire if older than 15 min (and mark for escalation)
-        age_min = (now - ci.created_at).total_seconds() / 60
-        if age_min > CHECKIN_EXPIRY_MINUTES:
-            ci.status = "expired"
-            ci.escalated_at = now
-            await session.flush()
+        # The guardian escalation check is deliberately short-lived. The
+        # backend owns this deadline so it still applies when either app is
+        # backgrounded or closed.
+        age_seconds = (now - ci.created_at).total_seconds()
+        if age_seconds > CHECKIN_EXPIRY_SECONDS:
+            # Leave the row pending for the background escalator. Marking it
+            # expired here would let a protected-device refresh consume the
+            # row before guardians receive the mandatory high alert.
             continue
 
         # Get guardian name
@@ -202,7 +204,7 @@ async def get_pending_checkins(session: AsyncSession, child_id: str) -> list[dic
             "guardian_name": guardian.full_name if guardian else "Guardian",
             "status": ci.status,
             "created_at": ci.created_at.isoformat(),
-            "expires_in_seconds": max(0, int(CHECKIN_EXPIRY_MINUTES * 60 - age_min * 60)),
+            "expires_in_seconds": max(0, int(CHECKIN_EXPIRY_SECONDS - age_seconds)),
         })
 
     await session.commit()
@@ -627,8 +629,8 @@ async def get_latest_checkin_for_child(session: AsyncSession, guardian_id: str, 
 
 
 async def expire_stale_checkins(session: AsyncSession) -> int:
-    """Background job: expire pending check-ins older than 15 min and notify guardian."""
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=CHECKIN_EXPIRY_MINUTES)
+    """Escalate unanswered guardian safety checks after one minute."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=CHECKIN_EXPIRY_SECONDS)
     result = await session.execute(
         select(CheckIn).where(
             CheckIn.status == "pending",
@@ -658,14 +660,46 @@ async def expire_stale_checkins(session: AsyncSession) -> int:
             *linked_guardian_ids,
         ]))
 
+        # Persist one critical alert against the protected member. Guardian
+        # alert queries resolve it through the family relationship, so every
+        # linked guardian sees the same real high-priority event.
+        try:
+            from app.models.guardian import GuardianAlert, GuardianSession
+            session_result = await session.execute(
+                select(GuardianSession).where(
+                    GuardianSession.user_id == ci.child_id,
+                    GuardianSession.status == "active",
+                ).order_by(GuardianSession.started_at.desc()).limit(1)
+            )
+            active_session = session_result.scalar_one_or_none()
+            alert = GuardianAlert(
+                session_id=active_session.id if active_session else None,
+                user_id=ci.child_id,
+                alert_type="checkin_no_response",
+                severity="critical",
+                message=f"{child_name} did not respond to the safety check within 1 minute.",
+                details=f"Check-in ID: {ci.id}. No protected-member response was received.",
+                recommendation="Call the protected member and check their live location immediately.",
+                location=active_session.current_location if active_session else None,
+            )
+            session.add(alert)
+            await session.flush()
+            try:
+                from app.services.alert_ack_engine import mark_for_ack
+                await mark_for_ack(session, alert)
+            except Exception:
+                logger.exception("[checkin_expiry] alert acknowledgement wiring failed")
+        except SQLAlchemyError:
+            logger.exception("[checkin_expiry] critical guardian alert persistence failed")
+
         from app.services.push_service import send_push_to_user
         for recipient_id in guardian_recipient_ids:
             try:
                 await send_push_to_user(
                     session,
                     uuid.UUID(recipient_id),
-                    "No Response",
-                    f"{child_name} did not respond to the safety check within 15 minutes.",
+                    f"HIGH ALERT: {child_name} did not respond",
+                    f"{child_name} did not respond to the safety check within 1 minute. Check their live location now.",
                     data={
                         "type": "CHECKIN_EXPIRED",
                         "eventType": "checkin_expired",
@@ -673,9 +707,11 @@ async def expire_stale_checkins(session: AsyncSession) -> int:
                         "check_in_id": str(ci.id),
                         "child_id": str(ci.child_id),
                         "child_name": child_name,
-                        "severity": "high",
+                        "severity": "critical",
                         "screen": "alerts",
                     },
+                    channel_id="critical_safety",
+                    louder=True,
                 )
             except Exception as e:
                 logger.warning(
@@ -691,6 +727,8 @@ async def expire_stale_checkins(session: AsyncSession) -> int:
                 "child_name": child_name,
                 "guardian_id": str(ci.guardian_id),
                 "status": "expired",
+                "severity": "critical",
+                "message": f"{child_name} did not respond within 1 minute. Treat this as a high-priority safety alert.",
                 "expired_at": now.isoformat(),
             }
             for recipient_id in guardian_recipient_ids:
