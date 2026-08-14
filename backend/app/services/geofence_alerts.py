@@ -567,17 +567,31 @@ async def evaluate_user_location(
         set_json("geofence:route_state", state_key, payload, ttl=None)
         assignment_states.append(payload)
         any_transition = any_transition or transition
-        if transition and state == "route_deviation":
-            alert_message = f"{name} moved outside monitored route {route.name}."
+        if transition and (
+            state == "route_deviation" or
+            (state == "on_route" and previous.get("state") == "route_deviation")
+        ):
+            is_recovery = state == "on_route"
+            alert_kind = "route_recovery" if is_recovery else "route_deviation"
+            alert_message = (
+                f"{name} returned to monitored route {route.name}."
+                if is_recovery
+                else f"{name} moved outside monitored route {route.name}."
+            )
             try:
                 result = await trigger_alert(
-                    session, kind="route_deviation", user_id=user_id, severity="high",
+                    session, kind=alert_kind, user_id=user_id,
+                    severity="low" if is_recovery else "high",
                     message=alert_message,
-                    details=f"Latest GPS fix is {round(distance_m)} metres from the saved route corridor.",
+                    details=(
+                        "The latest protected-device GPS fix is back inside the saved route corridor."
+                        if is_recovery
+                        else f"Latest GPS fix is {round(distance_m)} metres from the saved route corridor."
+                    ),
                     location={"lat": lat, "lng": lng},
-                    sse_event_type="route_deviation",
+                    sse_event_type=alert_kind,
                     sse_payload_extras={**payload, "message": alert_message},
-                    idempotency_key=f"{route_id}:deviation", cooldown_s=BREACH_COOLDOWN_SEC,
+                    idempotency_key=f"{route_id}:{state}", cooldown_s=BREACH_COOLDOWN_SEC,
                 )
                 any_alert = any_alert or result.dispatched
             except Exception as exc:

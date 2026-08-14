@@ -27,6 +27,7 @@ SMS_RATE_LIMIT_S = 300  # 5 minutes
 DISPATCH_RULES = {
     "zone_risk":     {"push": True,  "sms": True,  "priority": "HIGH"},
     "route_deviation": {"push": True, "sms": False, "priority": "MEDIUM"},
+    "route_recovery": {"push": True, "sms": False, "priority": "INFO"},
     "idle":          {"push": True,  "sms": False, "priority": "MEDIUM"},
     "emergency":     {"push": True,  "sms": True,  "priority": "CRITICAL"},
     "arrived":       {"push": True,  "sms": False, "priority": "INFO"},
@@ -80,6 +81,8 @@ def _format_push_title(alert_type: str, severity: str) -> str:
         return "\U0001F7E2 NISCHINT SAFE"
     if alert_type == "route_deviation":
         return "\U0001F7E1 NISCHINT ALERT"
+    if alert_type == "route_recovery":
+        return "\U0001F7E2 NISCHINT BACK ON ROUTE"
     return "\U0001F534 NISCHINT ALERT"
 
 
