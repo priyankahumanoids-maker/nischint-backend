@@ -20,6 +20,66 @@ from app.services.event_broadcaster import broadcaster
 logger = logging.getLogger(__name__)
 
 
+async def notify_repeat_sos(
+    session: AsyncSession,
+    event_id: str,
+    user_id: str,
+    lat: float,
+    lng: float,
+    trigger_source: str,
+) -> dict:
+    """Fan out every deliberate repeat SOS tap without creating another event."""
+    from app.services.alert_trigger import trigger_alert
+
+    repeat_id = str(uuid.uuid4())
+    result = await trigger_alert(
+        session,
+        kind="sos",
+        user_id=user_id,
+        severity="critical",
+        message="Emergency SOS triggered again",
+        details=f"Repeated SOS tap. Trigger: {trigger_source}",
+        location={"lat": lat, "lng": lng},
+        sse_event_type="emergency_triggered",
+        sse_payload_extras={
+            "event": "SOS_TRIGGERED",
+            "event_id": event_id,
+            "repeat_trigger_id": repeat_id,
+            "trigger_source": trigger_source,
+            "severity_level": 2,
+            "is_repeat": True,
+        },
+        louder=True,
+        idempotency_key=None,
+        cooldown_s=0,
+        suppress_co_located=False,
+    )
+    await broadcaster.broadcast_to_operators("emergency_triggered", {
+        "event": "SOS_TRIGGERED",
+        "event_id": event_id,
+        "child_id": user_id,
+        "user_id": user_id,
+        "lat": lat,
+        "lng": lng,
+        "trigger_source": trigger_source,
+        "repeat_trigger_id": repeat_id,
+        "is_repeat": True,
+    })
+    await broadcaster.broadcast_to_user(user_id, "emergency_triggered", {
+        "event": "SOS_TRIGGERED",
+        "event_id": event_id,
+        "repeat_trigger_id": repeat_id,
+        "is_repeat": True,
+    })
+    logger.warning(
+        "Repeated SOS dispatched: event=%s user=%s guardians=%s",
+        event_id,
+        user_id,
+        result.guardians_notified,
+    )
+    return {"guardians_notified": result.guardians_notified, "repeat_trigger_id": repeat_id}
+
+
 # ── SOS Trigger (immediate) ──
 
 async def trigger_silent_sos(

@@ -50,7 +50,7 @@ class VerifyInviteRequest(BaseModel):
     password: str = Field(min_length=8)
     full_name: str = Field(min_length=1, max_length=100)
     phone: Optional[str] = None
-    role: str = Field("child", pattern="^(child|woman|senior|family)$")
+    role: str = Field("child", pattern="^(child|woman|senior|family|co_parent)$")
 
 
 class LoginRequest(BaseModel):

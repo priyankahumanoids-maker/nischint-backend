@@ -491,6 +491,15 @@ async def startup_db():
         except Exception as _e:
             logger.error(f"[PF-01] startup DDL failed (non-fatal): {_e}")
 
+    if pool:
+        try:
+            from app.migrations.gz02_safe_zone_address import (
+                ensure_safe_zone_address_column,
+            )
+            await ensure_safe_zone_address_column()
+        except Exception as _e:
+            logger.error(f"[GZ-02] startup DDL failed (non-fatal): {_e}")
+
     if os.environ.get("ENV_HAZARD_USE_POSTGIS", "false").strip().lower() in (
         "1", "true", "yes", "on",
     ):

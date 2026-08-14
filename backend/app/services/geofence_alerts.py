@@ -18,6 +18,7 @@ Cooldown:
 """
 from __future__ import annotations
 
+import logging
 import math
 import uuid
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.guardian import GuardianSession
 from app.models.safe_zone import SafeZone
+from app.models.monitored_route import MonitoredRoute
 from app.models.user import User
 
 __all__ = [
@@ -37,6 +39,8 @@ __all__ = [
     "record_protected_telemetry",
     "EMOTIONAL_COPY",
 ]
+
+logger = logging.getLogger(__name__)
 
 # ── Emotional notification copy (per product spec) ──
 # Tokens: {name} = protected user's full name (e.g. "Aarav").
@@ -140,6 +144,44 @@ def invalidate_zone_cache(user_id: str) -> None:
         delete_key("geofence:zone", user_id)
     except Exception:
         pass
+
+
+def clear_zone_runtime_state(user_id: str, zone_id: str) -> None:
+    from app.services.redis_service import delete_key
+    for namespace in (_NS_STATE, _NS_COOL):
+        try:
+            delete_key(namespace, f"{user_id}:{zone_id}")
+        except Exception:
+            pass
+
+
+def clear_route_runtime_state(user_id: str, route_id: str) -> None:
+    from app.services.redis_service import delete_key
+    try:
+        delete_key("geofence:route_state", f"{user_id}:{route_id}")
+    except Exception:
+        pass
+
+
+def _distance_to_route_m(
+    lat: float,
+    lng: float,
+    route: MonitoredRoute,
+) -> float:
+    """Shortest local-plane distance to the saved origin/destination segment."""
+    mean_lat = math.radians((route.origin_lat + route.dest_lat + lat) / 3.0)
+    metres_per_lat = 111_320.0
+    metres_per_lng = max(1.0, 111_320.0 * math.cos(mean_lat))
+    ax, ay = route.origin_lng * metres_per_lng, route.origin_lat * metres_per_lat
+    bx, by = route.dest_lng * metres_per_lng, route.dest_lat * metres_per_lat
+    px, py = lng * metres_per_lng, lat * metres_per_lat
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 0.001:
+        return math.hypot(px - ax, py - ay)
+    fraction = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_sq))
+    closest_x, closest_y = ax + fraction * dx, ay + fraction * dy
+    return math.hypot(px - closest_x, py - closest_y)
 
 
 async def _get_user_name(session: AsyncSession, user_id: str) -> str:
@@ -399,18 +441,33 @@ async def evaluate_user_location(
     lat: float,
     lng: float,
 ) -> GeofenceEvaluation:
-    """
-    Evaluate a user's location against their active safety zone.
-    Emits SSE events with emotionally-designed copy when state transitions.
-    Applies a 60s cooldown on BREACH notifications to prevent spam.
-    """
+    """Evaluate every active zone and route assigned to this protected user."""
     from app.services.redis_service import get_json, set_json, delete_key
     from app.services.event_broadcaster import broadcaster
+    from app.services.alert_trigger import trigger_alert
 
-    zone = await _load_active_zone(session, user_id)
+    zones = (
+        await session.execute(
+            select(SafeZone)
+            .where(
+                SafeZone.user_id == uuid.UUID(user_id),
+                SafeZone.active.is_(True),
+            )
+            .order_by(SafeZone.created_at.asc())
+        )
+    ).scalars().all()
+    routes = (
+        await session.execute(
+            select(MonitoredRoute)
+            .where(
+                MonitoredRoute.user_id == uuid.UUID(user_id),
+                MonitoredRoute.active.is_(True),
+            )
+            .order_by(MonitoredRoute.created_at.asc())
+        )
+    ).scalars().all()
 
-    # No zone configured → nothing to evaluate. Return neutral.
-    if zone is None:
+    if not zones and not routes:
         return GeofenceEvaluation(
             state="safe",
             message="",
@@ -424,127 +481,122 @@ async def evaluate_user_location(
             breach_alert_fired=False,
         )
 
-    distance_m = haversine_m(lat, lng, zone.lat, zone.lng)
-    prev = get_json(_NS_STATE, user_id) or {}
-    prev_state: GeoState | None = prev.get("state")  # type: ignore[assignment]
-    new_state = _compute_state(distance_m, zone.radius_m, prev_state)
-
-    transition = prev_state != new_state
     name = await _get_user_name(session, user_id)
-    message = EMOTIONAL_COPY[new_state].format(name=name)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    assignment_states: list[dict] = []
+    any_transition = False
+    any_alert = False
 
-    # Persist current state (always — for live dashboard reads)
-    set_json(
-        _NS_STATE,
-        user_id,
-        {
-            "state": new_state,
-            "distance_m": round(distance_m, 1),
-            "radius_m": zone.radius_m,
-            "zone_id": str(zone.id),
-            "zone_name": zone.name,
-            "lat": lat,
-            "lng": lng,
-            "center_lat": zone.lat,
-            "center_lng": zone.lng,
-            "message": message,
-            "updated_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
-        },
-        ttl=3600,  # 1h — refreshed on every update
-    )
+    for zone in zones:
+        zone_id = str(zone.id)
+        state_key = f"{user_id}:{zone_id}"
+        distance_m = haversine_m(lat, lng, zone.lat, zone.lng)
+        is_restricted = zone.zone_type == "restricted"
+        inside = distance_m <= zone.radius_m
+        state = (
+            "restricted_inside" if is_restricted and inside
+            else "restricted_clear" if is_restricted
+            else "safe" if inside
+            else "breach"
+        )
+        previous = get_json(_NS_STATE, state_key) or {}
+        transition = previous.get("state") != state
+        payload = {
+            "user_id": user_id, "child_id": user_id, "user_name": name,
+            "state": state, "zone_id": zone_id, "zone_name": zone.name,
+            "zone_category": "restricted" if is_restricted else "safe",
+            "distance_m": round(distance_m, 1), "radius_m": zone.radius_m,
+            "center_lat": zone.lat, "center_lng": zone.lng,
+            "lat": lat, "lng": lng, "updated_at": now_iso,
+        }
+        set_json(_NS_STATE, state_key, payload, ttl=None)
+        assignment_states.append(payload)
+        any_transition = any_transition or transition
 
-    breach_alert_fired = False
-    payload_common = {
-        "user_id": user_id,
-        "user_name": name,
-        "state": new_state,
-        "message": message,
-        "distance_m": round(distance_m, 1),
-        "radius_m": zone.radius_m,
-        "zone_id": str(zone.id),
-        "zone_name": zone.name,
-        "center_lat": zone.lat,
-        "center_lng": zone.lng,
-        "lat": lat,
-        "lng": lng,
-    }
-
-    # Emit SSE events only on transitions OR on breach (with cooldown)
-    if transition:
-        # Always notify the protected user themselves so the mobile app reflects current state
-        try:
-            await broadcaster.broadcast_to_user(user_id, "geofence_status", payload_common)
-        except Exception:
-            pass
-
-        # On BREACH: apply 60s cooldown and enter the canonical persisted
-        # alert pipeline. That pipeline resolves every linked guardian,
-        # writes GuardianAlert/SafetyIncident rows, sends closed-app FCM,
-        # and evaluates SACHET/NDMA context for this real coordinate.
-        if new_state == "breach":
-            cooldown = get_json(_NS_COOL, user_id)
-            if not cooldown:
-                now_iso = __import__("datetime").datetime.utcnow().isoformat() + "Z"
-                set_json(_NS_COOL, user_id, {"fired_at": now_iso}, ttl=BREACH_COOLDOWN_SEC)
+        if transition:
+            await broadcaster.broadcast_to_user(user_id, "geofence_status", payload)
+            alert_kind = None
+            alert_event = None
+            alert_message = None
+            details = None
+            if not is_restricted and not inside:
+                alert_kind, alert_event = "geofence_breach", "geofence_breach"
+                alert_message = f"{name} left safe zone {zone.name}."
+                details = f"Currently {round(distance_m)} metres from the zone centre."
+            elif not is_restricted and inside and previous.get("state") == "breach":
+                alert_kind, alert_event = "geofence_recovery", "geofence_recovery"
+                alert_message = f"{name} returned to safe zone {zone.name}."
+                details = "The latest protected-device GPS fix is back inside the saved area."
+            elif is_restricted and inside:
+                alert_kind, alert_event = "geofence_breach", "geofence_breach"
+                alert_message = f"{name} entered restricted zone {zone.name}."
+                details = "The latest protected-device GPS fix is inside this restricted area."
+            elif is_restricted and not inside and previous.get("state") == "restricted_inside":
+                alert_kind, alert_event = "geofence_recovery", "geofence_recovery"
+                alert_message = f"{name} left restricted zone {zone.name}."
+                details = "The latest protected-device GPS fix is now outside this restricted area."
+            if alert_kind and alert_message:
                 try:
-                    from app.services.alert_trigger import trigger_alert
                     result = await trigger_alert(
-                        session,
-                        kind="geofence_breach",
-                        user_id=user_id,
-                        severity="high",
-                        message=message,
-                        details=(
-                            f"Outside {zone.name} by {round(distance_m, 1)} metres. "
-                            "Location is from the protected member's latest GPS fix."
-                        ),
+                        session, kind=alert_kind, user_id=user_id,
+                        severity="high" if alert_kind == "geofence_breach" else "low",
+                        message=alert_message, details=details,
                         location={"lat": lat, "lng": lng},
-                        sse_event_type="geofence_breach",
-                        sse_payload_extras={
-                            **payload_common,
-                            "guardian_message": EMOTIONAL_COPY["family_alerted"],
-                            "alert_sent_message": EMOTIONAL_COPY["alert_sent"].format(name=name),
-                        },
-                        idempotency_key=f"{zone.id}:breach",
-                        cooldown_s=BREACH_COOLDOWN_SEC,
+                        sse_event_type=alert_event,
+                        sse_payload_extras={**payload, "message": alert_message},
+                        idempotency_key=f"{zone_id}:{state}", cooldown_s=BREACH_COOLDOWN_SEC,
                     )
-                    breach_alert_fired = result.dispatched
-                except Exception:
-                    # Keep the protected-user status update intact even if the
-                    # guardian dispatch path is temporarily unavailable.
-                    pass
-        elif new_state == "recovery":
-            # Clear breach cooldown so a future exit triggers a fresh alert.
-            delete_key(_NS_COOL, user_id)
-            try:
-                from app.services.alert_trigger import trigger_alert
-                await trigger_alert(
-                    session,
-                    kind="geofence_recovery",
-                    user_id=user_id,
-                    severity="low",
-                    message=message,
-                    details=f"Returned inside {zone.name}.",
-                    location={"lat": lat, "lng": lng},
-                    sse_event_type="geofence_recovery",
-                    sse_payload_extras=payload_common,
-                    idempotency_key=f"{zone.id}:recovery",
-                    cooldown_s=BREACH_COOLDOWN_SEC,
-                )
-            except Exception:
-                pass
+                    any_alert = any_alert or result.dispatched
+                except Exception as exc:
+                    logger.warning("[GEOFENCE] zone alert failed zone=%s: %s", zone_id, exc)
 
+    for route in routes:
+        route_id = str(route.id)
+        state_key = f"{user_id}:{route_id}"
+        distance_m = _distance_to_route_m(lat, lng, route)
+        state = "on_route" if distance_m <= route.corridor_width_m else "route_deviation"
+        previous = get_json("geofence:route_state", state_key) or {}
+        transition = previous.get("state") != state
+        payload = {
+            "user_id": user_id, "child_id": user_id, "user_name": name,
+            "state": state, "route_id": route_id, "route_name": route.name,
+            "distance_m": round(distance_m, 1),
+            "corridor_width_m": route.corridor_width_m,
+            "lat": lat, "lng": lng, "updated_at": now_iso,
+        }
+        set_json("geofence:route_state", state_key, payload, ttl=None)
+        assignment_states.append(payload)
+        any_transition = any_transition or transition
+        if transition and state == "route_deviation":
+            alert_message = f"{name} moved outside monitored route {route.name}."
+            try:
+                result = await trigger_alert(
+                    session, kind="route_deviation", user_id=user_id, severity="high",
+                    message=alert_message,
+                    details=f"Latest GPS fix is {round(distance_m)} metres from the saved route corridor.",
+                    location={"lat": lat, "lng": lng},
+                    sse_event_type="route_deviation",
+                    sse_payload_extras={**payload, "message": alert_message},
+                    idempotency_key=f"{route_id}:deviation", cooldown_s=BREACH_COOLDOWN_SEC,
+                )
+                any_alert = any_alert or result.dispatched
+            except Exception as exc:
+                logger.warning("[GEOFENCE] route alert failed route=%s: %s", route_id, exc)
+
+    priority = next(
+        (item for item in assignment_states if item["state"] in ("restricted_inside", "route_deviation", "breach")),
+        assignment_states[0],
+    )
+    set_json(_NS_STATE, user_id, {**priority, "assignments": assignment_states}, ttl=3600)
     return GeofenceEvaluation(
-        state=new_state,
-        message=message,
-        distance_m=distance_m,
-        radius_m=zone.radius_m,
-        zone_id=str(zone.id),
-        zone_name=zone.name,
-        center_lat=zone.lat,
-        center_lng=zone.lng,
-        transition=transition,
-        breach_alert_fired=breach_alert_fired,
+        state="breach" if priority["state"] in ("restricted_inside", "route_deviation", "breach") else "safe",
+        message=str(priority.get("message") or ""),
+        distance_m=float(priority.get("distance_m") or 0),
+        radius_m=float(priority.get("radius_m") or priority.get("corridor_width_m") or 0),
+        zone_id=priority.get("zone_id") or priority.get("route_id"),
+        zone_name=priority.get("zone_name") or priority.get("route_name"),
+        center_lat=priority.get("center_lat"), center_lng=priority.get("center_lng"),
+        transition=any_transition, breach_alert_fired=any_alert,
     )
 
 

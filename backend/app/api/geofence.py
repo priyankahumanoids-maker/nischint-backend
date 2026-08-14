@@ -37,6 +37,7 @@ class ZoneForUserRequest(BaseModel):
     center_lng: float = Field(..., ge=-180, le=180)
     radius_m: float = Field(DEFAULT_RADIUS_M, ge=MIN_RADIUS_M, le=MAX_RADIUS_M)
     name: str = Field("Safety Zone", min_length=1, max_length=100)
+    address: str | None = Field(None, max_length=300)
     category: Literal["safe", "restricted"] = "safe"
 
 
@@ -50,6 +51,26 @@ class RouteForUserRequest(BaseModel):
     dest_lat: float = Field(..., ge=-90, le=90)
     dest_lng: float = Field(..., ge=-180, le=180)
     corridor_width_m: float = Field(100.0, ge=20.0, le=2000.0)
+
+
+class ZoneUpdateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    address: str | None = Field(None, max_length=300)
+    center_lat: float = Field(..., ge=-90, le=90)
+    center_lng: float = Field(..., ge=-180, le=180)
+    radius_m: float = Field(..., ge=MIN_RADIUS_M, le=MAX_RADIUS_M)
+    category: Literal["safe", "restricted"]
+
+
+class RouteUpdateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    origin_name: str | None = None
+    origin_lat: float = Field(..., ge=-90, le=90)
+    origin_lng: float = Field(..., ge=-180, le=180)
+    dest_name: str | None = None
+    dest_lat: float = Field(..., ge=-90, le=90)
+    dest_lng: float = Field(..., ge=-180, le=180)
+    corridor_width_m: float = Field(..., ge=20.0, le=2000.0)
 
 
 class LocationUpdateRequest(BaseModel):
@@ -152,6 +173,7 @@ async def create_zone_for_user(
     zone = SafeZone(
         user_id=uuid.UUID(req.user_id),
         name=req.name,
+        address=req.address,
         lat=req.center_lat,
         lng=req.center_lng,
         radius_m=req.radius_m,
@@ -173,6 +195,7 @@ async def create_zone_for_user(
         "id": str(zone.id),
         "user_id": req.user_id,
         "name": zone.name,
+        "address": zone.address,
         "center_lat": zone.lat,
         "center_lng": zone.lng,
         "radius_m": zone.radius_m,
@@ -205,6 +228,7 @@ async def list_zones_for_user(
             {
                 "id": str(z.id),
                 "name": z.name,
+                "address": z.address,
                 "center_lat": z.lat,
                 "center_lng": z.lng,
                 "radius_m": z.radius_m,
@@ -214,6 +238,39 @@ async def list_zones_for_user(
             for z in zones
         ],
         "count": len(zones),
+    }
+
+
+@router.put("/zone/{zone_id}")
+async def update_zone(
+    zone_id: str,
+    req: ZoneUpdateRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    zrow = await session.execute(select(SafeZone).where(SafeZone.id == uuid.UUID(zone_id)))
+    zone = zrow.scalar_one_or_none()
+    if not zone or not zone.active:
+        raise HTTPException(status_code=404, detail="Zone not found")
+    caller_id = str(user.id)
+    if str(zone.user_id) != caller_id and not _is_admin(user):
+        if not await _is_guardian_of(session, caller_id, str(zone.user_id)):
+            raise HTTPException(status_code=403, detail="Not authorized to edit this zone.")
+    zone.name = req.name
+    zone.address = req.address
+    zone.lat = req.center_lat
+    zone.lng = req.center_lng
+    zone.radius_m = req.radius_m
+    zone.zone_type = req.category
+    zone.updated_at = datetime.utcnow()
+    await session.commit()
+    from app.services.geofence_alerts import clear_zone_runtime_state, invalidate_zone_cache
+    invalidate_zone_cache(str(zone.user_id))
+    clear_zone_runtime_state(str(zone.user_id), str(zone.id))
+    return {
+        "id": str(zone.id), "user_id": str(zone.user_id), "name": zone.name,
+        "address": zone.address, "center_lat": zone.lat, "center_lng": zone.lng,
+        "radius_m": zone.radius_m, "category": req.category, "active": True,
     }
 
 
@@ -235,8 +292,9 @@ async def deactivate_zone(
     z.active = False
     await session.commit()
     try:
-        from app.services.geofence_alerts import invalidate_zone_cache
+        from app.services.geofence_alerts import clear_zone_runtime_state, invalidate_zone_cache
         invalidate_zone_cache(str(z.user_id))
+        clear_zone_runtime_state(str(z.user_id), str(z.id))
     except Exception:
         pass
     return {"id": zone_id, "active": False, "message": "Zone removed."}
@@ -639,4 +697,42 @@ async def deactivate_route(
 
     r.active = False
     await session.commit()
+    from app.services.geofence_alerts import clear_route_runtime_state
+    clear_route_runtime_state(str(r.user_id), str(r.id))
     return {"id": route_id, "active": False, "message": "Monitored route removed."}
+
+
+@router.put("/route/{route_id}")
+async def update_route(
+    route_id: str,
+    req: RouteUpdateRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    rrow = await session.execute(select(MonitoredRoute).where(MonitoredRoute.id == uuid.UUID(route_id)))
+    route = rrow.scalar_one_or_none()
+    if not route or not route.active:
+        raise HTTPException(status_code=404, detail="Route not found")
+    caller_id = str(user.id)
+    if str(route.user_id) != caller_id and not _is_admin(user):
+        if not await _is_guardian_of(session, caller_id, str(route.user_id)):
+            raise HTTPException(status_code=403, detail="Not authorized to edit this route.")
+    route.name = req.name
+    route.origin_name = req.origin_name
+    route.origin_lat = req.origin_lat
+    route.origin_lng = req.origin_lng
+    route.dest_name = req.dest_name
+    route.dest_lat = req.dest_lat
+    route.dest_lng = req.dest_lng
+    route.corridor_width_m = req.corridor_width_m
+    route.updated_at = datetime.utcnow()
+    await session.commit()
+    from app.services.geofence_alerts import clear_route_runtime_state
+    clear_route_runtime_state(str(route.user_id), str(route.id))
+    return {
+        "id": str(route.id), "user_id": str(route.user_id), "name": route.name,
+        "origin_name": route.origin_name, "origin_lat": route.origin_lat,
+        "origin_lng": route.origin_lng, "dest_name": route.dest_name,
+        "dest_lat": route.dest_lat, "dest_lng": route.dest_lng,
+        "corridor_width_m": route.corridor_width_m, "active": True,
+    }

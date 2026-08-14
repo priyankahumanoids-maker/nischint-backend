@@ -62,7 +62,12 @@ async def silent_sos(
     user=Depends(get_current_user),
 ):
     from app.services.redis_service import check_rate_limit
-    from app.services.emergency_engine import get_active_emergencies, update_emergency_location, trigger_silent_sos
+    from app.services.emergency_engine import (
+        get_active_emergencies,
+        notify_repeat_sos,
+        update_emergency_location,
+        trigger_silent_sos,
+    )
 
     user_id = str(user.id)
 
@@ -110,10 +115,20 @@ async def silent_sos(
             lat=req.lat,
             lng=req.lng,
         )
+        repeat_result = await notify_repeat_sos(
+            session=session,
+            event_id=existing["event_id"],
+            user_id=user_id,
+            lat=req.lat,
+            lng=req.lng,
+            trigger_source=req.trigger_source,
+        )
+        await session.commit()
         result = {
             **existing,
-            "message": "Active emergency already exists. Location updated.",
+            "message": "Guardians notified again. Active emergency location updated.",
             "is_existing": True,
+            "guardians_notified": repeat_result["guardians_notified"],
         }
         return JSONResponse(content=result, headers={
             "X-RateLimit-Limit": str(SOS_USER_LIMIT),
