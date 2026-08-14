@@ -119,6 +119,23 @@ async def _get_linked_user_ids(session: AsyncSession, guardian_email: str, guard
                 exc,
             )
 
+        # A successfully-created safety check is durable proof that this
+        # guardian/child relationship was authorized. Include it as a legacy
+        # recovery path so Family Circle cannot incorrectly show "not linked"
+        # while SOS/check-ins for that same member are already working.
+        try:
+            from app.models.checkin import CheckIn
+            checkin_result = await session.execute(
+                select(CheckIn.child_id).where(CheckIn.guardian_id == guardian_uuid)
+            )
+            ids.update(row[0] for row in checkin_result.all())
+        except Exception as exc:
+            logger.warning(
+                "Guardian dashboard check-in relationship lookup failed guardian=%s: %s",
+                guardian_user_id,
+                exc,
+            )
+
     return list(ids)
 
 

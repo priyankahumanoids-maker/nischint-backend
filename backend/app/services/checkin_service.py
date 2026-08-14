@@ -1,4 +1,5 @@
 # Check-In Service — 2-way safety check between guardian and child
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -110,34 +111,41 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
     child = child_user.scalar_one_or_none()
     child_name = child.full_name if child else "Unknown"
 
-    # Send push notification to child
+    # Commit the real check-in before any external FCM call. A slow/unavailable
+    # push provider must never leave the guardian button spinning or hide the
+    # pending request from the protected member's authenticated polling path.
+    await session.commit()
+
+    # Send push notification to child. Bound delivery latency; the committed
+    # row plus SSE/polling remain authoritative if FCM is temporarily slow.
     try:
         from app.services.push_service import send_push_to_user
-        await send_push_to_user(
-            session,
-            child_uuid,
-            "Safety Check",
-            "Your guardian is checking on you. Are you safe?",
-            data={
-                "type": "CHECKIN_REQUEST",
-                "eventType": "checkin_pending",
-                "event_type": "checkin_pending",
-                "check_in_id": check_in_id,
-                "child_id": child_id,
-                "child_name": child_name,
-                "guardian_id": guardian_id,
-                "guardian_name": guardian.full_name or "Your guardian",
-                "created_at": created_at,
-                "expires_in_seconds": CHECKIN_EXPIRY_SECONDS,
-                "screen": "home",
-            },
-            channel_id="safety-alerts",
+        await asyncio.wait_for(
+            send_push_to_user(
+                session,
+                child_uuid,
+                "Safety Check",
+                "Your guardian is checking on you. Are you safe?",
+                data={
+                    "type": "CHECKIN_REQUEST",
+                    "eventType": "checkin_pending",
+                    "event_type": "checkin_pending",
+                    "check_in_id": check_in_id,
+                    "child_id": child_id,
+                    "child_name": child_name,
+                    "guardian_id": guardian_id,
+                    "guardian_name": guardian.full_name or "Your guardian",
+                    "created_at": created_at,
+                    "expires_in_seconds": CHECKIN_EXPIRY_SECONDS,
+                    "screen": "home",
+                },
+                channel_id="safety-alerts",
+            ),
+            timeout=3.0,
         )
         logger.info(f"CHECKIN_PUSH_SENT child={child_id}")
-    except Exception as e:
+    except (asyncio.TimeoutError, Exception) as e:
         logger.warning(f"CHECKIN_PUSH_FAILED {e}")
-
-    await session.commit()
     logger.info(f"CHECKIN_CREATE_SUCCESS id={check_in_id} guardian={guardian_id} child={child_id}")
 
     # Broadcast checkin_pending to BOTH guardian AND child via SSE
