@@ -53,6 +53,10 @@ class VerifyInviteRequest(BaseModel):
     role: str = Field("child", pattern="^(child|woman|senior|family|co_parent)$")
 
 
+class ValidateInviteRequest(BaseModel):
+    invite_code: str = Field(min_length=6, max_length=6)
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
@@ -316,6 +320,38 @@ async def generate_invite_code(
 
     logger.info(f"[INVITE] Guardian {user.email} generated invite code (expires {expires_at.isoformat()})")
     return GenerateInviteResponse(code=code, expires_at=expires_at.isoformat())
+
+
+@router.post("/family/validate-invite-code")
+@limiter.limit("20/minute")
+async def validate_invite_code(
+    request: Request,
+    req: ValidateInviteRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Validate a QR/manual invite without consuming its single use."""
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+
+    normalized_code = req.invite_code.strip().upper()
+    result = await session.execute(
+        select(User).where(User.invite_code == normalized_code)
+    )
+    guardian = result.scalar_one_or_none()
+    if not guardian:
+        raise HTTPException(status_code=400, detail="Invalid invite code")
+
+    now = datetime.now(timezone.utc)
+    if not guardian.invite_code_expires_at or guardian.invite_code_expires_at < now:
+        guardian.invite_code = None
+        guardian.invite_code_expires_at = None
+        await session.commit()
+        raise HTTPException(status_code=400, detail="Invite code has expired")
+
+    return {
+        "valid": True,
+        "expires_at": guardian.invite_code_expires_at.isoformat(),
+    }
 
 
 @router.post("/family/verify-invite-code", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
