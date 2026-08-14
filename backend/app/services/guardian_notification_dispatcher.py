@@ -182,6 +182,7 @@ async def dispatch_guardian_alert(
             payload_data["lng"] = alert.location["lng"]
 
     push_target_ids: set[uuid.UUID] = set(resolved_guardian_user_ids)
+    pending_sms: list[tuple[object, str]] = []
 
     for g in guardians:
         prefs = g.notification_pref or {}
@@ -220,29 +221,7 @@ async def dispatch_guardian_alert(
                 sms_skipped += 1
                 continue
 
-            try:
-                sms_body = _format_sms_body(alert, session_id=session_id)
-                if settings.sms_provider == "twilio" and settings.twilio_account_sid:
-                    # The Twilio SDK is synchronous. Running it on the event
-                    # loop delayed FCM/SSE delivery for every other guardian.
-                    success = await asyncio.to_thread(
-                        _send_twilio_sms,
-                        g.phone,
-                        sms_body,
-                    )
-                    if success:
-                        sms_sent += 1
-                        _mark_sms_sent(g_id, alert.alert_type)
-                        logger.info(f"SMS sent to guardian {g.name} ({g.phone})")
-                    else:
-                        errors.append(f"sms:{g.name}:send_failed")
-                else:
-                    logger.info(f"SMS (stub) to {g.name} ({g.phone}): {sms_body[:100]}...")
-                    sms_sent += 1
-                    _mark_sms_sent(g_id, alert.alert_type)
-            except Exception as e:
-                logger.error(f"SMS error for guardian {g.name}: {e}")
-                errors.append(f"sms:{g.name}:{e}")
+            pending_sms.append((g, g_id))
 
     # Invite-code relationships resolve directly to guardian User IDs and may
     # not have a legacy Guardian row. Dispatch to those accounts as well so
@@ -275,6 +254,31 @@ async def dispatch_guardian_alert(
         except Exception as e:
             logger.error(f"Push fanout error: {e}")
             errors.append(f"push:fanout:{e}")
+
+    # Push is the immediate closed/background-app path. Send it before any
+    # Twilio network call so SMS provider latency can never hold up FCM.
+    for g, g_id in pending_sms:
+        try:
+            sms_body = _format_sms_body(alert, session_id=session_id)
+            if settings.sms_provider == "twilio" and settings.twilio_account_sid:
+                success = await asyncio.to_thread(
+                    _send_twilio_sms,
+                    g.phone,
+                    sms_body,
+                )
+                if success:
+                    sms_sent += 1
+                    _mark_sms_sent(g_id, alert.alert_type)
+                    logger.info(f"SMS sent to guardian {g.name} ({g.phone})")
+                else:
+                    errors.append(f"sms:{g.name}:send_failed")
+            else:
+                logger.info(f"SMS (stub) to {g.name} ({g.phone}): {sms_body[:100]}...")
+                sms_sent += 1
+                _mark_sms_sent(g_id, alert.alert_type)
+        except Exception as e:
+            logger.error(f"SMS error for guardian {g.name}: {e}")
+            errors.append(f"sms:{g.name}:{e}")
 
     result = {
         "dispatched": True,
