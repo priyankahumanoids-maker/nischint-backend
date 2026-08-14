@@ -62,6 +62,10 @@ class EmergencyContactUpdate(BaseModel):
     notes: Optional[str] = None
 
 
+class ProfilePhotoUpdate(BaseModel):
+    photo_data: Optional[str] = None
+
+
 def _serialize_relationship(r: GuardianRelationship) -> dict:
     return {
         "id": str(r.id),
@@ -180,10 +184,47 @@ async def get_family_profile(
             "email": user.email,
             "phone": user.phone,
             "role": user.role,
+            "profile_photo_data": user.profile_photo_data,
         },
         "guardians": guardian_users,
         "emergency_contacts": contacts,
         "total_contacts": len(guardian_users) + len(contacts),
+    }
+
+
+@router.put("/profile-photo")
+async def update_profile_photo(
+    payload: ProfilePhotoUpdate,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Persist, replace, or explicitly remove the signed-in user's photo."""
+    photo_data = payload.photo_data
+    if photo_data is not None:
+        allowed_prefixes = (
+            "data:image/jpeg;base64,",
+            "data:image/jpg;base64,",
+            "data:image/png;base64,",
+            "data:image/webp;base64,",
+        )
+        if not photo_data.lower().startswith(allowed_prefixes):
+            raise HTTPException(
+                status_code=422,
+                detail="Please choose a JPEG, PNG, or WebP image.",
+            )
+        # About 3 MB of encoded image data. Mobile compresses well below this,
+        # while this guard prevents unusually large request/database values.
+        if len(photo_data) > 4_200_000:
+            raise HTTPException(
+                status_code=413,
+                detail="Profile photo is too large. Please choose a smaller image.",
+            )
+
+    user.profile_photo_data = photo_data
+    await session.commit()
+    return {
+        "saved": True,
+        "profile_photo_data": user.profile_photo_data,
     }
 
 

@@ -1,7 +1,7 @@
 # User Model
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, Float, JSON
+from sqlalchemy import String, DateTime, Float, JSON, Text
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -53,6 +53,9 @@ class User(Base):
         String(120),
         nullable=True,
     )
+    # User-managed profile photo. The mobile client sends a compressed,
+    # square data URI so staging can persist it without device-local storage.
+    profile_photo_data: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(
         default=True,
         nullable=False,

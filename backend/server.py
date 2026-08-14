@@ -482,6 +482,15 @@ async def startup_db():
         except Exception as _e:
             logger.error(f"[SB-01] startup DDL failed (non-fatal): {_e}")
 
+    if pool:
+        try:
+            from app.migrations.pf01_user_profile_photo import (
+                ensure_user_profile_photo_column,
+            )
+            await ensure_user_profile_photo_column()
+        except Exception as _e:
+            logger.error(f"[PF-01] startup DDL failed (non-fatal): {_e}")
+
     if os.environ.get("ENV_HAZARD_USE_POSTGIS", "false").strip().lower() in (
         "1", "true", "yes", "on",
     ):

@@ -1,6 +1,6 @@
 # Check-In API — 2-way safety check between guardian and child
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
@@ -11,6 +11,32 @@ router = APIRouter(prefix="/checkin", tags=["checkin"])
 
 class CheckInResponse(BaseModel):
     response: str  # "safe" or "help"
+
+
+class SafeStatusRequest(BaseModel):
+    lat: float | None = Field(None, ge=-90, le=90)
+    lng: float | None = Field(None, ge=-180, le=180)
+    message: str | None = Field(None, max_length=240)
+
+
+@router.post("/safe-status")
+async def report_safe_status(
+    body: SafeStatusRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Protected member proactively reassures every linked guardian."""
+    from app.services.checkin_service import report_safe_status as _report_safe
+    result = await _report_safe(
+        session,
+        str(user.id),
+        lat=body.lat,
+        lng=body.lng,
+        message=body.message,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @router.post("/{child_user_id}")

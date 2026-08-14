@@ -3,6 +3,7 @@
 # Flow: Trigger → Create Event → Notify Guardians (instant) → Track Location
 # User gets cancel window AFTER guardians are notified.
 
+import asyncio
 import hashlib
 import logging
 import uuid
@@ -256,16 +257,37 @@ async def update_emergency_location(
         cached["location_trail"] = trail
         set_json("emergency", event_id, cached)
 
-    # Broadcast location update to operators
+    # Broadcast the same live fix to operators and every linked guardian.
+    # Push notifications wake a closed guardian app for the SOS itself; once
+    # the app is open, these SSE updates keep the map moving without waiting
+    # for its polling fallback.
     user_id = str(event.user_id)
-    await broadcaster.broadcast_to_operators("emergency_location_update", {
+    location_payload = {
         "event": "LOCATION_UPDATE",
         "event_id": event_id,
         "user_id": user_id,
+        "child_id": user_id,
         "lat": lat,
         "lng": lng,
         "location_updates": len(trail),
-    })
+        "captured_at": now.isoformat(),
+    }
+    from app.services.alert_trigger import _resolve_guardian_ids
+    guardian_ids, _ = await _resolve_guardian_ids(session, user_id)
+    await asyncio.gather(
+        broadcaster.broadcast_to_operators(
+            "emergency_location_update", location_payload
+        ),
+        *(
+            broadcaster.broadcast_to_user(
+                guardian_id,
+                "emergency_location_update",
+                location_payload,
+            )
+            for guardian_id in guardian_ids
+        ),
+        return_exceptions=True,
+    )
 
     return {
         "event_id": event_id,

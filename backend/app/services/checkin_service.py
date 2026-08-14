@@ -209,6 +209,123 @@ async def get_pending_checkins(session: AsyncSession, child_id: str) -> list[dic
     return checkins
 
 
+async def report_safe_status(
+    session: AsyncSession,
+    child_id: str,
+    *,
+    lat: float | None = None,
+    lng: float | None = None,
+    message: str | None = None,
+) -> dict:
+    """Record a proactive all-clear and notify every linked guardian once."""
+    child_uuid = uuid.UUID(child_id)
+    child_result = await session.execute(select(User).where(User.id == child_uuid))
+    child = child_result.scalar_one_or_none()
+    if not child:
+        return {"error": "Protected member account not found"}
+
+    from app.services.alert_trigger import _resolve_guardian_ids
+    guardian_ids, _ = await _resolve_guardian_ids(session, child_id)
+    guardian_ids = list(dict.fromkeys(guardian_ids))
+    if not guardian_ids:
+        return {"error": "No linked guardian is available to receive your safe status"}
+
+    now = datetime.now(timezone.utc)
+    safe_message = message or f"{child.full_name or child.email} is safe — no need to worry."
+    check_in_ids: list[str] = []
+
+    for guardian_id in guardian_ids:
+        guardian_uuid = uuid.UUID(guardian_id)
+        pending_result = await session.execute(
+            select(CheckIn)
+            .where(
+                CheckIn.guardian_id == guardian_uuid,
+                CheckIn.child_id == child_uuid,
+                CheckIn.status == "pending",
+            )
+            .order_by(CheckIn.created_at.desc())
+            .limit(1)
+        )
+        checkin = pending_result.scalar_one_or_none()
+        if checkin:
+            checkin.status = "safe"
+            checkin.responded_at = now
+            checkin.response_note = safe_message
+        else:
+            checkin = CheckIn(
+                guardian_id=guardian_uuid,
+                child_id=child_uuid,
+                status="safe",
+                response_note=safe_message,
+                created_at=now,
+                responded_at=now,
+            )
+            session.add(checkin)
+        await session.flush()
+        check_in_ids.append(str(checkin.id))
+
+    # An explicit all-clear returns non-emergency risk state to normal. It does
+    # not cancel an active SOS/EmergencyEvent; that remains a separate action.
+    try:
+        from app.models.safety_event import SafetyEvent
+        await session.execute(
+            update(SafetyEvent)
+            .where(SafetyEvent.user_id == child_uuid, SafetyEvent.status == "active")
+            .values(status="resolved", resolved_at=now, updated_at=now)
+        )
+    except Exception as exc:
+        logger.warning("SAFE_STATUS risk reset skipped child=%s: %s", child_id, exc)
+
+    await session.commit()
+
+    payload = {
+        "type": "CHECKIN_SAFE",
+        "eventType": "checkin_safe",
+        "event_type": "checkin_safe",
+        "child_id": child_id,
+        "child_name": child.full_name or child.email,
+        "message": safe_message,
+        "lat": lat,
+        "lng": lng,
+        "check_in_ids": check_in_ids,
+        "check_in_id": check_in_ids[0],
+        "checkin_id": check_in_ids[0],
+        "responded_at": now.isoformat(),
+    }
+
+    push_count = 0
+    from app.services.push_service import send_push_to_user
+    from app.services.event_broadcaster import broadcaster
+    for guardian_id in guardian_ids:
+        try:
+            push_count += await send_push_to_user(
+                session,
+                uuid.UUID(guardian_id),
+                f"{child.full_name or 'Protected member'} is safe",
+                "They checked in to say they are safe. No need to worry.",
+                data={**payload, "screen": "alerts"},
+            )
+        except Exception as exc:
+            logger.warning("SAFE_STATUS push failed guardian=%s: %s", guardian_id, exc)
+        try:
+            await broadcaster.broadcast_to_user(guardian_id, "checkin_safe", payload)
+        except Exception as exc:
+            logger.warning("SAFE_STATUS realtime alert failed guardian=%s: %s", guardian_id, exc)
+
+    try:
+        await broadcaster.broadcast_to_user(child_id, "checkin_safe", payload)
+    except Exception:
+        pass
+
+    return {
+        "status": "safe",
+        "message": "Your guardians have been notified that you are safe.",
+        "guardian_count": len(guardian_ids),
+        "push_count": push_count,
+        "responded_at": now.isoformat(),
+    }
+
+
 async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: str, response: str) -> dict:
     """Child responds to a check-in. response = 'safe' | 'help'."""
     logger.info(f"CHECKIN_RESPOND child={child_id} check_in={check_in_id} response={response}")

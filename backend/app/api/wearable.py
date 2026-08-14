@@ -42,7 +42,11 @@ SCHEMA_SQL = [
         user_id UUID REFERENCES users(id) ON DELETE SET NULL,
         device_type TEXT DEFAULT 'wearable',
         status TEXT DEFAULT 'inactive',
+        device_name TEXT,
+        capabilities JSONB DEFAULT '{}',
         battery_level INT,
+        heart_rate_bpm INT,
+        heart_rate_at TIMESTAMPTZ,
         last_seen_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -65,9 +69,15 @@ SCHEMA_SQL = [
         device_id UUID REFERENCES wearable_devices(id) ON DELETE CASCADE,
         battery INT,
         rssi INT,
+        heart_rate_bpm INT,
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
     """,
+    "ALTER TABLE wearable_devices ADD COLUMN IF NOT EXISTS device_name TEXT;",
+    "ALTER TABLE wearable_devices ADD COLUMN IF NOT EXISTS capabilities JSONB DEFAULT '{}';",
+    "ALTER TABLE wearable_devices ADD COLUMN IF NOT EXISTS heart_rate_bpm INT;",
+    "ALTER TABLE wearable_devices ADD COLUMN IF NOT EXISTS heart_rate_at TIMESTAMPTZ;",
+    "ALTER TABLE device_health_log ADD COLUMN IF NOT EXISTS heart_rate_bpm INT;",
     "CREATE INDEX IF NOT EXISTS idx_wd_device_uid ON wearable_devices(device_uid);",
     "CREATE INDEX IF NOT EXISTS idx_wd_user_id ON wearable_devices(user_id);",
     "CREATE INDEX IF NOT EXISTS idx_dal_device_id ON device_audit_log(device_id);",
@@ -117,6 +127,8 @@ def normalize_event(event_type: str) -> str:
 class DeviceRegisterRequest(BaseModel):
     device_uid: str
     device_type: str = "wearable"
+    device_name: Optional[str] = None
+    capabilities: Optional[dict] = None
 
 
 class DeviceBindRequest(BaseModel):
@@ -136,6 +148,7 @@ class HeartbeatRequest(BaseModel):
     device_id: str
     battery: Optional[int] = None
     rssi: Optional[int] = None
+    heart_rate_bpm: Optional[int] = None
 
 
 # ──────────────────────────────────────────────
@@ -221,9 +234,13 @@ async def register_device(
     request: Request,
     req: DeviceRegisterRequest,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ):
     """Register a BLE peripheral device. Returns device_id for subsequent calls."""
     await _ensure_schema(db)
+
+    if not req.device_uid.strip():
+        raise HTTPException(status_code=422, detail="A Bluetooth device identifier is required")
 
     # Check if already registered
     existing = await db.execute(
@@ -232,6 +249,8 @@ async def register_device(
     )
     row = existing.fetchone()
     if row:
+        if row.user_id and str(row.user_id) != str(user.id):
+            raise HTTPException(status_code=409, detail="This wearable is already linked to another account")
         return {
             "status": "exists",
             "device_id": str(row.id),
@@ -240,12 +259,16 @@ async def register_device(
 
     device_id = str(uuid.uuid4())
     await db.execute(text("""
-        INSERT INTO wearable_devices (id, device_uid, device_type, status, created_at)
-        VALUES (:id, :uid, :dtype, 'inactive', :now)
+        INSERT INTO wearable_devices
+          (id, device_uid, user_id, device_type, device_name, capabilities, status, last_seen_at, created_at)
+        VALUES (:id, :uid, :owner, :dtype, :name, CAST(:capabilities AS jsonb), 'active', :now, :now)
     """), {
         "id": device_id,
         "uid": req.device_uid,
+        "owner": str(user.id),
         "dtype": req.device_type,
+        "name": (req.device_name or '').strip()[:120] or None,
+        "capabilities": json_lib.dumps(req.capabilities or {}),
         "now": datetime.now(timezone.utc),
     })
     await db.commit()
@@ -254,7 +277,7 @@ async def register_device(
     return {
         "status": "registered",
         "device_id": device_id,
-        "linked_user": False,
+        "linked_user": True,
     }
 
 
@@ -440,6 +463,7 @@ async def device_heartbeat(
     request: Request,
     req: HeartbeatRequest,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ):
     """Device health telemetry — battery, signal strength, connectivity check."""
     await _ensure_schema(db)
@@ -454,24 +478,33 @@ async def device_heartbeat(
     device = d.fetchone()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    if not device.user_id or str(device.user_id) != str(user.id):
+        raise HTTPException(status_code=403, detail="This wearable is not linked to the signed-in account")
+    if req.battery is not None and not 0 <= req.battery <= 100:
+        raise HTTPException(status_code=422, detail="Battery must be between 0 and 100")
+    if req.heart_rate_bpm is not None and not 20 <= req.heart_rate_bpm <= 260:
+        raise HTTPException(status_code=422, detail="Heart rate is outside the supported wearable range")
 
     # Update device status
     await db.execute(text("""
         UPDATE wearable_devices
         SET last_seen_at = :now, status = 'active',
             battery_level = COALESCE(:battery, battery_level)
+            ,heart_rate_bpm = COALESCE(:heart_rate_bpm, heart_rate_bpm)
+            ,heart_rate_at = CASE WHEN :heart_rate_bpm IS NULL THEN heart_rate_at ELSE :now END
         WHERE id = :did
-    """), {"now": now, "did": req.device_id, "battery": req.battery})
+    """), {"now": now, "did": req.device_id, "battery": req.battery, "heart_rate_bpm": req.heart_rate_bpm})
 
     # Log health data
     await db.execute(text("""
-        INSERT INTO device_health_log (id, device_id, battery, rssi, created_at)
-        VALUES (:id, :did, :battery, :rssi, :now)
+        INSERT INTO device_health_log (id, device_id, battery, rssi, heart_rate_bpm, created_at)
+        VALUES (:id, :did, :battery, :rssi, :heart_rate_bpm, :now)
     """), {
         "id": str(uuid.uuid4()),
         "did": req.device_id,
         "battery": req.battery,
         "rssi": req.rssi,
+        "heart_rate_bpm": req.heart_rate_bpm,
         "now": now,
     })
 
@@ -518,7 +551,8 @@ async def list_devices(
     await _ensure_schema(db)
 
     r = await db.execute(text("""
-        SELECT id, device_uid, device_type, status, battery_level, last_seen_at, created_at
+        SELECT id, device_uid, device_type, device_name, capabilities, status, battery_level,
+               heart_rate_bpm, heart_rate_at, last_seen_at, created_at
         FROM wearable_devices WHERE user_id = :uid ORDER BY created_at DESC
     """), {"uid": str(user.id)})
 
@@ -528,13 +562,68 @@ async def list_devices(
                 "device_id": str(row.id),
                 "device_uid": row.device_uid,
                 "device_type": row.device_type,
+                "device_name": row.device_name,
+                "capabilities": row.capabilities or {},
                 "status": row.status,
                 "battery_level": row.battery_level,
+                "heart_rate_bpm": row.heart_rate_bpm,
+                "heart_rate_at": row.heart_rate_at.isoformat() if row.heart_rate_at else None,
                 "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
             }
             for row in r.fetchall()
         ]
+    }
+
+
+def _device_payload(row) -> dict:
+    return {
+        "device_id": str(row.id),
+        "device_type": row.device_type,
+        "device_name": row.device_name,
+        "capabilities": row.capabilities or {},
+        "status": row.status,
+        "battery_level": row.battery_level,
+        "heart_rate_bpm": row.heart_rate_bpm,
+        "heart_rate_at": row.heart_rate_at.isoformat() if row.heart_rate_at else None,
+        "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@router.get("/dependent/{dependent_id}/devices")
+async def list_dependent_devices(
+    dependent_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Read-only device status for a protected member or their linked guardians."""
+    await _ensure_schema(db)
+
+    user_exists = await db.execute(
+        text("SELECT id FROM users WHERE id = :uid"),
+        {"uid": dependent_id},
+    )
+    if not user_exists.fetchone():
+        raise HTTPException(status_code=404, detail="Protected member not found")
+
+    if str(user.id) != str(dependent_id):
+        from app.services.alert_trigger import _resolve_guardian_ids
+        guardian_ids, _ = await _resolve_guardian_ids(db, dependent_id)
+        if str(user.id) not in {str(guardian_id) for guardian_id in guardian_ids}:
+            raise HTTPException(status_code=403, detail="You are not linked to this protected member")
+
+    result = await db.execute(text("""
+        SELECT id, device_type, device_name, capabilities, status,
+               battery_level, heart_rate_bpm, heart_rate_at, last_seen_at, created_at
+        FROM wearable_devices
+        WHERE user_id = :uid
+        ORDER BY created_at DESC
+    """), {"uid": dependent_id})
+
+    return {
+        "dependent_id": str(dependent_id),
+        "devices": [_device_payload(row) for row in result.fetchall()],
     }
 
 

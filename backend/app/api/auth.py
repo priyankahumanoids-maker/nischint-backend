@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-INVITE_CODE_TTL_MINUTES = settings.family_invite_ttl_minutes
+# Product rule: a family scanner/code is valid for exactly 15 minutes unless
+# it is consumed earlier by one successful join.
+INVITE_CODE_TTL_MINUTES = 15
 
 
 def _generate_invite_code() -> str:
@@ -77,6 +79,10 @@ class ConfirmRequest(BaseModel):
     code: str
 
 
+class CheckPhoneRequest(BaseModel):
+    phone: str = Field(min_length=10, max_length=20)
+
+
 class CognitoStatusResponse(BaseModel):
     enabled: bool
     region: str = ""
@@ -84,6 +90,38 @@ class CognitoStatusResponse(BaseModel):
 
 
 # ── Registration ──
+
+def _normalize_phone(phone: Optional[str]) -> str:
+    """Store Indian mobile numbers in the E.164 form Cognito expects."""
+    digits = "".join(character for character in str(phone or "") if character.isdigit())
+    if len(digits) == 10:
+        return f"+91{digits}"
+    if len(digits) == 12 and digits.startswith("91"):
+        return f"+{digits}"
+    return f"+{digits}" if digits else ""
+
+
+async def _phone_exists(session: AsyncSession, phone: Optional[str]) -> bool:
+    from sqlalchemy import func, select
+
+    normalized = _normalize_phone(phone)
+    digits = normalized.lstrip("+")[-10:]
+    if not digits:
+        return False
+    result = await session.execute(
+        select(User.id)
+        .where(func.right(func.regexp_replace(User.phone, r"\D", "", "g"), 10) == digits)
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+@router.post("/check-phone")
+async def check_phone(
+    req: CheckPhoneRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    return {"exists": await _phone_exists(session, req.phone)}
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
@@ -128,6 +166,7 @@ async def get_me(
         "id": str(user.id),
         "email": user.email,
         "full_name": user.full_name,
+        "phone": user.phone,
         "role": user.role,
         "roles": roles,
         "facility_id": user.facility_id,
@@ -295,8 +334,13 @@ async def verify_invite_code(
     from sqlalchemy import select
 
     # 1. Validate the code — look up guardian by invite_code
+    normalized_invite_code = req.invite_code.strip().upper()
+    # Lock the guardian row until commit. This makes the scanner truly
+    # single-use even if two devices submit the same code at nearly once.
     result = await session.execute(
-        select(User).where(User.invite_code == req.invite_code)
+        select(User)
+        .where(User.invite_code == normalized_invite_code)
+        .with_for_update()
     )
     guardian = result.scalar_one_or_none()
 
@@ -306,6 +350,9 @@ async def verify_invite_code(
     # 2. Check expiry
     now = datetime.now(timezone.utc)
     if not guardian.invite_code_expires_at or guardian.invite_code_expires_at < now:
+        guardian.invite_code = None
+        guardian.invite_code_expires_at = None
+        await session.commit()
         raise HTTPException(status_code=400, detail="Invite code has expired")
 
     # 3. Prevent duplicate email
@@ -429,12 +476,17 @@ async def _local_register(req: RegisterRequest, session: AsyncSession) -> TokenR
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists",
         )
+    if req.phone and await _phone_exists(session, req.phone):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mobile number is already registered. Please sign in instead.",
+        )
 
     user = User(
         email=req.email,
         password_hash=await user_service.hash_password_async(req.password),
         role="guardian",
-        phone=req.phone,
+        phone=_normalize_phone(req.phone) or None,
         full_name=req.full_name,
     )
     session.add(user)
@@ -532,6 +584,11 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists",
         )
+    if req.phone and await _phone_exists(session, req.phone):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mobile number is already registered. Please sign in instead.",
+        )
 
     # Register in Cognito
     try:
@@ -539,10 +596,16 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
             email=req.email,
             password=req.password,
             full_name=req.full_name or "",
-            phone=req.phone or "",
+            phone=_normalize_phone(req.phone),
         )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        message = str(e)
+        if "UsernameExistsException" in message or "AliasExistsException" in message:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This email or mobile number is already registered. Please sign in instead.",
+            )
+        raise HTTPException(status_code=400, detail=message)
 
     cognito_sub = result["user_sub"]
 
@@ -570,7 +633,7 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
             password_hash=await user_service.hash_password_async(req.password),
             cognito_sub=cognito_sub,
             role="guardian",
-            phone=req.phone,
+            phone=_normalize_phone(req.phone) or None,
             full_name=req.full_name,
         )
         session.add(user)

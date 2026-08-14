@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -25,7 +26,7 @@ from app.models.monitored_route import MonitoredRoute
 router = APIRouter(prefix="/geofence", tags=["geofence"])
 
 DEFAULT_RADIUS_M = 3000
-MIN_RADIUS_M = 500
+MIN_RADIUS_M = 100
 MAX_RADIUS_M = 10000
 
 
@@ -36,6 +37,7 @@ class ZoneForUserRequest(BaseModel):
     center_lng: float = Field(..., ge=-180, le=180)
     radius_m: float = Field(DEFAULT_RADIUS_M, ge=MIN_RADIUS_M, le=MAX_RADIUS_M)
     name: str = Field("Safety Zone", min_length=1, max_length=100)
+    category: Literal["safe", "restricted"] = "safe"
 
 
 class RouteForUserRequest(BaseModel):
@@ -147,24 +149,13 @@ async def create_zone_for_user(
                 detail="You are not authorized to manage this user's safety zones.",
             )
 
-    # Deactivate any existing active zones so there's only one primary zone per user
-    # (simpler mental model for guardians — one zone per loved one).
-    existing = await session.execute(
-        select(SafeZone).where(
-            SafeZone.user_id == uuid.UUID(req.user_id),
-            SafeZone.active.is_(True),
-        )
-    )
-    for z in existing.scalars().all():
-        z.active = False
-
     zone = SafeZone(
         user_id=uuid.UUID(req.user_id),
         name=req.name,
         lat=req.center_lat,
         lng=req.center_lng,
         radius_m=req.radius_m,
-        zone_type="custom",
+        zone_type=req.category,
         active=True,
     )
     session.add(zone)
@@ -185,6 +176,7 @@ async def create_zone_for_user(
         "center_lat": zone.lat,
         "center_lng": zone.lng,
         "radius_m": zone.radius_m,
+        "category": req.category,
         "active": True,
         "message": "Safety zone set. Your loved one will be notified on any exit.",
     }
@@ -217,6 +209,7 @@ async def list_zones_for_user(
                 "center_lng": z.lng,
                 "radius_m": z.radius_m,
                 "zone_type": z.zone_type,
+                "category": "restricted" if z.zone_type == "restricted" else "safe",
             }
             for z in zones
         ],
@@ -638,7 +631,7 @@ async def deactivate_route(
     if not r:
         raise HTTPException(status_code=404, detail="Route not found")
 
-    caller_id = str(r.user_id)
+    caller_id = str(user.id)
     if str(r.user_id) != caller_id and not _is_admin(user):
         ok = await _is_guardian_of(session, caller_id, str(r.user_id))
         if not ok:

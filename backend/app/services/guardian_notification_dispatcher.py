@@ -2,6 +2,7 @@
 # Dispatches real FCM push + Twilio SMS to guardians when alerts fire.
 # Respects per-guardian notification preferences, implements rate limiting.
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.guardian import Guardian, GuardianAlert
 from app.models.user import User
 from app.services.notification_service import _send_twilio_sms
-from app.services.push_service import send_push_to_user
+from app.services.push_service import get_user_push_tokens, send_push_to_tokens
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,8 @@ async def dispatch_guardian_alert(
         if alert.location.get("lng") is not None:
             payload_data["lng"] = alert.location["lng"]
 
+    push_target_ids: set[uuid.UUID] = set(resolved_guardian_user_ids)
+
     for g in guardians:
         prefs = g.notification_pref or {}
         g_id = str(g.id)
@@ -204,20 +207,8 @@ async def dispatch_guardian_alert(
                     )
                     target_user_id = child_res.scalar_one_or_none()
 
-                if target_user_id and target_user_id not in sent_push_user_ids:
-                    sent = await send_push_to_user(
-                        session, target_user_id, title, body,
-                        data=payload_data,
-                        channel_id="safety-alerts",
-                        louder=louder,
-                    )
-                    push_sent += sent
-                    sent_push_user_ids.add(target_user_id)
-                    logger.info(
-                        f"PUSH{' LOUDER' if louder else ''} "
-                        f"[{alert.alert_type}] to guardian {g.name}: "
-                        f"sent={sent}"
-                    )
+                if target_user_id:
+                    push_target_ids.add(target_user_id)
             except Exception as e:
                 logger.error(f"Push error for guardian {g.name}: {e}")
                 errors.append(f"push:{g.name}:{e}")
@@ -232,7 +223,13 @@ async def dispatch_guardian_alert(
             try:
                 sms_body = _format_sms_body(alert, session_id=session_id)
                 if settings.sms_provider == "twilio" and settings.twilio_account_sid:
-                    success = _send_twilio_sms(g.phone, sms_body)
+                    # The Twilio SDK is synchronous. Running it on the event
+                    # loop delayed FCM/SSE delivery for every other guardian.
+                    success = await asyncio.to_thread(
+                        _send_twilio_sms,
+                        g.phone,
+                        sms_body,
+                    )
                     if success:
                         sms_sent += 1
                         _mark_sms_sent(g_id, alert.alert_type)
@@ -250,32 +247,34 @@ async def dispatch_guardian_alert(
     # Invite-code relationships resolve directly to guardian User IDs and may
     # not have a legacy Guardian row. Dispatch to those accounts as well so
     # closed-app FCM delivery works for QR/code-linked families.
-    if rules["push"]:
-        for target_user_id in resolved_guardian_user_ids:
-            if target_user_id in sent_push_user_ids:
-                continue
-            try:
-                sent = await send_push_to_user(
-                    session,
-                    target_user_id,
-                    title,
-                    body,
-                    data=payload_data,
-                    channel_id="safety-alerts",
-                    louder=louder,
+    if rules["push"] and push_target_ids:
+        try:
+            # Resolve tokens with the request session, then make one concurrent
+            # FCM fan-out. A stale/offline guardian device can no longer hold
+            # up delivery to the other family devices.
+            token_lists = []
+            for target_user_id in push_target_ids:
+                token_lists.append(
+                    await get_user_push_tokens(session, target_user_id)
                 )
-                push_sent += sent
-                sent_push_user_ids.add(target_user_id)
-                logger.info(
-                    f"PUSH{' LOUDER' if louder else ''} "
-                    f"[{alert.alert_type}] to linked guardian user "
-                    f"{target_user_id}: sent={sent}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Push error for linked guardian user {target_user_id}: {e}"
-                )
-                errors.append(f"push:{target_user_id}:{e}")
+            all_tokens = [token for tokens in token_lists for token in tokens]
+            push_sent = await send_push_to_tokens(
+                all_tokens,
+                title,
+                body,
+                data=payload_data,
+                channel_id="safety-alerts",
+                louder=louder,
+            )
+            sent_push_user_ids.update(push_target_ids)
+            logger.info(
+                f"PUSH{' LOUDER' if louder else ''} "
+                f"[{alert.alert_type}] fanout users={len(push_target_ids)} "
+                f"tokens={len(all_tokens)} sent={push_sent}"
+            )
+        except Exception as e:
+            logger.error(f"Push fanout error: {e}")
+            errors.append(f"push:fanout:{e}")
 
     result = {
         "dispatched": True,
