@@ -545,6 +545,7 @@ async def evaluate_user_location(
                         sse_event_type=alert_event,
                         sse_payload_extras={**payload, "message": alert_message},
                         idempotency_key=f"{zone_id}:{state}", cooldown_s=BREACH_COOLDOWN_SEC,
+                        suppress_co_located=False,
                     )
                     any_alert = any_alert or result.dispatched
                 except Exception as exc:
@@ -592,6 +593,7 @@ async def evaluate_user_location(
                     sse_event_type=alert_kind,
                     sse_payload_extras={**payload, "message": alert_message},
                     idempotency_key=f"{route_id}:{state}", cooldown_s=BREACH_COOLDOWN_SEC,
+                    suppress_co_located=False,
                 )
                 any_alert = any_alert or result.dispatched
             except Exception as exc:
