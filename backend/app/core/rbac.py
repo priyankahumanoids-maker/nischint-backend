@@ -16,21 +16,23 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decode_token_claims
+from app.core.product_roles import (
+    CANONICAL_ROLES,
+    ROLE_PRIORITY,
+    normalize_role,
+    normalize_roles,
+)
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
-# Valid roles in the system
-VALID_ROLES = {"admin", "guardian", "operator", "caregiver", "user"}
+# Valid roles in the product. Legacy/display aliases are normalized before
+# authorization, but co_parent remains distinct from guardian.
+VALID_ROLES = set(CANONICAL_ROLES)
 
-# Role hierarchy: admin > operator > caregiver > guardian > user
-ROLE_HIERARCHY = {
-    "admin": 5,
-    "operator": 4,
-    "caregiver": 3,
-    "guardian": 2,
-    "user": 1,
-}
+# Retained for compatibility with existing imports. Authorization checks below
+# are set-membership based; this mapping is not used to grant inherited access.
+ROLE_HIERARCHY = dict(ROLE_PRIORITY)
 
 
 def get_user_roles(user: User, token: str = None) -> set:
@@ -45,7 +47,9 @@ def get_user_roles(user: User, token: str = None) -> set:
 
     # Always include local DB role
     if user.role:
-        roles.add(user.role)
+        normalized = normalize_role(user.role)
+        if normalized:
+            roles.add(normalized)
 
     # Extract Cognito groups from token if available
     if token:
@@ -54,7 +58,7 @@ def get_user_roles(user: User, token: str = None) -> set:
             if claims:
                 cognito_groups = claims.get("cognito:groups", [])
                 if isinstance(cognito_groups, list):
-                    roles.update(g for g in cognito_groups if g in VALID_ROLES)
+                    roles.update(normalize_roles(cognito_groups) & VALID_ROLES)
         except Exception:
             pass
 
@@ -92,7 +96,8 @@ def require_role(allowed_roles: List[str]):
         user_roles = get_user_roles(user, token)
 
         # Check if user has any of the required roles
-        if not user_roles.intersection(set(allowed_roles)):
+        allowed = normalize_roles(allowed_roles)
+        if not user_roles.intersection(allowed):
             # DEBUG level: a 403 is a correct response, not an error condition.
             # Includes the request path so ops can triage misconfigured
             # frontends without log-level flags.

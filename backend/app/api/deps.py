@@ -9,6 +9,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import verify_token, decode_token_claims
+from app.core.product_roles import normalize_role, normalize_roles
 from app.db.session import async_session
 from app.models.user import User
 from app.services import auth_metrics, user_cache, user_service
@@ -105,15 +106,17 @@ def require_role(role: str | list[str]):
     callers), or a list of strings to allow any of several roles
     (OCE-01 needed `guardian | operator | admin`).
     """
-    allowed = {role} if isinstance(role, str) else set(role)
+    allowed = normalize_roles(role)
 
     async def _check(user: User = Depends(get_current_user)) -> User:
-        user_roles = []
+        user_roles = set()
         if hasattr(user, 'roles') and user.roles:
-            user_roles = user.roles if isinstance(user.roles, list) else [user.roles]
+            user_roles.update(normalize_roles(user.roles))
         if hasattr(user, 'role') and user.role:
-            user_roles.append(user.role)
-        if not (allowed & set(user_roles)):
+            normalized = normalize_role(user.role)
+            if normalized:
+                user_roles.add(normalized)
+        if not (allowed & user_roles):
             detail = (
                 f"Role '{role}' required"
                 if isinstance(role, str)

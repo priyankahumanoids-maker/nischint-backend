@@ -17,6 +17,7 @@ from app.api.deps import get_db_session, get_current_user
 from app.core.cognito import is_cognito_enabled
 from app.core.config import settings
 from app.core.rate_limiter import limiter
+from app.core.product_roles import normalize_roles, select_primary_role
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -1037,15 +1038,14 @@ async def _cognito_login(login_request: LoginRequest, session: AsyncSession) -> 
     # Extract Cognito groups from claims
     cognito_groups = claims.get("cognito:groups", []) if claims else []
 
-    # Sync role from Cognito groups to local DB (pick highest KNOWN priority)
+    # Sync role from Cognito groups using the canonical product vocabulary.
+    # This recognizes protected-member and co-parent roles without treating
+    # co_parent as a primary guardian capability.
     if cognito_groups:
-        role_priority = {"admin": 5, "operator": 4, "caregiver": 3, "guardian": 2, "child": 1}
-        known_roles = [r for r in cognito_groups if r in role_priority]
-        if known_roles:
-            best_role = max(known_roles, key=lambda r: role_priority[r])
-            if user.role != best_role:
-                user.role = best_role
-                await session.flush()
+        best_role = select_primary_role(cognito_groups)
+        if best_role and user.role != best_role:
+            user.role = best_role
+            await session.flush()
 
     # Create local JWT for API calls (includes cognito:groups for RBAC)
     local_token = create_access_token(data={
@@ -1053,7 +1053,7 @@ async def _cognito_login(login_request: LoginRequest, session: AsyncSession) -> 
         "role": user.role,
         "email": user.email,
         "full_name": user.full_name,
-        "cognito:groups": cognito_groups,
+        "cognito:groups": sorted(normalize_roles(cognito_groups)),
     })
 
     return TokenResponse(
