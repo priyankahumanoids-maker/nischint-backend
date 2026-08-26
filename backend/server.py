@@ -559,6 +559,16 @@ async def startup_db():
     except Exception:
         logger.exception("auth_metrics summary thread failed to start")
 
+    # AI-02: Ensure runtime AI/risk schema before schedulers start.
+    # Production does not currently execute the historical Alembic chain.
+    try:
+        from app.migrations.ai02_runtime_tables import (
+            ensure_ai_risk_runtime_tables,
+        )
+        await ensure_ai_risk_runtime_tables()
+    except Exception:
+        logger.exception("[AI-02] runtime AI/risk schema initialization failed")
+
     # Background schedulers — gated by NISCHINT_ROLE so the API and the
     # scheduler tick can be split into separate processes without forking
     # this file. With NISCHINT_ROLE=api this whole block is skipped and
