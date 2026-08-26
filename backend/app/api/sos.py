@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
 from app.core.rbac import require_role
+from app.core.product_roles import PROTECTED_MEMBER_ROLES
 from app.core.rate_limiter import limiter
 from app.models.user import User
 from app.services import sos_service as svc
@@ -18,9 +19,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sos", tags=["sos"])
 
-_escape_role = require_role(["guardian", "operator", "admin"])
-# Trigger/Cancel allow the actual at-risk user roles too.
-_trigger_role = require_role(["guardian", "operator", "admin", "child", "woman", "senior", "parent"])
+_ESCAPE_ROLES = {"guardian", "operator", "admin"}
+_escape_role = require_role(sorted(_ESCAPE_ROLES))
+# Trigger/Cancel allow the actual at-risk user roles too. Family members are
+# protected members as well, so use the canonical product-role set rather than
+# maintaining another partial hard-coded list here.
+_trigger_role = require_role(sorted(_ESCAPE_ROLES | PROTECTED_MEMBER_ROLES))
 
 
 # ── Schemas ──
@@ -101,7 +105,7 @@ async def trigger_sos(
     request: Request,
     body: SOSTrigger,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_escape_role),
+    user: User = Depends(_trigger_role),
     x_loadtest_token: Optional[str] = Header(default=None, alias="X-Loadtest-Token"),
 ):
     if _loadtest_short_circuit_allowed(x_loadtest_token):
@@ -137,7 +141,7 @@ async def cancel_sos(
     sos_id: str,
     body: SOSCancel,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_escape_role),
+    user: User = Depends(_trigger_role),
 ):
     result = await svc.cancel_sos(session, user.id, uuid.UUID(sos_id), resolved_by=body.resolved_by)
     if not result:

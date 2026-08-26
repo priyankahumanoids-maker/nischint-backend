@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db_session, get_current_user
 from app.models.user import User
 from app.models.guardian import GuardianAlert
+from app.core.product_roles import is_protected_member
 
 router = APIRouter(prefix="/guardian/dashboard", tags=["guardian-dashboard"])
 
@@ -48,7 +49,7 @@ async def get_alerts(
     user: User = Depends(get_current_user),
 ):
     """Get recent alerts. Guardian sees alerts for loved ones. Child sees check-ins addressed to them."""
-    if user.role in ("child", "kid"):
+    if is_protected_member(user.role):
         from app.services.guardian_dashboard_engine import get_child_alerts
         return {"alerts": await get_child_alerts(session, str(user.id), limit)}
     from app.services.guardian_dashboard_engine import get_alerts as _get

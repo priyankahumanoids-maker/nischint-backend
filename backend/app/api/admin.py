@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session
 from app.core.rbac import require_role
+from app.core.product_roles import CANONICAL_ROLES, normalize_role
 from app.models.user import User
 from app.models.facility import Facility
 
@@ -32,17 +33,20 @@ _read_role = require_role(["admin", "operator"])
 
 # ── Schemas ──
 
+_ADMIN_ROLE_PATTERN = "^(" + "|".join(sorted(CANONICAL_ROLES)) + ")$"
+
+
 class UserCreate(BaseModel):
     email: EmailStr
     full_name: Optional[str] = None
     phone: Optional[str] = None
     password: str = Field(..., min_length=6)
-    role: str = Field("guardian", pattern="^(admin|guardian|operator|caregiver|user)$")
+    role: str = Field("guardian", pattern=_ADMIN_ROLE_PATTERN)
     facility_id: Optional[str] = None
 
 
 class UserUpdateRole(BaseModel):
-    role: str = Field(..., pattern="^(admin|guardian|operator|caregiver|user)$")
+    role: str = Field(..., pattern=_ADMIN_ROLE_PATTERN)
 
 
 class UserUpdateFacility(BaseModel):
@@ -96,7 +100,7 @@ async def list_users(
     query = select(User)
 
     if role:
-        query = query.where(User.role == role)
+        query = query.where(User.role == normalize_role(role))
     if facility_id:
         query = query.where(User.facility_id == facility_id)
     if is_active is not None:
@@ -155,12 +159,12 @@ async def update_user_role(
         raise HTTPException(status_code=404, detail="User not found")
 
     old_role = user.role
-    user.role = body.role
+    user.role = normalize_role(body.role)
     await session.flush()
 
     # Sync to Cognito groups if possible
     try:
-        await _sync_cognito_role(user.email, old_role, body.role)
+        await _sync_cognito_role(user.email, old_role, user.role)
     except Exception as e:
         logger.warning(f"Failed to sync Cognito role for {user.email}: {e}")
 
@@ -261,14 +265,14 @@ async def create_user(
         full_name=body.full_name,
         phone=body.phone,
         password_hash=hashed,
-        role=body.role,
+        role=normalize_role(body.role),
         facility_id=body.facility_id,
         is_active=True,
     )
     session.add(new_user)
     await session.flush()
 
-    logger.info(f"Admin created user: {body.email} (role={body.role})")
+    logger.info(f"Admin created user: {body.email} (role={new_user.role})")
 
     return {
         "id": str(new_user.id),
@@ -466,7 +470,7 @@ async def system_health(
     total_users = (await session.execute(select(func.count()).select_from(User))).scalar() or 0
 
     role_counts = {}
-    for role in ["admin", "guardian", "operator", "caregiver", "user"]:
+    for role in sorted(CANONICAL_ROLES):
         cnt = (await session.execute(
             select(func.count()).select_from(User).where(User.role == role)
         )).scalar() or 0
