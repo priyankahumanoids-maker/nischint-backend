@@ -80,7 +80,9 @@ async def _get_linked_user_ids(
         return list(ids)
 
     guardian_scope_ids: set[uuid.UUID] = set()
-    guardian_scope_emails: set[str] = {guardian_email} if guardian_email else set()
+    guardian_scope_emails: set[str] = (
+        {guardian_email} if guardian_email else set()
+    )
 
     if guardian_user_id:
         try:
@@ -95,7 +97,7 @@ async def _get_linked_user_ids(
         guardian_scope_ids.add(guardian_uuid)
 
         # Co-parent/co-guardian invites point to the primary guardian through
-        # User.guardian_id.  Give the co-guardian the same read/monitor scope
+        # User.guardian_id. Give the co-guardian the same read/monitor scope
         # without converting the guardian into a protected family member.
         if normalized_role in {
             "co_parent",
@@ -108,16 +110,125 @@ async def _get_linked_user_ids(
                 select(User).where(User.id == guardian_uuid)
             )
             co_parent = co_parent_result.scalar_one_or_none()
+
             if co_parent and co_parent.guardian_id:
                 guardian_scope_ids.add(co_parent.guardian_id)
+
                 owner_result = await session.execute(
-                    select(User.email).where(User.id == co_parent.guardian_id)
+                    select(User.email).where(
+                        User.id == co_parent.guardian_id
+                    )
                 )
                 owner_email = owner_result.scalar_one_or_none()
                 if owner_email:
                     guardian_scope_emails.add(owner_email)
 
-    # Legacy/contact based links.
+    # Fast path: resolve all relationship sources in one SQL round trip.
+    #
+    # The previous implementation performed one sequential execute() per
+    # relationship source.  UNION ALL preserves all sources while the set
+    # below keeps the original de-duplication semantics.
+    link_queries = []
+
+    if guardian_scope_emails:
+        link_queries.append(
+            select(Guardian.user_id.label("user_id")).where(
+                Guardian.email.in_(guardian_scope_emails),
+                Guardian.is_active.is_(True),
+            )
+        )
+
+    if guardian_scope_ids:
+        link_queries.append(
+            select(User.id.label("user_id")).where(
+                User.guardian_id.in_(guardian_scope_ids),
+                User.is_active == True,  # noqa: E712
+            )
+        )
+
+        try:
+            from app.models.relationship import Relationship
+
+            link_queries.append(
+                select(Relationship.child_id.label("user_id")).where(
+                    Relationship.guardian_id.in_(guardian_scope_ids),
+                    Relationship.status == "accepted",
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Guardian dashboard Relationship lookup setup failed guardian=%s: %s",
+                guardian_user_id,
+                exc,
+            )
+
+        try:
+            from app.models.guardian_network import GuardianRelationship
+
+            link_queries.append(
+                select(GuardianRelationship.user_id.label("user_id")).where(
+                    GuardianRelationship.guardian_user_id.in_(
+                        guardian_scope_ids
+                    ),
+                    GuardianRelationship.is_active.is_(True),
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Guardian dashboard network lookup setup failed guardian=%s: %s",
+                guardian_user_id,
+                exc,
+            )
+
+        if include_checkin_recovery:
+            try:
+                from app.models.checkin import CheckIn
+
+                link_queries.append(
+                    select(CheckIn.child_id.label("user_id")).where(
+                        CheckIn.guardian_id.in_(guardian_scope_ids)
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Guardian dashboard check-in relationship lookup setup failed guardian=%s: %s",
+                    guardian_user_id,
+                    exc,
+                )
+
+    if not link_queries:
+        return list(ids)
+
+    try:
+        if len(link_queries) == 1:
+            linked_result = await session.execute(link_queries[0])
+        else:
+            from sqlalchemy import union_all
+
+            linked_result = await session.execute(
+                union_all(*link_queries)
+            )
+
+        ids.update(
+            row[0]
+            for row in linked_result.all()
+            if row[0] is not None
+        )
+        return list(ids)
+
+    except Exception as exc:
+        # Preserve the old fault-tolerant behavior if a deployment has a
+        # partially migrated optional relationship table.  The optimized
+        # path is used normally; this fallback matches the previous lookup
+        # semantics source-by-source.
+        logger.warning(
+            "Guardian dashboard combined relationship lookup failed guardian=%s: %s; "
+            "falling back to sequential lookups",
+            guardian_user_id,
+            exc,
+        )
+
+    # Fallback: original source-by-source relationship resolution.
     if guardian_scope_emails:
         guardian_rows = await session.execute(
             select(Guardian.user_id).where(
@@ -128,7 +239,6 @@ async def _get_linked_user_ids(
         ids.update(row[0] for row in guardian_rows.all())
 
     if guardian_scope_ids:
-        # Direct primary-guardian links on the protected User record.
         user_result = await session.execute(
             select(User.id).where(
                 User.guardian_id.in_(guardian_scope_ids),
@@ -137,7 +247,6 @@ async def _get_linked_user_ids(
         )
         ids.update(row[0] for row in user_result.all())
 
-        # Accepted code/invite relationships.
         try:
             from app.models.relationship import Relationship
 
@@ -155,14 +264,14 @@ async def _get_linked_user_ids(
                 exc,
             )
 
-        # Guardian-network links, including co-guardians created through the
-        # share-invite flow.
         try:
             from app.models.guardian_network import GuardianRelationship
 
             network_result = await session.execute(
                 select(GuardianRelationship.user_id).where(
-                    GuardianRelationship.guardian_user_id.in_(guardian_scope_ids),
+                    GuardianRelationship.guardian_user_id.in_(
+                        guardian_scope_ids
+                    ),
                     GuardianRelationship.is_active.is_(True),
                 )
             )
@@ -174,8 +283,6 @@ async def _get_linked_user_ids(
                 exc,
             )
 
-        # Legacy display recovery only.  Existing successful check-ins can help
-        # old families remain visible, but MUST NOT authorize a new action.
         if include_checkin_recovery:
             try:
                 from app.models.checkin import CheckIn
@@ -194,7 +301,6 @@ async def _get_linked_user_ids(
                 )
 
     return list(ids)
-
 
 async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_user_id: str, user_role: str | None = None) -> dict:
     """Get all people this guardian monitors, with their live status, location, and last_updated."""
