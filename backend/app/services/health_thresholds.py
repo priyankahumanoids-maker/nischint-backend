@@ -79,33 +79,23 @@ EMIT_COOLDOWN_S = 5.0
 REDIS_NS = "system_health_state"
 
 
-def _redis():
-    try:
-        from app.services.redis_service import _get_client
-        return _get_client()
-    except Exception:
-        return None
-
-
 def _read_prev(source: str) -> dict | None:
-    c = _redis()
-    if not c:
-        return None
+    """Read previous health state with Redis -> in-memory fallback."""
     try:
-        raw = c.get(f"nischint:{REDIS_NS}:{source}")
-        return json.loads(raw) if raw else None
+        from app.services.redis_service import get_json
+        value = get_json(REDIS_NS, source)
+        return value if isinstance(value, dict) else None
     except Exception:
         return None
 
 
 def _write_prev(source: str, payload: dict) -> None:
-    c = _redis()
-    if not c:
-        return
+    """Persist previous health state with Redis -> in-memory fallback."""
     try:
-        c.set(f"nischint:{REDIS_NS}:{source}", json.dumps(payload), ex=86400)
+        from app.services.redis_service import set_json
+        set_json(REDIS_NS, source, payload, ttl=86400)
     except Exception as e:
-        logger.debug(f"health_thresholds redis write failed: {e}")
+        logger.debug(f"health_thresholds state write failed: {e}")
 
 
 def _classify_scheduler(drift_p95_ms: float | None, missed: int, errors: int) -> tuple[str, str | None, float | None]:

@@ -25,6 +25,11 @@ _client = None
 _available = False
 _local_cache = {}
 
+# Environment configuration is immutable for the lifetime of a Cloud Run
+# revision. Once we establish that REDIS_URL is not configured, avoid
+# re-reading settings and re-logging the same warning on every cache call.
+_redis_not_configured = False
+
 PREFIX = "nischint"
 
 
@@ -35,12 +40,18 @@ def _get_redis_url() -> str:
 
 def _get_client():
     """Lazy-initialize Redis connection pool and client."""
-    global _pool, _client, _available
+    global _pool, _client, _available, _redis_not_configured
+
     if _client is not None:
         return _client
+
+    if _redis_not_configured:
+        return None
+
     url = _get_redis_url()
     if not url:
-        logger.warning("REDIS_URL not set — Redis cache disabled")
+        _redis_not_configured = True
+        logger.warning("REDIS_URL not set - Redis cache disabled; using local fallback")
         return None
     try:
         _pool = redis.ConnectionPool.from_url(
