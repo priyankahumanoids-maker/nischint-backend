@@ -500,6 +500,18 @@ async def startup_db():
         except Exception as _e:
             logger.error(f"[GZ-02] startup DDL failed (non-fatal): {_e}")
 
+    if pool:
+        try:
+            from app.migrations.pt01_push_token_ownership import (
+                ensure_push_token_single_owner,
+            )
+            await ensure_push_token_single_owner()
+        except Exception as _e:
+            logger.error(
+                f"[PT-01] startup DDL failed (non-fatal): {_e}"
+            )
+
+
     if os.environ.get("ENV_HAZARD_USE_POSTGIS", "false").strip().lower() in (
         "1", "true", "yes", "on",
     ):
