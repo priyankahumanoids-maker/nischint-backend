@@ -191,17 +191,25 @@ async def trigger_silent_sos(
     child_user = child_result.scalar_one_or_none()
     child_name = child_user.full_name if child_user else "Child"
 
-    # Create GuardianAlert record so GET /guardian/dashboard/alerts surfaces the emergency
-    from app.models.guardian import GuardianAlert
-    alert = GuardianAlert(
-        user_id=uuid.UUID(user_id),
-        alert_type="emergency_triggered",
-        severity="critical",
-        message=f"EMERGENCY: {child_name} triggered SOS!",
-        details=f"Silent SOS triggered. Emergency Event: {event_id}",
-        location={"lat": lat, "lng": lng},
-    )
-    session.add(alert)
+    # Persist exactly ONE guardian-facing alert row. Under ALERT_TRIGGER_V2_SOS
+    # the unified trigger_alert() call above already created GuardianAlert, sent
+    # guardian SSE, and dispatched push/SMS. Creating another row here was the
+    # source of duplicate SOS cards. The legacy path still needs this row because
+    # _notify_guardians() only sends push/SMS.
+    if not _use_v2:
+        from app.models.guardian import GuardianAlert
+
+        alert = GuardianAlert(
+            user_id=uuid.UUID(user_id),
+            alert_type="emergency_triggered",
+            severity="critical",
+            message=f"EMERGENCY: {child_name} triggered SOS!",
+            details=f"Silent SOS triggered. Emergency Event: {event_id}",
+            location={"lat": lat, "lng": lng},
+        )
+        session.add(alert)
+
+    # Commit the EmergencyEvent state and (legacy only) GuardianAlert together.
     await session.commit()
 
     sse_payload = {

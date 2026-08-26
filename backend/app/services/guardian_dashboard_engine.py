@@ -35,15 +35,32 @@ def _fresh_device_telemetry(raw: object, now: datetime) -> tuple[dict | None, da
     return raw, updated_at
 
 
-async def _get_linked_user_ids(session: AsyncSession, guardian_email: str, guardian_user_id: str | None = None, user_role: str | None = None) -> list[uuid.UUID]:
-    """Find all user_ids that this guardian monitors.
-    
-    Source of truth: User.guardian_id column in the users table.
+async def _get_linked_user_ids(
+    session: AsyncSession,
+    guardian_email: str,
+    guardian_user_id: str | None = None,
+    user_role: str | None = None,
+    *,
+    include_checkin_recovery: bool = True,
+) -> list[uuid.UUID]:
+    """Find all protected users that the signed-in guardian may monitor.
+
+    Relationship sources are deliberately centralized here so Home, Family,
+    Protection, safety-checks, and co-guardian access cannot disagree about
+    the same family circle.  A co-parent inherits the primary guardian's
+    family scope, but is still a guardian relationship — never a protected
+    member.
+
+    ``include_checkin_recovery`` exists only for legacy dashboard recovery.
+    Authorization-sensitive callers (for example creating a new safety check)
+    must set it to ``False`` so an old CheckIn row cannot grant new access.
     """
     ids: set[uuid.UUID] = set()
 
-    # Admin sees ALL children across the system (oversight capability).
-    if (user_role or "").lower() == "admin":
+    normalized_role = (user_role or "").strip().lower()
+
+    # Admin sees all protected-role users for oversight.
+    if normalized_role == "admin":
         admin_result = await session.execute(
             select(User.id).where(
                 User.role.in_(
@@ -62,34 +79,71 @@ async def _get_linked_user_ids(session: AsyncSession, guardian_email: str, guard
         ids.update(row[0] for row in admin_result.all())
         return list(ids)
 
-    # Legacy/contact-based guardian records remain a valid relationship
-    # source for existing families.
-    if guardian_email:
+    guardian_scope_ids: set[uuid.UUID] = set()
+    guardian_scope_emails: set[str] = {guardian_email} if guardian_email else set()
+
+    if guardian_user_id:
+        try:
+            guardian_uuid = uuid.UUID(str(guardian_user_id))
+        except (TypeError, ValueError, AttributeError):
+            logger.warning(
+                "Guardian dashboard received invalid guardian id=%s",
+                guardian_user_id,
+            )
+            return []
+
+        guardian_scope_ids.add(guardian_uuid)
+
+        # Co-parent/co-guardian invites point to the primary guardian through
+        # User.guardian_id.  Give the co-guardian the same read/monitor scope
+        # without converting the guardian into a protected family member.
+        if normalized_role in {
+            "co_parent",
+            "co-parent",
+            "coparent",
+            "co_guardian",
+            "co-guardian",
+        }:
+            co_parent_result = await session.execute(
+                select(User).where(User.id == guardian_uuid)
+            )
+            co_parent = co_parent_result.scalar_one_or_none()
+            if co_parent and co_parent.guardian_id:
+                guardian_scope_ids.add(co_parent.guardian_id)
+                owner_result = await session.execute(
+                    select(User.email).where(User.id == co_parent.guardian_id)
+                )
+                owner_email = owner_result.scalar_one_or_none()
+                if owner_email:
+                    guardian_scope_emails.add(owner_email)
+
+    # Legacy/contact based links.
+    if guardian_scope_emails:
         guardian_rows = await session.execute(
             select(Guardian.user_id).where(
-                Guardian.email == guardian_email,
+                Guardian.email.in_(guardian_scope_emails),
                 Guardian.is_active.is_(True),
             )
         )
         ids.update(row[0] for row in guardian_rows.all())
 
-    # Direct primary-guardian link.
-    if guardian_user_id:
-        guardian_uuid = uuid.UUID(guardian_user_id)
+    if guardian_scope_ids:
+        # Direct primary-guardian links on the protected User record.
         user_result = await session.execute(
             select(User.id).where(
-                User.guardian_id == guardian_uuid,
-                User.is_active == True
+                User.guardian_id.in_(guardian_scope_ids),
+                User.is_active == True,  # noqa: E712
             )
         )
         ids.update(row[0] for row in user_result.all())
 
-        # Accepted invite/code links.
+        # Accepted code/invite relationships.
         try:
             from app.models.relationship import Relationship
+
             rel_result = await session.execute(
                 select(Relationship.child_id).where(
-                    Relationship.guardian_id == guardian_uuid,
+                    Relationship.guardian_id.in_(guardian_scope_ids),
                     Relationship.status == "accepted",
                 )
             )
@@ -101,13 +155,14 @@ async def _get_linked_user_ids(session: AsyncSession, guardian_email: str, guard
                 exc,
             )
 
-        # Guardian-network links include co-parents/co-guardians accepted
-        # through the share-invite flow.
+        # Guardian-network links, including co-guardians created through the
+        # share-invite flow.
         try:
             from app.models.guardian_network import GuardianRelationship
+
             network_result = await session.execute(
                 select(GuardianRelationship.user_id).where(
-                    GuardianRelationship.guardian_user_id == guardian_uuid,
+                    GuardianRelationship.guardian_user_id.in_(guardian_scope_ids),
                     GuardianRelationship.is_active.is_(True),
                 )
             )
@@ -119,22 +174,24 @@ async def _get_linked_user_ids(session: AsyncSession, guardian_email: str, guard
                 exc,
             )
 
-        # A successfully-created safety check is durable proof that this
-        # guardian/child relationship was authorized. Include it as a legacy
-        # recovery path so Family Circle cannot incorrectly show "not linked"
-        # while SOS/check-ins for that same member are already working.
-        try:
-            from app.models.checkin import CheckIn
-            checkin_result = await session.execute(
-                select(CheckIn.child_id).where(CheckIn.guardian_id == guardian_uuid)
-            )
-            ids.update(row[0] for row in checkin_result.all())
-        except Exception as exc:
-            logger.warning(
-                "Guardian dashboard check-in relationship lookup failed guardian=%s: %s",
-                guardian_user_id,
-                exc,
-            )
+        # Legacy display recovery only.  Existing successful check-ins can help
+        # old families remain visible, but MUST NOT authorize a new action.
+        if include_checkin_recovery:
+            try:
+                from app.models.checkin import CheckIn
+
+                checkin_result = await session.execute(
+                    select(CheckIn.child_id).where(
+                        CheckIn.guardian_id.in_(guardian_scope_ids)
+                    )
+                )
+                ids.update(row[0] for row in checkin_result.all())
+            except Exception as exc:
+                logger.warning(
+                    "Guardian dashboard check-in relationship lookup failed guardian=%s: %s",
+                    guardian_user_id,
+                    exc,
+                )
 
     return list(ids)
 

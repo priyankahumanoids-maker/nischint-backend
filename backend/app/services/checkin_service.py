@@ -61,28 +61,28 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
     if not guardian:
         return {"error": "Guardian not found"}
 
-    link_result = await session.execute(
-        select(Guardian).where(
-            Guardian.user_id == child_uuid,
-            Guardian.email == guardian.email,
-            Guardian.is_active == True,  # noqa: E712
-        ).limit(1)
+    # Use the same canonical family resolver as the Guardian dashboard.  The
+    # older implementation checked only the legacy Guardian table and the
+    # Relationship table, so valid direct User.guardian_id and co-guardian
+    # links could be rejected with "not linked as a guardian".
+    #
+    # Do NOT use legacy CheckIn rows as authorization for a new action.
+    from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+    linked_user_ids = await _get_linked_user_ids(
+        session,
+        guardian.email or "",
+        str(guardian_uuid),
+        guardian.role,
+        include_checkin_recovery=False,
     )
-    is_linked = link_result.scalar_one_or_none() is not None
-
-    # Also check relationships table (code-based linking)
-    if not is_linked:
-        from app.models.relationship import Relationship
-        rel_result = await session.execute(
-            select(Relationship).where(
-                Relationship.guardian_id == guardian_uuid,
-                Relationship.child_id == child_uuid,
-                Relationship.status == "accepted",
-            ).limit(1)
+    if child_uuid not in set(linked_user_ids):
+        logger.warning(
+            "CHECKIN_LINK_REJECTED guardian=%s child=%s role=%s",
+            guardian_id,
+            child_id,
+            guardian.role,
         )
-        is_linked = rel_result.scalar_one_or_none() is not None
-
-    if not is_linked:
         return {"error": "You are not linked as a guardian to this user"}
 
     # Cancel any existing pending check-ins from this guardian to this child

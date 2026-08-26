@@ -287,17 +287,34 @@ async def bind_device(
     request: Request,
     req: DeviceBindRequest,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ):
-    """Bind a registered device to a user. Activates the device."""
-    # Verify device exists
+    """Bind a registered device to the signed-in protected account.
+
+    A client-supplied user_id is never sufficient authorization to transfer a
+    wearable.  This prevents one account from claiming another user's device.
+    """
+    await _ensure_schema(db)
+
+    if str(user.id) != str(req.user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="A wearable can only be linked to the signed-in account",
+        )
+
     d = await db.execute(
-        text("SELECT id FROM wearable_devices WHERE id = :did"),
+        text("SELECT id, user_id FROM wearable_devices WHERE id = :did"),
         {"did": req.device_id},
     )
-    if not d.fetchone():
+    device = d.fetchone()
+    if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    if device.user_id and str(device.user_id) != str(user.id):
+        raise HTTPException(
+            status_code=409,
+            detail="This wearable is already linked to another account",
+        )
 
-    # Verify user exists
     u = await db.execute(
         text("SELECT id FROM users WHERE id = :uid"),
         {"uid": req.user_id},
@@ -320,12 +337,67 @@ async def bind_device(
     return {"status": "bound", "device_id": req.device_id, "user_id": req.user_id}
 
 
+@router.delete("/devices/{device_id}")
+@limiter.limit("30/minute")
+async def release_device(
+    request: Request,
+    device_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Release a wearable owned by the signed-in account.
+
+    The physical device identity and audit history are retained, but ownership
+    is cleared so the same watch can later be registered/bound to another
+    NISCHINT account.  Guardians cannot release a protected member's watch from
+    their own account; the current owner must explicitly unpair it.
+    """
+    await _ensure_schema(db)
+
+    result = await db.execute(
+        text("SELECT id, user_id FROM wearable_devices WHERE id = :did"),
+        {"did": device_id},
+    )
+    device = result.fetchone()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if not device.user_id or str(device.user_id) != str(user.id):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the account that owns this wearable can release it",
+        )
+
+    now = datetime.now(timezone.utc)
+    await _audit_log(
+        db,
+        device_id,
+        str(user.id),
+        "DEVICE_UNBOUND",
+        f"unbind:{uuid.uuid4()}",
+        {"reason": "user_requested"},
+        "mobile",
+    )
+    await db.execute(
+        text("""
+            UPDATE wearable_devices
+            SET user_id = NULL, status = 'inactive', last_seen_at = :now
+            WHERE id = :did
+        """),
+        {"did": device_id, "now": now},
+    )
+    await db.commit()
+
+    logger.info("[WEARABLE_RELEASE] device=%s owner=%s", device_id, user.id)
+    return {"status": "released", "device_id": device_id}
+
+
 @router.post("/event")
 @limiter.limit("120/minute")
 async def ingest_event(
     request: Request,
     req: DeviceEventRequest,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ):
     """
     Ingest a BLE event. Resolves device→user, normalizes event type,
@@ -346,6 +418,11 @@ async def ingest_event(
     context = await _resolve_device(db, req.device_id)
     if not context:
         raise HTTPException(status_code=404, detail="Device not found or not bound to a user")
+    if context["user_id"] != str(user.id):
+        raise HTTPException(
+            status_code=403,
+            detail="This wearable is not linked to the signed-in account",
+        )
 
     # Normalize event
     alert_category = normalize_event(req.event_type)
