@@ -30,6 +30,7 @@ from apscheduler.events import (
     EVENT_JOB_ERROR,
     EVENT_JOB_EXECUTED,
     EVENT_JOB_MISSED,
+    EVENT_JOB_SUBMITTED,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,33 +106,120 @@ def _get_or_create(job_id: str, owner: str = "") -> _JobStats:
 
 
 # ── APScheduler event listeners ───────────────────────────────────────
-def _on_executed(event, owner: str) -> None:
-    drift_ms: float | None = None
-    if event.scheduled_run_time:
-        drift_ms = (datetime.now(timezone.utc) - event.scheduled_run_time).total_seconds() * 1000
+def _on_submitted(event, owner: str) -> None:
+    """Record scheduled -> executor-dispatch delay.
 
-    duration_ms: float | None = None
-    rt = getattr(event, "retval", None)
-    if isinstance(rt, dict) and "_duration_ms" in rt:
-        duration_ms = float(rt["_duration_ms"])
+    APScheduler emits EVENT_JOB_SUBMITTED when scheduled run times have
+    been handed to the executor. Measuring here keeps actual job runtime
+    out of scheduler drift.
+
+    Standard APScheduler submission events expose ``scheduled_run_times``.
+    The singular fallback also supports synthetic/custom event objects.
+    """
+    scheduled_run_times = list(
+        getattr(event, "scheduled_run_times", None) or []
+    )
+
+    if not scheduled_run_times:
+        single = getattr(
+            event,
+            "scheduled_run_time",
+            None,
+        )
+        if single is not None:
+            scheduled_run_times = [single]
+
+    if not scheduled_run_times:
+        return
+
+    dispatched_at = datetime.now(timezone.utc)
 
     with _lock:
-        s = _get_or_create(event.job_id, owner)
-        s.last_run_at = datetime.now(timezone.utc).isoformat()
+        s = _get_or_create(
+            event.job_id,
+            owner,
+        )
+
+        for scheduled_run_time in scheduled_run_times:
+            drift_ms = max(
+                0.0,
+                (
+                    dispatched_at
+                    - scheduled_run_time
+                ).total_seconds() * 1000,
+            )
+
+            rounded = round(
+                drift_ms,
+                2,
+            )
+
+            s.last_run_drift_ms = rounded
+            s.drifts_ms.append(rounded)
+
+        if len(s.drifts_ms) > ROLLING_WINDOW:
+            s.drifts_ms = (
+                s.drifts_ms[-ROLLING_WINDOW:]
+            )
+
+        _persist(s)
+
+    _maybe_emit_threshold_event(
+        event.job_id
+    )
+
+
+def _on_executed(event, owner: str) -> None:
+    """Record completion without adding runtime to dispatch drift."""
+    duration_ms: float | None = None
+
+    rt = getattr(
+        event,
+        "retval",
+        None,
+    )
+
+    if (
+        isinstance(rt, dict)
+        and "_duration_ms" in rt
+    ):
+        duration_ms = float(
+            rt["_duration_ms"]
+        )
+
+    with _lock:
+        s = _get_or_create(
+            event.job_id,
+            owner,
+        )
+
+        s.last_run_at = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
         s.last_status = "success"
         s.last_error = None
         s.success_count += 1
-        if drift_ms is not None:
-            s.last_run_drift_ms = round(drift_ms, 2)
-            s.drifts_ms.append(round(drift_ms, 2))
-            if len(s.drifts_ms) > ROLLING_WINDOW:
-                s.drifts_ms = s.drifts_ms[-ROLLING_WINDOW:]
+
         if duration_ms is not None:
-            s.last_duration_ms = round(duration_ms, 2)
+            s.last_duration_ms = round(
+                duration_ms,
+                2,
+            )
+
             n = s.success_count
-            s.avg_duration_ms = (s.avg_duration_ms * (n - 1) + duration_ms) / n
+
+            s.avg_duration_ms = (
+                s.avg_duration_ms * (n - 1)
+                + duration_ms
+            ) / n
+
         _persist(s)
-    _maybe_emit_threshold_event(event.job_id)
+
+    _maybe_emit_threshold_event(
+        event.job_id
+    )
 
 
 def _on_missed(event, owner: str) -> None:
@@ -187,6 +275,7 @@ def attach(scheduler, owner: str) -> bool:
     if sid in _attached_schedulers:
         return False
     _attached_schedulers.add(sid)
+    scheduler.add_listener(lambda e: _on_submitted(e, owner), EVENT_JOB_SUBMITTED)
     scheduler.add_listener(lambda e: _on_executed(e, owner), EVENT_JOB_EXECUTED)
     scheduler.add_listener(lambda e: _on_missed(e, owner), EVENT_JOB_MISSED)
     scheduler.add_listener(lambda e: _on_error(e, owner), EVENT_JOB_ERROR)
