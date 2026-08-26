@@ -205,6 +205,56 @@ def sign_in(email: str, password: str) -> dict:
         raise ValueError(f"{code}: {msg}")
 
 
+# ── Password Recovery ──
+
+def forgot_password(email: str) -> dict:
+    """Ask Cognito to deliver a password-reset code to the user."""
+    _ensure_enabled("forgot_password")
+    client = _get_client()
+    params = {
+        "ClientId": settings.cognito_client_id,
+        "Username": email,
+    }
+    secret_hash = _compute_secret_hash(email)
+    if secret_hash:
+        params["SecretHash"] = secret_hash
+
+    try:
+        resp = client.forgot_password(**params)
+        return {
+            "code_delivery": resp.get("CodeDeliveryDetails"),
+        }
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        msg = e.response["Error"]["Message"]
+        logger.error(f"Cognito forgot_password error: {code} — {msg}")
+        raise ValueError(f"{code}: {msg}")
+
+
+def confirm_forgot_password(email: str, code: str, new_password: str) -> bool:
+    """Confirm Cognito password recovery using the delivered reset code."""
+    _ensure_enabled("confirm_forgot_password")
+    client = _get_client()
+    params = {
+        "ClientId": settings.cognito_client_id,
+        "Username": email,
+        "ConfirmationCode": code,
+        "Password": new_password,
+    }
+    secret_hash = _compute_secret_hash(email)
+    if secret_hash:
+        params["SecretHash"] = secret_hash
+
+    try:
+        client.confirm_forgot_password(**params)
+        return True
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        msg = e.response["Error"]["Message"]
+        logger.error(f"Cognito confirm_forgot_password error: {error_code} — {msg}")
+        raise ValueError(f"{error_code}: {msg}")
+
+
 # ── Token Refresh ──
 
 def refresh_tokens(refresh_token: str, cognito_username: str = "", email: str = "") -> dict:
@@ -402,6 +452,24 @@ def admin_get_user(email: str) -> Optional[dict]:
         if e.response["Error"]["Code"] == "UserNotFoundException":
             return None
         raise
+
+
+def admin_global_sign_out(username: str) -> bool:
+    """Revoke all Cognito sessions for a user from the trusted backend."""
+    _ensure_enabled("admin_global_sign_out")
+    client = _get_client()
+    try:
+        client.admin_user_global_sign_out(
+            UserPoolId=settings.cognito_user_pool_id,
+            Username=username,
+        )
+        return True
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code == "UserNotFoundException":
+            return True
+        logger.error(f"Cognito admin_global_sign_out error: {code} — {e}")
+        raise ValueError(f"{code}: {e.response['Error']['Message']}")
 
 
 def global_sign_out(access_token: str):

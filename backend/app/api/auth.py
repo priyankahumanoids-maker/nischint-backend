@@ -1,6 +1,10 @@
 # Authentication Router — Dual-mode: Local JWT + AWS Cognito
+import asyncio
+import hashlib
+import hmac
 import logging
 import random
+import secrets
 import uuid
 from datetime import timedelta
 from typing import Optional
@@ -29,6 +33,102 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # Product rule: a family scanner/code is valid for exactly 15 minutes unless
 # it is consumed earlier by one successful join.
 INVITE_CODE_TTL_MINUTES = 15
+
+# Password recovery is intentionally separate from registration OTP.
+# Reset codes are short-lived and one-time-use. Cognito owns delivery when
+# enabled; local fallback accounts use the existing SendGrid + Redis layer.
+PASSWORD_RESET_TTL_SECONDS = 15 * 60
+PASSWORD_RESET_MAX_ATTEMPTS = 5
+PASSWORD_RESET_NAMESPACE = "auth_password_reset"
+
+
+def _normalize_email(email: str) -> str:
+    return str(email or "").strip().casefold()
+
+
+def _password_reset_cache_key(email: str) -> str:
+    # Avoid placing raw email addresses in Redis keys/log tooling.
+    return hashlib.sha256(_normalize_email(email).encode("utf-8")).hexdigest()
+
+
+def _password_reset_digest(email: str, code: str) -> str:
+    payload = f"{_normalize_email(email)}:{str(code or '').strip()}".encode("utf-8")
+    return hmac.new(
+        settings.jwt_secret.encode("utf-8"),
+        payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _store_local_password_reset(email: str, code: str) -> None:
+    from app.services import redis_service
+
+    redis_service.set_json(
+        PASSWORD_RESET_NAMESPACE,
+        _password_reset_cache_key(email),
+        {
+            "digest": _password_reset_digest(email, code),
+            "attempts": 0,
+        },
+        ttl=PASSWORD_RESET_TTL_SECONDS,
+    )
+
+
+def _consume_local_password_reset(email: str, code: str) -> bool:
+    from app.services import redis_service
+
+    cache_key = _password_reset_cache_key(email)
+    entry = redis_service.get_json(PASSWORD_RESET_NAMESPACE, cache_key)
+    if not isinstance(entry, dict):
+        return False
+
+    attempts = int(entry.get("attempts") or 0)
+    if attempts >= PASSWORD_RESET_MAX_ATTEMPTS:
+        redis_service.delete_key(PASSWORD_RESET_NAMESPACE, cache_key)
+        return False
+
+    expected = str(entry.get("digest") or "")
+    supplied = _password_reset_digest(email, code)
+    if not expected or not hmac.compare_digest(expected, supplied):
+        attempts += 1
+        if attempts >= PASSWORD_RESET_MAX_ATTEMPTS:
+            redis_service.delete_key(PASSWORD_RESET_NAMESPACE, cache_key)
+        else:
+            # Redis service preserves a bounded TTL. Re-writing on a failed
+            # attempt does not create an unbounded credential-reset record.
+            redis_service.set_json(
+                PASSWORD_RESET_NAMESPACE,
+                cache_key,
+                {"digest": expected, "attempts": attempts},
+                ttl=PASSWORD_RESET_TTL_SECONDS,
+            )
+        return False
+
+    redis_service.delete_key(PASSWORD_RESET_NAMESPACE, cache_key)
+    return True
+
+
+async def _send_local_password_reset_email(email: str, code: str) -> bool:
+    from app.services.email_service import send_email
+
+    subject = "Reset your Nischint password"
+    text_body = (
+        f"Your Nischint password reset code is {code}. "
+        "It expires in 15 minutes. If you did not request this, ignore this email."
+    )
+    html_body = (
+        "<p>Your Nischint password reset code is:</p>"
+        f"<p style='font-size:24px;font-weight:700;letter-spacing:4px'>{code}</p>"
+        "<p>This code expires in 15 minutes.</p>"
+        "<p>If you did not request this reset, you can safely ignore this email.</p>"
+    )
+    return await asyncio.to_thread(
+        send_email,
+        email,
+        subject,
+        html_body,
+        text_body,
+    )
 
 
 def _generate_invite_code() -> str:
@@ -81,6 +181,16 @@ class RefreshRequest(BaseModel):
 class ConfirmRequest(BaseModel):
     email: EmailStr
     code: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=12)
+    password: str = Field(min_length=8, max_length=128)
 
 
 class CheckPhoneRequest(BaseModel):
@@ -270,6 +380,168 @@ async def confirm(req: ConfirmRequest):
         return {"confirmed": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/forgot-password", status_code=status.HTTP_202_ACCEPTED)
+@limiter.limit("5/minute")
+async def forgot_password(
+    request: Request,
+    req: ForgotPasswordRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Start password recovery without exposing whether an email exists.
+
+    Cognito is authoritative when enabled. Accounts that exist only in the
+    local compatibility store use the existing Redis + SendGrid fallback.
+    """
+    normalized_email = _normalize_email(req.email)
+    generic_response = {
+        "accepted": True,
+        "message": (
+            "If an eligible account exists, password-reset instructions "
+            "will be sent to the registered email address."
+        ),
+    }
+
+    if is_cognito_enabled():
+        from app.core.cognito import forgot_password as cognito_forgot_password
+
+        try:
+            cognito_forgot_password(normalized_email)
+            return generic_response
+        except ValueError as exc:
+            error_text = str(exc)
+            if "UserNotFoundException" not in error_text:
+                if "LimitExceededException" in error_text or "TooManyRequestsException" in error_text:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Too many password reset attempts. Please try again later.",
+                    )
+                logger.warning(
+                    "Cognito forgot-password failed for %s: %s",
+                    normalized_email,
+                    error_text[:200],
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Password reset service is temporarily unavailable.",
+                )
+
+    # Local fallback. Unknown emails intentionally return the same response.
+    user = await user_service.get_user_by_email(session, normalized_email)
+    if not user:
+        return generic_response
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    _store_local_password_reset(normalized_email, code)
+    sent = await _send_local_password_reset_email(normalized_email, code)
+    if not sent:
+        logger.warning(
+            "Local password-reset email could not be delivered for %s",
+            normalized_email,
+        )
+    return generic_response
+
+
+@router.post("/reset-password")
+@limiter.limit("10/minute")
+async def reset_password(
+    request: Request,
+    req: ResetPasswordRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Complete Cognito or local password recovery and keep local fallback
+    credentials synchronized with the new password.
+    """
+    normalized_email = _normalize_email(req.email)
+    cognito_reset = False
+
+    if is_cognito_enabled():
+        from app.core.cognito import confirm_forgot_password
+
+        try:
+            confirm_forgot_password(
+                normalized_email,
+                req.code.strip(),
+                req.password,
+            )
+            cognito_reset = True
+        except ValueError as exc:
+            error_text = str(exc)
+            if "UserNotFoundException" not in error_text:
+                if "CodeMismatchException" in error_text:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="The password reset code is invalid.",
+                    )
+                if "ExpiredCodeException" in error_text:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="The password reset code has expired. Request a new code.",
+                    )
+                if "LimitExceededException" in error_text or "TooManyRequestsException" in error_text:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Too many password reset attempts. Please try again later.",
+                    )
+                logger.warning(
+                    "Cognito reset-password failed for %s: %s",
+                    normalized_email,
+                    error_text[:200],
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Password reset service is temporarily unavailable.",
+                )
+
+    user = await user_service.get_user_by_email(session, normalized_email)
+
+    if not cognito_reset:
+        if not user or not _consume_local_password_reset(normalized_email, req.code):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The password reset code is invalid or expired.",
+            )
+
+    # Keep the local compatibility credential in sync. This matters because
+    # Cognito login deliberately falls back to Postgres during AWS outages.
+    if user:
+        user.password_hash = await user_service.hash_password_async(req.password)
+        await session.commit()
+
+    return {"reset": True}
+
+
+@router.post("/logout")
+async def logout(
+    user: User = Depends(get_current_user),
+):
+    """Best-effort server sign-out.
+
+    Cognito sessions are globally revoked when available. Local JWTs remain
+    stateless and expire naturally; the mobile client still clears all local
+    credentials immediately even when this endpoint is unreachable.
+    """
+    provider = "local"
+    server_revoked = False
+
+    if is_cognito_enabled() and getattr(user, "cognito_sub", None):
+        from app.core.cognito import admin_global_sign_out
+
+        provider = "cognito"
+        try:
+            admin_global_sign_out(str(user.cognito_sub or user.email))
+            server_revoked = True
+        except Exception as exc:
+            # Logout must never trap a user inside the app because an external
+            # identity provider is temporarily unavailable.
+            logger.warning("Cognito global sign-out failed for %s: %s", user.email, exc)
+
+    return {
+        "signed_out": True,
+        "provider": provider,
+        "server_revoked": server_revoked,
+    }
 
 
 @router.get("/login-health")
