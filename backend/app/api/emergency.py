@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session as get_session
+from app.core.product_roles import is_primary_guardian, normalize_role
 
 router = APIRouter(prefix="/emergency", tags=["Emergency"])
 
@@ -43,6 +44,73 @@ class SMSFallbackRequest(BaseModel):
     lat: float
     lng: float
     trigger_source: str = "offline_fallback"
+
+
+async def _get_emergency_event_or_404(session: AsyncSession, event_id: str):
+    """Load one emergency event without leaking invalid-ID implementation errors."""
+    import uuid as _uuid
+    from app.models.emergency import EmergencyEvent
+
+    try:
+        event_uuid = _uuid.UUID(str(event_id))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Emergency event not found")
+
+    result = await session.execute(
+        select(EmergencyEvent).where(EmergencyEvent.id == event_uuid)
+    )
+    event = result.scalar_one_or_none()
+    if event is None:
+        raise HTTPException(status_code=404, detail="Emergency event not found")
+    return event
+
+
+async def _caller_can_monitor_emergency(
+    session: AsyncSession,
+    user,
+    event_user_id,
+) -> bool:
+    """Owner, linked family monitor, or system operator/admin may read SOS details."""
+    caller_role = normalize_role(getattr(user, "role", None))
+    if caller_role in {"admin", "operator"}:
+        return True
+    if str(event_user_id) == str(user.id):
+        return True
+
+    from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+    linked_user_ids = await _get_linked_user_ids(
+        session,
+        getattr(user, "email", None),
+        str(user.id),
+        getattr(user, "role", None),
+        include_checkin_recovery=False,
+    )
+    return any(str(linked_id) == str(event_user_id) for linked_id in linked_user_ids)
+
+
+async def _caller_can_resolve_emergency(
+    session: AsyncSession,
+    user,
+    event_user_id,
+) -> bool:
+    """Resolution is a primary-guardian/system action; owners cancel with their PIN."""
+    caller_role = normalize_role(getattr(user, "role", None))
+    if caller_role in {"admin", "operator"}:
+        return True
+    if not is_primary_guardian(caller_role):
+        return False
+
+    from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+    linked_user_ids = await _get_linked_user_ids(
+        session,
+        getattr(user, "email", None),
+        str(user.id),
+        getattr(user, "role", None),
+        include_checkin_recovery=False,
+    )
+    return any(str(linked_id) == str(event_user_id) for linked_id in linked_user_ids)
 
 
 def _rate_limit_headers(result) -> dict:
@@ -195,6 +263,14 @@ async def location_update(
     user=Depends(get_current_user),
 ):
     from app.services.emergency_engine import update_emergency_location
+
+    event = await _get_emergency_event_or_404(session, req.event_id)
+    if str(event.user_id) != str(user.id):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the emergency owner may update its live location.",
+        )
+
     result = await update_emergency_location(
         session=session,
         event_id=req.event_id,
@@ -251,6 +327,14 @@ async def resolve_sos(
     user=Depends(get_current_user),
 ):
     from app.services.emergency_engine import resolve_emergency
+
+    event = await _get_emergency_event_or_404(session, req.event_id)
+    if not await _caller_can_resolve_emergency(session, user, event.user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="You are not authorized to resolve this emergency event.",
+        )
+
     result = await resolve_emergency(session=session, event_id=req.event_id)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
@@ -276,6 +360,12 @@ async def get_status(
     user=Depends(get_current_user),
 ):
     from app.services.emergency_engine import get_emergency_details
+
+    event = await _get_emergency_event_or_404(session, event_id)
+    if not await _caller_can_monitor_emergency(session, user, event.user_id):
+        # Do not reveal whether another family's emergency ID exists.
+        raise HTTPException(status_code=404, detail="Emergency event not found")
+
     result = await get_emergency_details(session=session, event_id=event_id)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])

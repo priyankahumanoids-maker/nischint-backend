@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db_session, get_current_user
 from app.models.user import User
 from app.models.guardian import GuardianAlert
-from app.core.product_roles import is_protected_member
+from app.core.product_roles import is_primary_guardian, is_protected_member, normalize_role
 
 router = APIRouter(prefix="/guardian/dashboard", tags=["guardian-dashboard"])
 
@@ -73,8 +73,47 @@ async def end_session(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    """End a journey session (callable by guardian or child)."""
+    """End a journey owned by the caller or one managed by the primary guardian."""
+    from app.models.guardian import GuardianSession
+    from app.services.guardian_dashboard_engine import _get_linked_user_ids
     from app.services.guardian_mode_engine import stop_session
+
+    try:
+        session_uuid = uuid.UUID(str(session_id))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    journey = (await session.execute(
+        select(GuardianSession).where(GuardianSession.id == session_uuid)
+    )).scalar_one_or_none()
+    if journey is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    caller_role = normalize_role(getattr(user, "role", None))
+    authorized = str(journey.user_id) == str(user.id)
+
+    if not authorized and caller_role in {"admin", "operator"}:
+        authorized = True
+
+    if not authorized and is_primary_guardian(caller_role):
+        linked_user_ids = await _get_linked_user_ids(
+            session,
+            user.email,
+            str(user.id),
+            getattr(user, "role", None),
+            include_checkin_recovery=False,
+        )
+        authorized = any(
+            str(linked_id) == str(journey.user_id)
+            for linked_id in linked_user_ids
+        )
+
+    if not authorized:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not authorized to end this journey session.",
+        )
+
     result = await stop_session(session, session_id)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])

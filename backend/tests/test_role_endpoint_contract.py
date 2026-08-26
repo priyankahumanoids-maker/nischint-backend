@@ -54,7 +54,8 @@ def test_legacy_sos_trigger_and_cancel_accept_all_protected_member_roles():
 
 def test_all_protected_members_receive_their_own_dashboard_alert_view():
     src = _read("app/api/guardian_dashboard.py")
-    assert "from app.core.product_roles import is_protected_member" in src
+    assert "from app.core.product_roles import" in src
+    assert "is_protected_member" in src
     get_alerts = _function_source(src, "get_alerts")
     assert "if is_protected_member(user.role):" in get_alerts
     assert "get_child_alerts" in get_alerts
