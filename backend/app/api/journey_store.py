@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
@@ -24,6 +25,12 @@ _client = None
 _db = None
 _enabled = False
 
+# Mongo is optional for this store. Remember the initialization result for the
+# lifetime of the process so an unavailable Mongo server cannot add a blocking
+# connection timeout to every request.
+_init_attempted = False
+_init_lock = threading.Lock()
+
 COL_CONTACTS = "journey_contacts"
 COL_USER_CONTACTS = "journey_user_contacts"
 COL_SOS = "journey_sos_events"
@@ -31,26 +38,82 @@ COL_ESCALATIONS = "journey_escalations"
 
 
 def _init() -> None:
-    """Initialize pymongo client once. Falls back silently on failure."""
-    global _client, _db, _enabled
-    if _client is not None or not settings.journey_mongo_enabled:
+    """
+    Initialize the optional pymongo store at most once per process.
+
+    If Mongo is unavailable, keep the existing in-memory fallback for the
+    lifetime of this process instead of retrying a blocking connection on
+    every request. A new deployment/process gets a fresh initialization
+    attempt automatically.
+    """
+    global _client, _db, _enabled, _init_attempted
+
+    # Fast path after either a successful initialization or a previous
+    # connection failure.
+    if _init_attempted or not settings.journey_mongo_enabled:
         return
+
+    # Do not make concurrent request threads wait behind Mongo discovery.
+    # One caller performs initialization; others immediately continue using
+    # the existing in-memory fallback until initialization completes.
+    if not _init_lock.acquire(blocking=False):
+        return
+
+    candidate = None
+
     try:
+        # Re-check after obtaining the initialization slot.
+        if _init_attempted or not settings.journey_mongo_enabled:
+            return
+
+        # Mark before any network operation so concurrent callers do not start
+        # their own Mongo connection attempts.
+        _init_attempted = True
+
         from pymongo import MongoClient
-        _client = MongoClient(settings.mongo_url, serverSelectionTimeoutMS=3000)
-        _client.admin.command("ping")
-        _db = _client[settings.db_name]
+
+        candidate = MongoClient(
+            settings.mongo_url,
+            serverSelectionTimeoutMS=3000,
+        )
+
+        candidate.admin.command("ping")
+
+        db = candidate[settings.db_name]
+
+        # Preserve all existing indexes and persistence behaviour.
+        db[COL_CONTACTS].create_index("layer")
+        db[COL_SOS].create_index("received_at")
+        db[COL_ESCALATIONS].create_index("updated_at")
+
+        _client = candidate
+        _db = db
         _enabled = True
-        # Indexes
-        _db[COL_CONTACTS].create_index("layer")
-        _db[COL_SOS].create_index("received_at")
-        _db[COL_ESCALATIONS].create_index("updated_at")
-        logger.info(f"[JOURNEY_STORE] MongoDB connected: db={settings.db_name}")
+
+        logger.info(
+            f"[JOURNEY_STORE] MongoDB connected: db={settings.db_name}"
+        )
+
     except Exception as e:
-        logger.warning(f"[JOURNEY_STORE] Mongo unavailable, using in-memory only: {e}")
+        # Dispose of a partially-created client cleanly.
+        if candidate is not None:
+            try:
+                candidate.close()
+            except Exception:
+                pass
+
         _client = None
         _db = None
         _enabled = False
+
+        # This warning now occurs once per process rather than once per caller.
+        logger.warning(
+            f"[JOURNEY_STORE] Mongo unavailable, "
+            f"using in-memory only: {e}"
+        )
+
+    finally:
+        _init_lock.release()
 
 
 def is_enabled() -> bool:
