@@ -97,16 +97,38 @@ async def start_session(
     session: AsyncSession, user_id: str, lat: float, lng: float,
     dest_lat: float | None = None, dest_lng: float | None = None,
     dest_name: str | None = None,
+    initial_eta_minutes: float | None = None,
 ) -> dict:
     now = datetime.now(timezone.utc)
     zone = await check_zone(session, user_id, lat, lng, now)
 
+    destination = (
+        {"lat": dest_lat, "lng": dest_lng, "name": dest_name}
+        if dest_lat is not None and dest_lng is not None
+        else None
+    )
+
+    # The mobile Safe Walk route engine already has a route-aware ETA. Store
+    # that immediately so linked guardians can see ETA from journey start,
+    # before the first meaningful GPS movement arrives. Older clients that do
+    # not send an ETA fall back to the same 4.5 km/h walking assumption used
+    # by the mobile Safe Walk UI.
+    initial_eta = None
+    if destination:
+        if initial_eta_minutes is not None:
+            initial_eta = round(max(0.0, float(initial_eta_minutes)), 1)
+        else:
+            remaining_m = _haversine(lat, lng, dest_lat, dest_lng)
+            walking_speed_mps = 4.5 / 3.6
+            initial_eta = round(remaining_m / walking_speed_mps / 60, 1)
+
     gs = GuardianSession(
         user_id=uuid.UUID(user_id), status="active",
-        destination={"lat": dest_lat, "lng": dest_lng, "name": dest_name} if dest_lat is not None else None,
+        destination=destination,
         current_location={"lat": lat, "lng": lng},
         risk_level=zone["risk_level"], risk_score=zone["risk_score"],
         zone_name=zone["zone_name"],
+        eta_minutes=initial_eta,
         is_night=(now.hour >= 22 or now.hour < 5),
     )
     session.add(gs)
@@ -135,6 +157,7 @@ async def start_session(
             "zone_name": zone["zone_name"],
         },
         "destination": gs.destination, "guardians_notified": len(guardians),
+        "eta_minutes": gs.eta_minutes,
         "is_night": gs.is_night,
     }
 
@@ -423,10 +446,18 @@ async def update_location(
         live["safety_check_pending"] = False
 
     # ETA
-    eta = None
-    if gs.destination and speed > 0.3:
+    # Keep the last valid ETA when GPS reports no meaningful movement. This
+    # prevents a duplicate/stationary fix from erasing ETA on the Guardian
+    # dashboard. Once movement is measurable, refresh ETA from live speed.
+    eta = gs.eta_minutes
+    if gs.destination:
         dest_dist = _haversine(lat, lng, gs.destination["lat"], gs.destination["lng"])
-        eta = round(dest_dist / speed / 60, 1)
+        if speed > 0.3:
+            eta = round(dest_dist / speed / 60, 1)
+        elif eta is None:
+            walking_speed_mps = 4.5 / 3.6
+            eta = round(dest_dist / walking_speed_mps / 60, 1)
+
         if dest_dist < 200:
             alert = await _create_alert(session, session_id, "arrived", "low",
                 "Arrived at destination safely",

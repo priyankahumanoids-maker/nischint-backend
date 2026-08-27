@@ -31,6 +31,9 @@ class AddGuardianRequest(BaseModel):
 class StartSessionRequest(BaseModel):
     location: LocationInput
     destination: Optional[LocationInput] = None
+    # Optional route ETA supplied by the protected app. Older clients do not
+    # send it, so this remains fully backward compatible.
+    eta_minutes: Optional[float] = Field(None, ge=0, le=1440)
 
 
 class UpdateLocationRequest(BaseModel):
@@ -88,6 +91,7 @@ async def start_session(
         dest_lat=req.destination.lat if req.destination else None,
         dest_lng=req.destination.lng if req.destination else None,
         dest_name=req.destination.name if req.destination else None,
+        initial_eta_minutes=req.eta_minutes,
     )
 
 
