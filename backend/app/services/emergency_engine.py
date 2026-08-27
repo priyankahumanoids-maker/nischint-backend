@@ -443,8 +443,15 @@ async def cancel_emergency(
 async def resolve_emergency(
     session: AsyncSession,
     event_id: str,
+    *,
+    notify_guardians: bool = True,
 ) -> dict:
-    """Mark emergency as resolved."""
+    """Mark emergency as resolved.
+
+    notify_guardians=False is used when another authenticated workflow
+    already sent the all-clear push (for example a SAFE check-in).
+    SSE resolution still runs so every client can clear emergency state.
+    """
     result = await session.execute(
         select(EmergencyEvent).where(EmergencyEvent.id == uuid.UUID(event_id))
     )
@@ -460,12 +467,13 @@ async def resolve_emergency(
     delete_key("emergency", event_id)
     _update_active_list(str(event.user_id), event_id, "remove")
 
-    await _notify_guardians_all_clear(
-        session,
-        str(event.user_id),
-        event_id,
-        "resolved",
-    )
+    if notify_guardians:
+        await _notify_guardians_all_clear(
+            session,
+            str(event.user_id),
+            event_id,
+            "resolved",
+        )
 
     logger.info(f"Emergency RESOLVED: event={event_id}")
 
@@ -485,6 +493,13 @@ async def resolve_emergency(
         "user_id": user_id,
         "resolved_at": now.isoformat(),
     }
+    # Send to the protected member too so an already-open SOS screen can
+    # immediately clear its local emergency state.
+    await broadcaster.broadcast_to_user(
+        user_id,
+        "emergency_resolved",
+        resolve_payload,
+    )
     await broadcaster.broadcast_to_operators("emergency_resolved", resolve_payload)
 
     from app.services.alert_trigger import _resolve_guardian_ids

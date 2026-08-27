@@ -375,6 +375,45 @@ async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: 
         *linked_guardian_ids,
     ]))
 
+    # A SAFE response is an explicit all-clear from this authenticated
+    # protected member. If they currently have an active SOS, close that
+    # same member's emergency through the canonical emergency engine.
+    #
+    # A normal safety check with no active SOS is unchanged.
+    # HELP never enters this branch and can never resolve an SOS.
+    resolved_emergency_id = None
+    if response == "safe":
+        from app.models.emergency import EmergencyEvent
+
+        emergency_result = await session.execute(
+            select(EmergencyEvent).where(
+                EmergencyEvent.user_id == uuid.UUID(child_id),
+                EmergencyEvent.status == "active",
+            ).order_by(EmergencyEvent.created_at.desc()).limit(1)
+        )
+        active_emergency = emergency_result.scalar_one_or_none()
+
+        if active_emergency:
+            from app.services.emergency_engine import resolve_emergency
+
+            resolution = await resolve_emergency(
+                session=session,
+                event_id=str(active_emergency.id),
+                # respond_to_checkin already sends the Guardian's All Clear
+                # push below. Avoid a second push for the same user action.
+                notify_guardians=False,
+            )
+            if "error" in resolution:
+                raise RuntimeError(
+                    f"Active SOS could not be resolved: {resolution['error']}"
+                )
+
+            resolved_emergency_id = str(active_emergency.id)
+            logger.info(
+                f"CHECKIN_SAFE resolved active SOS "
+                f"child={child_id} event={resolved_emergency_id}"
+            )
+
     # ── Step A: Push notification ──
     push_count = 0
     if response == "safe":
@@ -588,6 +627,7 @@ async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: 
         "check_in_id": check_in_id,
         "status": response,
         "responded_at": now.isoformat(),
+        "resolved_emergency_id": resolved_emergency_id,
     }
 
 

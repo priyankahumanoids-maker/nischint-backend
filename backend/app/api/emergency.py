@@ -94,10 +94,19 @@ async def _caller_can_resolve_emergency(
     user,
     event_user_id,
 ) -> bool:
-    """Resolution is a primary-guardian/system action; owners cancel with their PIN."""
+    """Allow the event owner, authorized primary guardian, or system role to resolve."""
+
+    # A protected member must be able to explicitly mark THEIR OWN SOS safe.
+    # This does not weaken family isolation because the event owner must match
+    # the authenticated caller exactly.
+    if str(getattr(user, "id", "")) == str(event_user_id):
+        return True
+
     caller_role = normalize_role(getattr(user, "role", None))
     if caller_role in {"admin", "operator"}:
         return True
+
+    # Preserve the existing Guardian authorization policy exactly as-is.
     if not is_primary_guardian(caller_role):
         return False
 
