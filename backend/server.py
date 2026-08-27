@@ -511,6 +511,17 @@ async def startup_db():
                 f"[PT-01] startup DDL failed (non-fatal): {_e}"
             )
 
+    if pool:
+        try:
+            from app.migrations.med01_medication import (
+                ensure_medication_tables,
+            )
+            await ensure_medication_tables()
+        except Exception as _e:
+            logger.error(
+                f"[MED-01] startup DDL failed (non-fatal): {_e}"
+            )
+
 
     if os.environ.get("ENV_HAZARD_USE_POSTGIS", "false").strip().lower() in (
         "1", "true", "yes", "on",

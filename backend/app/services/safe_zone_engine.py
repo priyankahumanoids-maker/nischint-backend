@@ -43,6 +43,12 @@ RECOMMENDATIONS = {
 # ── In-Memory Cache ──
 _zone_cache = {}       # zone_id -> {score, level, data, expires_at}
 _user_state_cache = {} # user_id -> {last_zone_id, last_risk_level, timestamp}
+# Production environments created before the location-incident ingestion work may
+# legitimately not have the optional `location_incidents` table.  Safe Walk must
+# still start using hotspot/time/environment risk instead of crashing the whole
+# journey flow.  Cache the schema capability for the lifetime of the process.
+_location_incidents_available: bool | None = None
+_location_incidents_warning_logged = False
 CACHE_TTL_S = 300      # 5 minutes
 GRID_CELL_SIZE_M = 250
 
@@ -167,19 +173,61 @@ async def _fetch_zones(session: AsyncSession) -> list[dict]:
 
 
 async def _fetch_nearby_incidents(session: AsyncSession, lat: float, lng: float, radius_m: float = 500, days: int = 30) -> list[dict]:
+    """Return optional recent incident intelligence without breaking Safe Walk.
+
+    `location_incidents` is an enrichment source, not the canonical journey
+    table.  Some deployed databases pre-date that ingestion table.  A missing or
+    temporarily incompatible enrichment source must therefore degrade to an
+    empty contribution while the still-valid hotspot/time/environment signals
+    continue to protect the journey.
+    """
+    global _location_incidents_available, _location_incidents_warning_logged
+
+    if _location_incidents_available is None:
+        exists = (
+            await session.execute(
+                text("SELECT to_regclass('public.location_incidents')")
+            )
+        ).scalar()
+        _location_incidents_available = bool(exists)
+
+    if not _location_incidents_available:
+        if not _location_incidents_warning_logged:
+            logger.warning(
+                "[SAFE_ZONE_DEGRADED] location_incidents unavailable; "
+                "continuing with hotspot/time/environment risk signals"
+            )
+            _location_incidents_warning_logged = True
+        return []
+
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    rows = (await session.execute(text("""
-        SELECT li.latitude, li.longitude, li.severity, li.incident_type,
-               li.created_at, EXTRACT(HOUR FROM li.created_at) as hour
-        FROM location_incidents li
-        JOIN incidents i ON li.incident_id = i.id
-        WHERE li.created_at >= :cutoff
-          AND li.latitude IS NOT NULL AND li.longitude IS NOT NULL
-          AND ABS(li.latitude - :lat) < 0.006
-          AND ABS(li.longitude - :lng) < 0.006
-        ORDER BY li.created_at DESC
-        LIMIT 100
-    """), {"cutoff": cutoff, "lat": lat, "lng": lng})).fetchall()
+
+    # Keep an unexpected enrichment-schema error inside a savepoint.  Without
+    # this, PostgreSQL would mark the request transaction as failed and Safe
+    # Walk could not proceed even though the remaining risk sources are valid.
+    try:
+        async with session.begin_nested():
+            rows = (await session.execute(text("""
+                SELECT li.latitude, li.longitude, li.severity, li.incident_type,
+                       li.created_at, EXTRACT(HOUR FROM li.created_at) as hour
+                FROM location_incidents li
+                JOIN incidents i ON li.incident_id = i.id
+                WHERE li.created_at >= :cutoff
+                  AND li.latitude IS NOT NULL AND li.longitude IS NOT NULL
+                  AND ABS(li.latitude - :lat) < 0.006
+                  AND ABS(li.longitude - :lng) < 0.006
+                ORDER BY li.created_at DESC
+                LIMIT 100
+            """), {"cutoff": cutoff, "lat": lat, "lng": lng})).fetchall()
+    except Exception as exc:  # enrichment failure must not block core safety
+        _location_incidents_available = False
+        if not _location_incidents_warning_logged:
+            logger.warning(
+                "[SAFE_ZONE_DEGRADED] recent-incident enrichment disabled: %s",
+                exc,
+            )
+            _location_incidents_warning_logged = True
+        return []
 
     return [r for r in [
         {"lat": float(r.latitude), "lng": float(r.longitude), "severity": r.severity,

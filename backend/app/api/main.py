@@ -5,6 +5,7 @@ from app.api.health import router as health_router
 from app.api.auth import router as auth_router
 from app.api.users import router as users_router
 from app.api.seniors import router as seniors_router
+from app.api.medicine import router as medicine_router
 from app.api.devices import router as devices_router
 from app.api.telemetry import router as telemetry_router
 from app.api.incidents import router as incidents_router
@@ -107,6 +108,7 @@ api_router = APIRouter()
 api_router.include_router(auth_router)
 api_router.include_router(users_router)
 api_router.include_router(seniors_router)
+api_router.include_router(medicine_router)
 api_router.include_router(devices_router)
 api_router.include_router(telemetry_router)
 api_router.include_router(incidents_router)
