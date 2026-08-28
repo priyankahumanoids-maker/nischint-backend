@@ -329,6 +329,7 @@ async def _compute_child_risk(session: AsyncSession, child_id, now):
     # The incident lifecycle (NISCH-006) attaches to children, not sessions
     # — so even an offline child needs a slot in the feed.
     if not active or not active.current_location:
+        last_known_at = child_user.last_known_at
         return {
             "child_id":   str(child_id),
             "child_name": child_user.full_name or "Unknown",
@@ -336,9 +337,21 @@ async def _compute_child_risk(session: AsyncSession, child_id, now):
             "score":      0,
             "factors":    ["Not currently tracking"],
             "status":     "offline",
-            "last_seen":  None,
-            "lat":        None,
-            "lng":        None,
+            "last_seen":  (
+                last_known_at.isoformat()
+                if last_known_at is not None
+                else None
+            ),
+            "lat":        (
+                float(child_user.last_known_lat)
+                if child_user.last_known_lat is not None
+                else None
+            ),
+            "lng":        (
+                float(child_user.last_known_lng)
+                if child_user.last_known_lng is not None
+                else None
+            ),
             "session_id": None,
             "is_offline": True,
         }

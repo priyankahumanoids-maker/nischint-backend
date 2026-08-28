@@ -224,7 +224,26 @@ async def record_protected_telemetry(
     if observed_at > now:
         observed_at = now
     observation_age_s = max(0.0, (now - observed_at).total_seconds())
-    is_current = observation_age_s <= 120
+
+    # Persist one authoritative latest-known coordinate on the User row. This
+    # survives Redis expiry/restarts and is the source Guardian screens can use
+    # when a protected phone is temporarily offline. Delayed queue replay must
+    # never replace a newer point.
+    user_row = (
+        await session.execute(
+            select(User).where(User.id == uuid.UUID(user_id))
+        )
+    ).scalar_one_or_none()
+    accepted_as_latest = True
+    if user_row is not None and user_row.last_known_at is not None:
+        previous_at = user_row.last_known_at
+        if previous_at.tzinfo is None:
+            previous_at = previous_at.replace(tzinfo=timezone.utc)
+        else:
+            previous_at = previous_at.astimezone(timezone.utc)
+        accepted_as_latest = observed_at >= previous_at
+
+    is_current = observation_age_s <= 120 and accepted_as_latest
     normalized_battery = (
         int(battery_pct)
         if battery_pct is not None and 0 <= int(battery_pct) <= 100
@@ -239,8 +258,21 @@ async def record_protected_telemetry(
         "updated_at": observed_at.isoformat(),
         "received_at": now.isoformat(),
         "is_current": is_current,
+        "accepted_as_latest": accepted_as_latest,
         "source": "protected_device",
     }
+
+    if not accepted_as_latest:
+        # Keep the newer Redis/DB/session/SSE state untouched. The caller marks
+        # this response stale and will not replay geofence transitions.
+        snapshot["latest_preserved"] = True
+        return snapshot
+
+    if user_row is not None:
+        user_row.last_known_lat = float(lat)
+        user_row.last_known_lng = float(lng)
+        user_row.last_known_at = observed_at
+
     set_json("protected_telemetry", user_id, snapshot, ttl=24 * 60 * 60)
     mark_user_ping(user_id, observed_at.isoformat())
 

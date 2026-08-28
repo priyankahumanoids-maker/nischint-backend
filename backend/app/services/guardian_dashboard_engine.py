@@ -28,6 +28,13 @@ def _fresh_device_telemetry(raw: object, now: datetime) -> tuple[dict | None, da
         updated_at = datetime.fromisoformat(str(updated_raw).replace("Z", "+00:00"))
         if updated_at.tzinfo is None:
             updated_at = updated_at.replace(tzinfo=timezone.utc)
+        else:
+            updated_at = updated_at.astimezone(timezone.utc)
+        # New protected-device snapshots explicitly tell us whether the point
+        # is current (<=2 min). A delayed offline replay remains valid as
+        # last-known history but must never be presented as live telemetry.
+        if raw.get("is_current") is False:
+            return None, updated_at
         if now - updated_at > DEVICE_TELEMETRY_FRESHNESS:
             return None, updated_at
     except (TypeError, ValueError):
@@ -608,7 +615,40 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                 )
                 location_type = "live"
 
-        # 4. Last ended session
+        # 4. Durable protected-device last-known location. These columns are
+        # updated by both passive/background GPS and SOS GPS, so Guardian Home
+        # and Family retain the exact last fix even after Redis expires or the
+        # protected phone goes offline.
+        if (
+            not location
+            and user.last_known_lat is not None
+            and user.last_known_lng is not None
+            and user.last_known_at is not None
+        ):
+            location = {
+                "lat": float(user.last_known_lat),
+                "lng": float(user.last_known_lng),
+            }
+            location_ts = user.last_known_at
+            normalized_last_known_at = user.last_known_at
+            if normalized_last_known_at.tzinfo is None:
+                normalized_last_known_at = normalized_last_known_at.replace(
+                    tzinfo=timezone.utc,
+                )
+            else:
+                normalized_last_known_at = normalized_last_known_at.astimezone(
+                    timezone.utc,
+                )
+            age = now - normalized_last_known_at
+            location_type = (
+                "live"
+                if age <= timedelta(minutes=2)
+                else "recent"
+                if age <= timedelta(hours=24)
+                else "historical"
+            )
+
+        # 5. Last ended session
         if not location:
             last_sess = ended_sessions_by_user.get(uid)
             if last_sess:
@@ -622,7 +662,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                     )
                     location_type = "recent"
 
-        # 5. Last location trail point
+        # 6. Last location trail point
         if not location:
             trail_row = trail_by_user.get(uid)
             if trail_row and trail_row[0] is not None:
@@ -633,7 +673,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                 location_ts = trail_row[2]
                 location_type = "recent"
 
-        # 6. Last emergency with coordinates
+        # 7. Last emergency with coordinates
         if not location:
             past_em = past_emergencies_by_user.get(uid)
             if past_em:

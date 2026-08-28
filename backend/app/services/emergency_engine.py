@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.emergency import EmergencyEvent
 from app.models.guardian import Guardian
+from app.models.user import User
 from app.services.redis_service import set_json, get_json, delete_key
 from app.services.event_broadcaster import broadcaster
 
@@ -315,6 +316,21 @@ async def update_emergency_location(
     event.location_trail = trail
     event.lat = lat
     event.lng = lng
+
+    # Keep the same durable last-known location current during an SOS. The
+    # passive geofence endpoint is intentionally bypassed while emergency
+    # tracking is active, so without this update Guardian screens could fall
+    # back to an older pre-SOS coordinate after the event/session ends.
+    user_row = (
+        await session.execute(
+            select(User).where(User.id == event.user_id)
+        )
+    ).scalar_one_or_none()
+    if user_row is not None:
+        user_row.last_known_lat = float(lat)
+        user_row.last_known_lng = float(lng)
+        user_row.last_known_at = now
+
     await session.flush()
 
     # Update Redis
