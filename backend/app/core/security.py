@@ -2,6 +2,7 @@
 # Supports dual-mode: local JWT + Cognito JWT
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from uuid import uuid4
 
 from jose import JWTError, jwt
 from pydantic import BaseModel
@@ -37,10 +38,11 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 
 def create_refresh_token(data: dict) -> str:
-    """Create a long-lived, signed refresh token for local-auth sessions."""
+    """Create a unique, long-lived refresh token for a local-auth session."""
     to_encode = data.copy()
     to_encode.update({
         "type": "refresh",
+        "jti": uuid4().hex,
         "exp": datetime.now(timezone.utc)
         + timedelta(days=settings.jwt_refresh_expires_days),
     })

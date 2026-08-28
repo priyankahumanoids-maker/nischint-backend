@@ -11,6 +11,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
@@ -37,18 +38,94 @@ INVITE_CODE_TTL_MINUTES = 15
 
 # Password recovery is intentionally separate from registration OTP.
 # Reset codes are short-lived and one-time-use. Cognito owns delivery when
-# enabled; local fallback accounts use the existing SendGrid + Redis layer.
+# enabled; local fallback accounts use SendGrid + durable PostgreSQL state.
 PASSWORD_RESET_TTL_SECONDS = 15 * 60
 PASSWORD_RESET_MAX_ATTEMPTS = 5
-PASSWORD_RESET_NAMESPACE = "auth_password_reset"
 
+
+async def _claim_local_refresh_once(
+    session: AsyncSession,
+    refresh_token: str,
+    claims: dict,
+    user_id: uuid.UUID,
+) -> bool:
+    """Atomically consume one local refresh credential in PostgreSQL.
+
+    New refresh tokens carry a unique ``jti``. Refresh tokens issued before
+    AUTH-03 are migrated transparently by using the SHA-256 fingerprint of the
+    exact signed token as their durable identifier.
+
+    ``token_id`` is a primary key, so concurrent refresh attempts served by
+    separate Cloud Run instances cannot both consume the same credential.
+    """
+    import time
+
+    token_id = str(claims.get("jti") or "").strip()
+
+    if not token_id:
+        token_id = hashlib.sha256(
+            str(refresh_token).encode("utf-8")
+        ).hexdigest()
+
+    try:
+        expires_at_epoch = int(claims.get("exp") or 0)
+    except (TypeError, ValueError):
+        expires_at_epoch = 0
+
+    if expires_at_epoch <= 0:
+        expires_at_epoch = (
+            int(time.time())
+            + int(settings.jwt_refresh_expires_days) * 24 * 60 * 60
+        )
+
+    try:
+        result = await session.execute(
+            text(
+                """
+                INSERT INTO auth_refresh_consumptions (
+                    token_id,
+                    user_id,
+                    expires_at,
+                    consumed_at
+                )
+                VALUES (
+                    :token_id,
+                    CAST(:user_id AS UUID),
+                    to_timestamp(:expires_at_epoch),
+                    NOW()
+                )
+                ON CONFLICT (token_id) DO NOTHING
+                RETURNING token_id
+                """
+            ),
+            {
+                "token_id": token_id,
+                "user_id": str(user_id),
+                "expires_at_epoch": expires_at_epoch,
+            },
+        )
+    except Exception as exc:
+        await session.rollback()
+        logger.error(
+            "AUTH_REFRESH_GUARD_DB_ERROR error=%s",
+            str(exc)[:200],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Session refresh is temporarily unavailable. "
+                "Please try again."
+            ),
+        )
+
+    return result.scalar_one_or_none() is not None
 
 def _normalize_email(email: str) -> str:
     return str(email or "").strip().casefold()
 
 
 def _password_reset_cache_key(email: str) -> str:
-    # Avoid placing raw email addresses in Redis keys/log tooling.
+    # Avoid placing raw email addresses in auth-state storage or logs.
     return hashlib.sha256(_normalize_email(email).encode("utf-8")).hexdigest()
 
 
@@ -61,52 +138,179 @@ def _password_reset_digest(email: str, code: str) -> str:
     ).hexdigest()
 
 
-def _store_local_password_reset(email: str, code: str) -> None:
-    from app.services import redis_service
+async def _store_local_password_reset(
+    session: AsyncSession,
+    email: str,
+    code: str,
+) -> None:
+    email_hash = _password_reset_cache_key(email)
+    digest = _password_reset_digest(email, code)
 
-    redis_service.set_json(
-        PASSWORD_RESET_NAMESPACE,
-        _password_reset_cache_key(email),
-        {
-            "digest": _password_reset_digest(email, code),
-            "attempts": 0,
-        },
-        ttl=PASSWORD_RESET_TTL_SECONDS,
-    )
+    try:
+        await session.execute(
+            text(
+                """
+                INSERT INTO auth_password_resets (
+                    email_hash,
+                    code_digest,
+                    attempts,
+                    expires_at,
+                    created_at
+                )
+                VALUES (
+                    :email_hash,
+                    :code_digest,
+                    0,
+                    NOW() + (:ttl_seconds * INTERVAL '1 second'),
+                    NOW()
+                )
+                ON CONFLICT (email_hash)
+                DO UPDATE SET
+                    code_digest = EXCLUDED.code_digest,
+                    attempts = 0,
+                    expires_at = EXCLUDED.expires_at,
+                    created_at = NOW()
+                """
+            ),
+            {
+                "email_hash": email_hash,
+                "code_digest": digest,
+                "ttl_seconds": PASSWORD_RESET_TTL_SECONDS,
+            },
+        )
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        logger.error(
+            "AUTH_PASSWORD_RESET_STORE_DB_ERROR error=%s",
+            str(exc)[:200],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Password reset service is temporarily unavailable.",
+        )
 
 
-def _consume_local_password_reset(email: str, code: str) -> bool:
-    from app.services import redis_service
+async def _consume_local_password_reset(
+    session: AsyncSession,
+    email: str,
+    code: str,
+) -> bool:
+    """Validate and consume one local password-reset code.
 
-    cache_key = _password_reset_cache_key(email)
-    entry = redis_service.get_json(PASSWORD_RESET_NAMESPACE, cache_key)
-    if not isinstance(entry, dict):
-        return False
+    ``FOR UPDATE`` serializes concurrent attempts for the same account so a
+    valid code cannot be successfully consumed twice.
+    """
+    email_hash = _password_reset_cache_key(email)
 
-    attempts = int(entry.get("attempts") or 0)
-    if attempts >= PASSWORD_RESET_MAX_ATTEMPTS:
-        redis_service.delete_key(PASSWORD_RESET_NAMESPACE, cache_key)
-        return False
+    try:
+        # Remove an expired record for this account before attempting use.
+        await session.execute(
+            text(
+                """
+                DELETE FROM auth_password_resets
+                WHERE email_hash = :email_hash
+                  AND expires_at <= NOW()
+                """
+            ),
+            {"email_hash": email_hash},
+        )
 
-    expected = str(entry.get("digest") or "")
-    supplied = _password_reset_digest(email, code)
-    if not expected or not hmac.compare_digest(expected, supplied):
-        attempts += 1
+        result = await session.execute(
+            text(
+                """
+                SELECT code_digest, attempts
+                FROM auth_password_resets
+                WHERE email_hash = :email_hash
+                  AND expires_at > NOW()
+                FOR UPDATE
+                """
+            ),
+            {"email_hash": email_hash},
+        )
+
+        row = result.mappings().first()
+
+        if not row:
+            await session.commit()
+            return False
+
+        attempts = int(row["attempts"] or 0)
+
         if attempts >= PASSWORD_RESET_MAX_ATTEMPTS:
-            redis_service.delete_key(PASSWORD_RESET_NAMESPACE, cache_key)
-        else:
-            # Redis service preserves a bounded TTL. Re-writing on a failed
-            # attempt does not create an unbounded credential-reset record.
-            redis_service.set_json(
-                PASSWORD_RESET_NAMESPACE,
-                cache_key,
-                {"digest": expected, "attempts": attempts},
-                ttl=PASSWORD_RESET_TTL_SECONDS,
+            await session.execute(
+                text(
+                    """
+                    DELETE FROM auth_password_resets
+                    WHERE email_hash = :email_hash
+                    """
+                ),
+                {"email_hash": email_hash},
             )
-        return False
+            await session.commit()
+            return False
 
-    redis_service.delete_key(PASSWORD_RESET_NAMESPACE, cache_key)
-    return True
+        expected = str(row["code_digest"] or "")
+        supplied = _password_reset_digest(email, code)
+
+        if not expected or not hmac.compare_digest(expected, supplied):
+            attempts += 1
+
+            if attempts >= PASSWORD_RESET_MAX_ATTEMPTS:
+                await session.execute(
+                    text(
+                        """
+                        DELETE FROM auth_password_resets
+                        WHERE email_hash = :email_hash
+                        """
+                    ),
+                    {"email_hash": email_hash},
+                )
+            else:
+                await session.execute(
+                    text(
+                        """
+                        UPDATE auth_password_resets
+                        SET attempts = :attempts
+                        WHERE email_hash = :email_hash
+                        """
+                    ),
+                    {
+                        "attempts": attempts,
+                        "email_hash": email_hash,
+                    },
+                )
+
+            await session.commit()
+            return False
+
+        # Keep successful code consumption in the caller's transaction.
+        # reset_password() will update password_hash and commit both changes
+        # atomically, so a failed password update does not burn a valid code.
+        await session.execute(
+            text(
+                """
+                DELETE FROM auth_password_resets
+                WHERE email_hash = :email_hash
+                """
+            ),
+            {"email_hash": email_hash},
+        )
+
+        return True
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await session.rollback()
+        logger.error(
+            "AUTH_PASSWORD_RESET_CONSUME_DB_ERROR error=%s",
+            str(exc)[:200],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Password reset service is temporarily unavailable.",
+        )
 
 
 async def _send_local_password_reset_email(email: str, code: str) -> bool:
@@ -339,15 +543,47 @@ async def refresh(
                 detail="Refresh session is no longer valid",
             )
 
+        if not await _claim_local_refresh_once(
+            session,
+            req.refresh_token,
+            local_claims,
+            refresh_user_id,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh session has already been used",
+            )
+
         token_claims = {
             "sub": str(user.id),
             "role": user.role,
             "email": user.email,
             "full_name": user.full_name,
         }
+        next_access_token = create_access_token(data=token_claims)
+        next_refresh_token = create_refresh_token(
+            data={"sub": str(user.id)}
+        )
+
+        try:
+            await session.commit()
+        except Exception as exc:
+            await session.rollback()
+            logger.error(
+                "AUTH_REFRESH_ROTATION_COMMIT_ERROR error=%s",
+                str(exc)[:200],
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Session refresh is temporarily unavailable. "
+                    "Please try again."
+                ),
+            )
+
         return TokenResponse(
-            access_token=create_access_token(data=token_claims),
-            refresh_token=create_refresh_token(data={"sub": str(user.id)}),
+            access_token=next_access_token,
+            refresh_token=next_refresh_token,
             role=user.role,
             auth_provider="local",
         )
@@ -393,7 +629,7 @@ async def forgot_password(
     """Start password recovery without exposing whether an email exists.
 
     Cognito is authoritative when enabled. Accounts that exist only in the
-    local compatibility store use the existing Redis + SendGrid fallback.
+    local compatibility store use PostgreSQL + SendGrid fallback.
     """
     normalized_email = _normalize_email(req.email)
     generic_response = {
@@ -434,7 +670,7 @@ async def forgot_password(
         return generic_response
 
     code = f"{secrets.randbelow(1_000_000):06d}"
-    _store_local_password_reset(normalized_email, code)
+    await _store_local_password_reset(session, normalized_email, code)
     sent = await _send_local_password_reset_email(normalized_email, code)
     if not sent:
         logger.warning(
@@ -498,7 +734,7 @@ async def reset_password(
     user = await user_service.get_user_by_email(session, normalized_email)
 
     if not cognito_reset:
-        if not user or not _consume_local_password_reset(normalized_email, req.code):
+        if not user or not await _consume_local_password_reset(session, normalized_email, req.code):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="The password reset code is invalid or expired.",
@@ -513,15 +749,22 @@ async def reset_password(
     return {"reset": True}
 
 
+class LogoutRequest(BaseModel):
+    refresh_token: Optional[str] = None
+
+
 @router.post("/logout")
 async def logout(
+    req: LogoutRequest,
     user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
 ):
     """Best-effort server sign-out.
 
-    Cognito sessions are globally revoked when available. Local JWTs remain
-    stateless and expire naturally; the mobile client still clears all local
-    credentials immediately even when this endpoint is unreachable.
+    Cognito sessions are globally revoked when available. For local-auth
+    sessions, the current refresh credential is durably consumed when the
+    client provides it. The mobile client always clears its local credentials
+    even when server-side revocation is temporarily unavailable.
     """
     provider = "local"
     server_revoked = False
@@ -536,7 +779,54 @@ async def logout(
         except Exception as exc:
             # Logout must never trap a user inside the app because an external
             # identity provider is temporarily unavailable.
-            logger.warning("Cognito global sign-out failed for %s: %s", user.email, exc)
+            logger.warning(
+                "Cognito global sign-out failed for %s: %s",
+                user.email,
+                exc,
+            )
+
+    elif req.refresh_token:
+        local_claims = decode_refresh_token(req.refresh_token)
+
+        if local_claims:
+            try:
+                refresh_user_id = uuid.UUID(
+                    str(local_claims["sub"])
+                )
+            except (KeyError, TypeError, ValueError):
+                refresh_user_id = None
+
+            if refresh_user_id == user.id:
+                # Whether this INSERT succeeds or the token was already
+                # consumed, it is no longer usable as a refresh credential.
+                await _claim_local_refresh_once(
+                    session,
+                    req.refresh_token,
+                    local_claims,
+                    user.id,
+                )
+
+                try:
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    logger.warning(
+                        "Local logout revocation commit failed for %s: %s",
+                        user.email,
+                        str(exc)[:200],
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=(
+                            "Server sign-out is temporarily unavailable."
+                        ),
+                    )
+
+                server_revoked = True
+            else:
+                logger.warning(
+                    "Ignoring local logout refresh token with mismatched user"
+                )
 
     return {
         "signed_out": True,

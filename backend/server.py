@@ -523,6 +523,18 @@ async def startup_db():
             )
 
 
+    if pool:
+        try:
+            from app.migrations.auth03_auth_core import (
+                ensure_auth_core_tables,
+            )
+            await ensure_auth_core_tables()
+        except Exception as _e:
+            logger.error(
+                f"[AUTH-03] startup DDL failed (non-fatal): {_e}"
+            )
+
+
     if os.environ.get("ENV_HAZARD_USE_POSTGIS", "false").strip().lower() in (
         "1", "true", "yes", "on",
     ):
