@@ -124,13 +124,32 @@ async def get_live_status(
         )).order_by(desc(GuardianSession.started_at)).limit(1)
     )).scalar_one_or_none()
 
-    # Compute AI risk score
+    # Compute a read-only live-risk snapshot.
+    #
+    # This endpoint is polled frequently by the Guardian Live Map.  Do not
+    # call compute_risk_score() here: that service persists GuardianRiskScore
+    # and GuardianRiskEvent rows and flushes the request session.  A failed
+    # optional AI write must never poison this read-only status request.
     risk_data = None
     try:
-        from app.services.guardian_ai_refinement import compute_risk_score
-        risk_data = await compute_risk_score(session, target_uid)
+        live_risk = await _compute_child_risk(
+            session,
+            target_uid,
+            datetime.now(timezone.utc),
+        )
+        if isinstance(live_risk, dict):
+            risk_data = {
+                "score": live_risk.get("score", 0),
+                "level": live_risk.get("risk", "GREEN"),
+                "factors": live_risk.get("factors", []),
+            }
     except Exception as e:
-        logger.debug(f"Risk score computation skipped: {e}")
+        logger.exception(
+            "[GUARDIAN_LIVE_STATUS] live risk computation failed "
+            "user=%s err=%s",
+            target_uid,
+            e,
+        )
 
     # Get recent alerts (last 10)
     recent_alerts = []
@@ -180,20 +199,19 @@ async def get_live_status(
             "last_update_seconds": last_update_seconds,
         }
 
-    # Get behavior pattern from risk data
+    # Derive the Guardian intelligence labels from the same GREEN/YELLOW/RED
+    # live-risk classification used by /guardian/live/risk.
     behavior_pattern = "Normal"
     recommendation = "No action needed"
     if risk_data:
-        score = risk_data.get("score", 0)
-        if score >= 85:
+        level = str(risk_data.get("level", "GREEN")).upper()
+
+        if level == "RED":
             behavior_pattern = "Critical Alert"
             recommendation = "Immediate contact required"
-        elif score >= 60:
+        elif level == "YELLOW":
             behavior_pattern = "Deviating"
             recommendation = "Check-in with user"
-        elif score >= 30:
-            behavior_pattern = "Slight Changes"
-            recommendation = "Continue monitoring"
 
     # Get last 5 completed sessions for history context
     past_sessions = []
