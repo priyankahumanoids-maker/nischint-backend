@@ -678,7 +678,7 @@ async def verify_invite_code(
         password_hash=await user_service.hash_password_async(req.password),
         role=req.role,
         full_name=req.full_name,
-        phone=req.phone,
+        phone=_normalize_phone(req.phone) or None,
         guardian_id=guardian.id,
     )
     session.add(new_user)

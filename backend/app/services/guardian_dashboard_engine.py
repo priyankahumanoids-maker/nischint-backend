@@ -703,6 +703,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
             "name": user.full_name or user.email,
             "email": user.email,
             "phone": user.phone,
+            "is_active": bool(user.is_active),
             "role": user.role,
             "relationship": rel_type,
             "status": status,
