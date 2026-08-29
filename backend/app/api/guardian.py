@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from app.api.deps import get_db_session, get_current_user
 from app.models import User
+from app.core.product_roles import is_co_guardian, is_primary_guardian, normalize_role
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/guardian", tags=["guardian"])
@@ -42,6 +43,82 @@ class UpdateLocationRequest(BaseModel):
     timestamp: Optional[str] = None
 
 
+async def _load_journey_for_auth(
+    session: AsyncSession,
+    session_id: str,
+):
+    """Load a journey for authorization without leaking cross-family data."""
+    import uuid
+    from sqlalchemy import select
+    from app.models.guardian import GuardianSession
+
+    try:
+        sid = uuid.UUID(str(session_id))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    journey = (
+        await session.execute(
+            select(GuardianSession).where(GuardianSession.id == sid)
+        )
+    ).scalar_one_or_none()
+    if journey is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return journey
+
+
+async def _require_journey_owner(
+    session: AsyncSession,
+    session_id: str,
+    user: User,
+):
+    """Mutation boundary: journey GPS/safety state belongs to its device owner.
+
+    Admin/operator retain operational access. Primary guardians use the
+    existing /guardian/dashboard/end-session endpoint when they need to end a
+    protected member's journey; co-parents remain monitoring-only.
+    """
+    journey = await _load_journey_for_auth(session, session_id)
+    role = normalize_role(getattr(user, "role", None))
+    if str(journey.user_id) == str(user.id) or role in {"admin", "operator"}:
+        return journey
+    raise HTTPException(
+        status_code=403,
+        detail="You are not authorized to modify this journey session.",
+    )
+
+
+async def _require_journey_viewer(
+    session: AsyncSession,
+    session_id: str,
+    user: User,
+):
+    """Read boundary: owner, operator/admin, or authorized family monitor."""
+    journey = await _load_journey_for_auth(session, session_id)
+    role = normalize_role(getattr(user, "role", None))
+
+    if str(journey.user_id) == str(user.id) or role in {"admin", "operator"}:
+        return journey
+
+    if is_primary_guardian(role) or is_co_guardian(role):
+        from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+        linked_user_ids = await _get_linked_user_ids(
+            session,
+            user.email,
+            str(user.id),
+            getattr(user, "role", None),
+            include_checkin_recovery=False,
+        )
+        if any(str(linked_id) == str(journey.user_id) for linked_id in linked_user_ids):
+            return journey
+
+    raise HTTPException(
+        status_code=403,
+        detail="You are not authorized to view this journey session.",
+    )
+
+
 # ── Guardian CRUD ──
 
 @router.post("/add")
@@ -70,7 +147,31 @@ async def remove_guardian(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    import uuid
+    from sqlalchemy import select
+    from app.models.guardian import Guardian
     from app.services.guardian_mode_engine import remove_guardian as remove_g
+
+    try:
+        guardian_uuid = uuid.UUID(str(guardian_id))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Guardian not found")
+
+    record = (
+        await session.execute(
+            select(Guardian).where(Guardian.id == guardian_uuid)
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        raise HTTPException(status_code=404, detail="Guardian not found")
+
+    role = normalize_role(getattr(user, "role", None))
+    if str(record.user_id) != str(user.id) and role not in {"admin", "operator"}:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not authorized to remove this guardian.",
+        )
+
     result = await remove_g(session, guardian_id)
     if "error" in result:
         raise HTTPException(404, result["error"])
@@ -105,6 +206,8 @@ async def stop_session(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    await _require_journey_owner(session, req.session_id, user)
+
     from app.services.guardian_mode_engine import stop_session as stop_s
     result = await stop_s(session, req.session_id)
     if "error" in result:
@@ -118,6 +221,8 @@ async def get_session(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    await _require_journey_viewer(session, session_id, user)
+
     from app.services.guardian_mode_engine import get_session as get_s
     result = await get_s(session, session_id)
     if not result:
@@ -153,6 +258,8 @@ async def update_location(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    await _require_journey_owner(session, req.session_id, user)
+
     logger.info(f"GPS_UPDATE_RECEIVED user={user.id} session={req.session_id} lat={req.location.lat} lng={req.location.lng}")
     from app.services.guardian_mode_engine import update_location as update_l
     from app.services.shadow_tracking import shadow_ping
@@ -231,6 +338,8 @@ async def acknowledge_safety(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    await _require_journey_owner(session, req.session_id, user)
+
     from app.services.guardian_mode_engine import acknowledge_safety as ack_s
     return await ack_s(session, req.session_id)
 
@@ -268,23 +377,10 @@ async def get_session_polyline(
     if gs is None:
         raise HTTPException(404, "Session not found")
 
-    # AuthZ: owner / operator / linked guardian.
-    is_owner = (gs.user_id == user.id)
-    is_operator = (user.role == "operator")
-    if not (is_owner or is_operator):
-        # Linked-guardian check via Guardian table (email match).
-        link = await session.execute(
-            text(
-                """SELECT 1
-                     FROM guardians g
-                     JOIN users u ON u.email = g.email
-                    WHERE g.user_id = :child AND u.id = :viewer
-                    LIMIT 1"""
-            ),
-            {"child": str(gs.user_id), "viewer": str(user.id)},
-        )
-        if link.scalar() is None:
-            raise HTTPException(403, "Not authorized for this session")
+    # Canonical AuthZ: owner / operator-admin / authorized family monitor.
+    # This includes the current direct users.guardian_id family model and
+    # co-parent read scope rather than relying only on the legacy Guardian table.
+    await _require_journey_viewer(session, session_id, user)
 
     # Cap to keep payload sane. seq is monotonic per session.
     capped = max(1, min(int(limit or 1000), 5000))
