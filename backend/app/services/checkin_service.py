@@ -631,13 +631,65 @@ async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: 
     }
 
 
-async def get_checkin_status(session: AsyncSession, check_in_id: str) -> dict | None:
-    """Get status of a check-in (for guardian polling)."""
+async def get_checkin_status(
+    session: AsyncSession,
+    check_in_id: str,
+    viewer_id: str,
+    viewer_email: str = "",
+    viewer_role: str | None = None,
+) -> dict | None:
+    """Get status only for the check-in child or an authorized family monitor.
+
+    Unauthorized UUIDs deliberately return ``None`` just like missing UUIDs so
+    this read endpoint cannot be used to enumerate another family's check-ins.
+    """
+    try:
+        checkin_uuid = uuid.UUID(str(check_in_id))
+        viewer_uuid = uuid.UUID(str(viewer_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
     ci_result = await session.execute(
-        select(CheckIn).where(CheckIn.id == uuid.UUID(check_in_id))
+        select(CheckIn).where(CheckIn.id == checkin_uuid)
     )
     ci = ci_result.scalar_one_or_none()
     if not ci:
+        return None
+
+    from app.core.product_roles import (
+        is_guardian_monitor,
+        normalize_role,
+    )
+
+    role = normalize_role(viewer_role)
+    is_allowed = (
+        ci.child_id == viewer_uuid
+        or ci.guardian_id == viewer_uuid
+        or role in {"admin", "operator"}
+    )
+
+    if not is_allowed and is_guardian_monitor(role):
+        # Use the canonical family resolver and explicitly disable historical
+        # CheckIn recovery: a previous check-in must never grant fresh access.
+        from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+        linked_user_ids = await _get_linked_user_ids(
+            session,
+            viewer_email,
+            str(viewer_uuid),
+            viewer_role,
+            include_checkin_recovery=False,
+        )
+        is_allowed = ci.child_id in set(linked_user_ids)
+
+    if not is_allowed:
+        logger.warning(
+            "CHECKIN_STATUS_REJECTED viewer=%s check_in=%s child=%s role=%s",
+            viewer_id,
+            check_in_id,
+            ci.child_id,
+            viewer_role,
+        )
         return None
 
     child_result = await session.execute(select(User).where(User.id == ci.child_id))

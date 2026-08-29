@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
+from app.core.product_roles import is_guardian_monitor, is_protected_member, normalize_role
 from app.models.user import User
 
 router = APIRouter(prefix="/checkin", tags=["checkin"])
@@ -26,6 +27,12 @@ async def report_safe_status(
     user: User = Depends(get_current_user),
 ):
     """Protected member proactively reassures every linked guardian."""
+    if not is_protected_member(user.role):
+        raise HTTPException(
+            status_code=403,
+            detail="Only a protected member can report their own safe status.",
+        )
+
     from app.services.checkin_service import report_safe_status as _report_safe
     result = await _report_safe(
         session,
@@ -45,7 +52,14 @@ async def create_checkin(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    """Guardian initiates a safety check-in for a child."""
+    """Guardian initiates a safety check-in for a protected member."""
+    role = normalize_role(user.role)
+    if not (is_guardian_monitor(role) or role == "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Only a guardian can initiate a safety check.",
+        )
+
     from app.services.checkin_service import create_checkin as _create
     result = await _create(session, str(user.id), child_user_id)
     if "error" in result:
@@ -87,10 +101,18 @@ async def get_checkin_status(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    """Guardian checks the status of a check-in."""
+    """Authorized family monitor or check-in owner checks its status."""
     from app.services.checkin_service import get_checkin_status as _status
-    result = await _status(session, check_in_id)
+    result = await _status(
+        session,
+        check_in_id,
+        str(user.id),
+        user.email or "",
+        user.role,
+    )
     if not result:
+        # Deliberately use 404 for both absent and unauthorized IDs so a caller
+        # cannot probe whether another family's check-in UUID exists.
         raise HTTPException(status_code=404, detail="Check-in not found")
     return result
 
