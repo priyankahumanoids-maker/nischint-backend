@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.guardian import Guardian, GuardianAlert, GuardianSession
 from app.models.relationship import Relationship
 from app.models.user import User
+from app.core.product_roles import is_co_guardian, is_protected_member
 from app.services import redis_service, ttfa_recorder
 from app.services.alert_formatter import format_alert
 from app.services.alert_proximity import is_co_located, is_suppressible_kind
@@ -190,10 +191,34 @@ async def _resolve_guardian_ids(session: AsyncSession, child_user_id: str) -> tu
 
     # Path 4: Direct parent link on User record (User.guardian_id).
     if child_user and child_user.guardian_id:
-        gid = str(child_user.guardian_id)
+        primary_guardian_id = child_user.guardian_id
+        gid = str(primary_guardian_id)
         if gid not in seen:
             seen.add(gid)
             out.append(gid)
+
+        # A co-parent created through the current Family Circle invite is
+        # represented as users.guardian_id -> the same primary guardian.
+        # Dashboard monitoring already inherits that primary family scope.
+        # Keep alert delivery consistent with the same family model, but only
+        # for real protected-member events — never when resolving a guardian
+        # account itself.
+        if is_protected_member(child_user.role):
+            co_parent_rows = (
+                await session.execute(
+                    select(User).where(
+                        User.guardian_id == primary_guardian_id,
+                        User.is_active.is_(True),
+                    )
+                )
+            ).scalars().all()
+            for candidate in co_parent_rows:
+                if not is_co_guardian(candidate.role):
+                    continue
+                co_parent_id = str(candidate.id)
+                if co_parent_id not in seen:
+                    seen.add(co_parent_id)
+                    out.append(co_parent_id)
 
     return out, child_name
 

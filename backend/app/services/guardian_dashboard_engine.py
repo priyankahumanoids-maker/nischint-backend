@@ -44,6 +44,31 @@ def _normalized_role_sql(column):
     )
 
 
+async def _filter_protected_scope_ids(
+    session: AsyncSession,
+    candidate_ids: set[uuid.UUID] | list[uuid.UUID],
+) -> list[uuid.UUID]:
+    """Remove supervisory/inactive accounts from a resolved family scope.
+
+    Some legacy relationship tables can contain guardian-facing links in
+    addition to protected-member links.  The family dashboard must never turn
+    a primary guardian or co-parent into a loved-one card merely because such a
+    relationship row exists.  This is a defensive boundary only; it does not
+    change how valid protected members are linked.
+    """
+    if not candidate_ids:
+        return []
+
+    result = await session.execute(
+        select(User.id).where(
+            User.id.in_(list(candidate_ids)),
+            User.is_active == True,  # noqa: E712
+            _normalized_role_sql(User.role).notin_(MONITOR_ONLY_ROLES),
+        )
+    )
+    return [row[0] for row in result.all() if row[0] is not None]
+
+
 def _fresh_device_telemetry(raw: object, now: datetime) -> tuple[dict | None, datetime | None]:
     """Return only recent, real protected-device telemetry."""
     if not isinstance(raw, dict):
@@ -249,7 +274,7 @@ async def _get_linked_user_ids(
             for row in linked_result.all()
             if row[0] is not None
         )
-        return list(ids)
+        return await _filter_protected_scope_ids(session, ids)
 
     except Exception as exc:
         # Preserve the old fault-tolerant behavior if a deployment has a
@@ -336,7 +361,7 @@ async def _get_linked_user_ids(
                     exc,
                 )
 
-    return list(ids)
+    return await _filter_protected_scope_ids(session, ids)
 
 async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_user_id: str, user_role: str | None = None) -> dict:
     """Get all people this guardian monitors, with their live status, location, and last_updated."""
