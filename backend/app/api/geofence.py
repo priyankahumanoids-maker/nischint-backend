@@ -173,6 +173,24 @@ async def _can_view_safety(session: AsyncSession, user: User, target_user_id: st
         return False
 
     primary_guardian_id = getattr(user, "guardian_id", None)
+
+    # `get_current_user()` may return a short-window cached User object. Older
+    # cache payloads did not include guardian_id, so never let cache shape
+    # decide a co-parent's authorization. Resolve the authoritative family
+    # owner directly from PostgreSQL when the cached object has no guardian.
+    if not primary_guardian_id:
+        try:
+            result = await session.execute(
+                select(User.guardian_id).where(
+                    User.id == uuid.UUID(caller_id)
+                )
+            )
+            primary_guardian_id = result.scalar_one_or_none()
+        except Exception:
+            # Authorization must fail closed if the relationship lookup cannot
+            # be completed; never widen access on a database/cache error.
+            primary_guardian_id = None
+
     if not primary_guardian_id:
         return False
 

@@ -16,6 +16,33 @@ from app.models.senior import Senior
 logger = logging.getLogger(__name__)
 DEVICE_TELEMETRY_FRESHNESS = timedelta(minutes=15)
 
+# Accounts that supervise a family circle are never protected members.  Keep
+# this guard at the relationship-source query so Home, Family, Protection,
+# alerts, sessions, and history all receive the same protected-member scope.
+MONITOR_ONLY_ROLES = {
+    "guardian",
+    "parent",
+    "primary_guardian",
+    "primaryguardian",
+    "co_parent",
+    "coparent",
+    "co_guardian",
+    "coguardian",
+    "admin",
+    "operator",
+}
+
+
+def _normalized_role_sql(column):
+    """Normalize role spellings for SQL-side monitor/protected filtering."""
+    return func.lower(
+        func.replace(
+            func.replace(column, "-", "_"),
+            " ",
+            "_",
+        )
+    )
+
 
 def _fresh_device_telemetry(raw: object, now: datetime) -> tuple[dict | None, datetime | None]:
     """Return only recent, real protected-device telemetry."""
@@ -150,6 +177,7 @@ async def _get_linked_user_ids(
             select(User.id.label("user_id")).where(
                 User.guardian_id.in_(guardian_scope_ids),
                 User.is_active == True,  # noqa: E712
+                _normalized_role_sql(User.role).notin_(MONITOR_ONLY_ROLES),
             )
         )
 
@@ -250,6 +278,7 @@ async def _get_linked_user_ids(
             select(User.id).where(
                 User.guardian_id.in_(guardian_scope_ids),
                 User.is_active == True,  # noqa: E712
+                _normalized_role_sql(User.role).notin_(MONITOR_ONLY_ROLES),
             )
         )
         ids.update(row[0] for row in user_result.all())

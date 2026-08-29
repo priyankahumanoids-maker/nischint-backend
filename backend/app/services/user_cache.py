@@ -14,7 +14,7 @@
 # Safety
 # ------
 # Callers in `app/api/*` only read scalar attributes (id, email, role,
-# full_name, phone, facility_id, last_known_*). None refresh / mutate
+# full_name, phone, guardian_id, facility_id, last_known_*). None refresh / mutate
 # / add the current_user back into a session. An unattached ORM instance
 # is therefore a drop-in.
 
@@ -49,6 +49,7 @@ def _user_to_dict(user: User) -> dict[str, Any]:
         "password_hash":      user.password_hash,
         "cognito_sub":        user.cognito_sub,
         "role":               user.role,
+        "guardian_id":        str(user.guardian_id) if user.guardian_id else None,
         "facility_id":        user.facility_id,
         "phone":              user.phone,
         "full_name":          user.full_name,
@@ -77,6 +78,8 @@ def _dict_to_user(data: dict[str, Any]) -> User:
     user.password_hash      = data["password_hash"]
     user.cognito_sub        = data.get("cognito_sub")
     user.role               = data.get("role") or "guardian"
+    guardian_id             = data.get("guardian_id")
+    user.guardian_id        = UUID(guardian_id) if guardian_id else None
     user.facility_id        = data.get("facility_id")
     user.phone              = data.get("phone")
     user.full_name          = data.get("full_name")
