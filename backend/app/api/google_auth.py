@@ -11,9 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db_session
 from app.core.config import settings
 from app.core.rate_limiter import limiter
-from app.core.security import create_access_token
+from app.core.security import create_access_token, create_refresh_token
 from app.models.user import User
 from app.services import user_service
+from app.services.auth_session_service import create_auth_session
+from app.services.auth_otp_service import mark_email_verified
 
 logger = logging.getLogger(__name__)
 
@@ -26,17 +28,21 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 class GoogleCredentialRequest(BaseModel):
     credential: str  # ID token from Google Sign-In
+    phone: Optional[str] = None  # required only when provisioning a brand-new account
 
 
 class GoogleCodeRequest(BaseModel):
     code: str  # Authorization code from Google Sign-In
     redirect_uri: str  # REMINDER: DO NOT HARDCODE THE URL, THIS BREAKS THE AUTH
+    phone: Optional[str] = None  # required only when provisioning a brand-new account
 
 
 class GoogleAuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     role: str
+    refresh_token: Optional[str] = None
+    session_id: Optional[str] = None
     auth_provider: str = "google"
     email: str
     full_name: Optional[str] = None
@@ -132,6 +138,8 @@ async def _get_google_userinfo(access_token: str) -> dict:
 async def _provision_google_user(
     session: AsyncSession,
     google_info: dict,
+    *,
+    phone: Optional[str] = None,
 ) -> tuple[User, bool]:
     """
     Find or create a local user for a Google-authenticated user.
@@ -153,17 +161,99 @@ async def _provision_google_user(
         await session.flush()
         return user, False
 
-    # Create new user
+    # New social accounts must complete the same phone-identity requirement as
+    # password registration. Existing Google-linked users can sign in without
+    # resupplying a phone. This avoids creating another phone=NULL account while
+    # the mobile social-onboarding UI is still intentionally deferred.
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if len(digits) == 10:
+        normalized_phone = f"+91{digits}"
+    elif len(digits) == 12 and digits.startswith("91"):
+        normalized_phone = f"+{digits}"
+    elif 10 <= len(digits) <= 15:
+        normalized_phone = f"+{digits}"
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "A valid mobile number is required to complete Google sign-up. "
+                "Existing accounts may sign in with Google without entering it again."
+            ),
+        )
+
+    from sqlalchemy import func, select
+    last10 = normalized_phone.lstrip("+")[-10:]
+    duplicate = await session.execute(
+        select(User.id).where(
+            func.right(func.regexp_replace(User.phone, r"\D", "", "g"), 10) == last10
+        ).limit(1)
+    )
+    if duplicate.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mobile number is already registered. Please sign in instead.",
+        )
+
     user = User(
         email=email,
         password_hash="google-oauth-managed",
         cognito_sub=f"google_{google_sub}",
         role="guardian",
         full_name=name,
+        phone=normalized_phone,
     )
     session.add(user)
     await session.flush()
     return user, True
+
+
+async def _issue_google_session(
+    session: AsyncSession,
+    request: Request,
+    user: User,
+    *,
+    is_new: bool,
+) -> GoogleAuthResponse:
+    if not bool(user.is_active):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is inactive. Contact support if you believe this is an error.",
+        )
+
+    sid = await create_auth_session(
+        session,
+        user.id,
+        provider="google",
+        request=request,
+    )
+    await mark_email_verified(
+        session,
+        user_id=user.id,
+        email=user.email,
+        source="google",
+    )
+    access_token = create_access_token(data={
+        "sub": str(user.id),
+        "role": user.role,
+        "email": user.email,
+        "full_name": user.full_name,
+        "sid": sid,
+        "auth_provider": "google",
+    })
+    refresh_token = create_refresh_token(
+        data={"sub": str(user.id), "sid": sid, "provider": "google"}
+    )
+    await session.commit()
+
+    return GoogleAuthResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        session_id=sid,
+        role=user.role,
+        email=user.email,
+        full_name=user.full_name,
+        is_new_user=is_new,
+    )
 
 
 @router.post("", response_model=GoogleAuthResponse)
@@ -185,28 +275,24 @@ async def google_auth_credential(
 
     if not google_info.get("email"):
         raise HTTPException(status_code=400, detail="Google account has no email")
+    if not bool(google_info.get("email_verified")):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Google account email is not verified",
+        )
 
-    # Find or create local user
-    user, is_new = await _provision_google_user(session, google_info)
-    await session.commit()
-
-    # Issue local JWT
-    access_token = create_access_token(data={
-        "sub": str(user.id),
-        "role": user.role,
-        "email": user.email,
-        "full_name": user.full_name,
-    })
+    # Find or create local user and issue the same durable AUTH-04 session
+    # used by password login.
+    user, is_new = await _provision_google_user(session, google_info, phone=req.phone)
+    response = await _issue_google_session(
+        session,
+        request,
+        user,
+        is_new=is_new,
+    )
 
     logger.info(f"Google auth successful for {user.email} (new={is_new})")
-
-    return GoogleAuthResponse(
-        access_token=access_token,
-        role=user.role,
-        email=user.email,
-        full_name=user.full_name,
-        is_new_user=is_new,
-    )
+    return response
 
 
 @router.post("/code", response_model=GoogleAuthResponse)
@@ -237,28 +323,23 @@ async def google_auth_code(
 
     if not google_info.get("email"):
         raise HTTPException(status_code=400, detail="Google account has no email")
+    if not bool(google_info.get("email_verified")):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Google account email is not verified",
+        )
 
-    # Find or create local user
-    user, is_new = await _provision_google_user(session, google_info)
-    await session.commit()
-
-    # Issue local JWT
-    access_token = create_access_token(data={
-        "sub": str(user.id),
-        "role": user.role,
-        "email": user.email,
-        "full_name": user.full_name,
-    })
+    # Find or create local user and bind Google login to a durable session.
+    user, is_new = await _provision_google_user(session, google_info, phone=req.phone)
+    response = await _issue_google_session(
+        session,
+        request,
+        user,
+        is_new=is_new,
+    )
 
     logger.info(f"Google auth (code) successful for {user.email} (new={is_new})")
-
-    return GoogleAuthResponse(
-        access_token=access_token,
-        role=user.role,
-        email=user.email,
-        full_name=user.full_name,
-        is_new_user=is_new,
-    )
+    return response
 
 
 @router.get("/status")

@@ -18,6 +18,7 @@ class TokenData(BaseModel):
     """Token payload data."""
     sub: str  # user_id
     exp: datetime
+    sid: Optional[str] = None
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -31,7 +32,8 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     else:
         expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
-    to_encode.update({"exp": expire})
+    issued_at = datetime.now(timezone.utc)
+    to_encode.update({"type": "access", "iat": issued_at.timestamp(), "exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
     return encoded_jwt
@@ -40,11 +42,12 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 def create_refresh_token(data: dict) -> str:
     """Create a unique, long-lived refresh token for a local-auth session."""
     to_encode = data.copy()
+    issued_at = datetime.now(timezone.utc)
     to_encode.update({
         "type": "refresh",
         "jti": uuid4().hex,
-        "exp": datetime.now(timezone.utc)
-        + timedelta(days=settings.jwt_refresh_expires_days),
+        "iat": issued_at.timestamp(),
+        "exp": issued_at + timedelta(days=settings.jwt_refresh_expires_days),
     })
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -85,16 +88,27 @@ def verify_token(token: str) -> Optional[str]:
     return None
 
 
-def _verify_local_token(token: str) -> Optional[str]:
-    """Verify a locally-issued JWT."""
+def decode_local_token_claims(token: str) -> Optional[dict]:
+    """Decode only a locally-signed JWT, without Cognito fallback."""
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            return None
-        return user_id
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except JWTError:
         return None
+
+
+def _verify_local_token(token: str) -> Optional[str]:
+    """Verify a locally-issued ACCESS JWT. Refresh tokens are never bearer tokens."""
+    payload = decode_local_token_claims(token)
+    if not payload:
+        return None
+    if payload.get("type") == "refresh":
+        return None
+    if payload.get("type") not in (None, "access"):
+        return None
+    user_id: str = payload.get("sub")
+    if user_id is None:
+        return None
+    return user_id
 
 
 def decode_token_claims(token: str) -> Optional[dict]:

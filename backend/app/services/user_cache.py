@@ -54,6 +54,9 @@ def _user_to_dict(user: User) -> dict[str, Any]:
         "phone":              user.phone,
         "full_name":          user.full_name,
         "is_active":          bool(user.is_active),
+        "deleted_at":         user.deleted_at.isoformat() if user.deleted_at else None,
+        "erasure_status":     user.erasure_status,
+        "erasure_scheduled_for": user.erasure_scheduled_for.isoformat() if user.erasure_scheduled_for else None,
         "preferred_channels": list(user.preferred_channels) if user.preferred_channels else ["email"],
         "created_at":         user.created_at.isoformat() if user.created_at else None,
         "last_known_lat":     user.last_known_lat,
@@ -84,6 +87,9 @@ def _dict_to_user(data: dict[str, Any]) -> User:
     user.phone              = data.get("phone")
     user.full_name          = data.get("full_name")
     user.is_active          = bool(data.get("is_active", True))
+    user.deleted_at         = _parse_dt(data.get("deleted_at"))
+    user.erasure_status     = data.get("erasure_status")
+    user.erasure_scheduled_for = _parse_dt(data.get("erasure_scheduled_for"))
     user.preferred_channels = data.get("preferred_channels") or ["email"]
     user.created_at         = _parse_dt(data.get("created_at")) or datetime.now(timezone.utc)
     user.last_known_lat     = data.get("last_known_lat")

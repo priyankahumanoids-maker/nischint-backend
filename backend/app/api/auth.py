@@ -1,4 +1,4 @@
-# Authentication Router — Dual-mode: Local JWT + AWS Cognito
+# Authentication Router â€” Dual-mode: Local JWT + AWS Cognito
 import asyncio
 import hashlib
 import hmac
@@ -23,10 +23,31 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_refresh_token,
+    decode_local_token_claims,
 )
 from app.models.user import User
 from app.schemas.user import RegisterRequest
-from app.services import user_service
+from app.services import user_service, user_cache
+from app.services.auth_session_service import (
+    bump_user_token_epoch,
+    create_auth_session,
+    list_auth_sessions,
+    revoke_all_auth_sessions,
+    revoke_auth_session,
+    touch_auth_session,
+    validate_auth_session,
+    validate_legacy_token_epoch,
+)
+from app.services.auth_otp_service import (
+    EMAIL_VERIFICATION_PURPOSE,
+    OTP_MAX_ATTEMPTS,
+    OTP_RESEND_COOLDOWN_SECONDS,
+    OTP_TTL_SECONDS,
+    consume_otp,
+    is_email_verified,
+    mark_email_verified,
+    store_otp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -343,7 +364,7 @@ def _generate_invite_code() -> str:
     return "".join(random.choices(alphabet, k=6))
 
 
-# ── Family Circle Invite schemas ──
+# â”€â”€ Family Circle Invite schemas â”€â”€
 
 class GenerateInviteResponse(BaseModel):
     code: str
@@ -373,6 +394,7 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     role: str
     refresh_token: Optional[str] = None
+    session_id: Optional[str] = None
     cognito_id_token: Optional[str] = None
     cognito_username: Optional[str] = None
     auth_provider: str = "local"
@@ -380,6 +402,7 @@ class TokenResponse(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str
+    session_id: Optional[str] = None
     email: Optional[str] = None
     cognito_username: Optional[str] = None
 
@@ -403,13 +426,88 @@ class CheckPhoneRequest(BaseModel):
     phone: str = Field(min_length=10, max_length=20)
 
 
+class EmailVerificationConfirmRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
 class CognitoStatusResponse(BaseModel):
     enabled: bool
     region: str = ""
     user_pool_id: str = ""
 
 
-# ── Registration ──
+def _current_local_session_id(request: Request) -> Optional[str]:
+    auth_header = str(request.headers.get("authorization") or "").strip()
+    if not auth_header.lower().startswith("bearer "):
+        return None
+    token = auth_header.split(" ", 1)[1].strip()
+    claims = decode_local_token_claims(token)
+    if not claims or claims.get("type") == "refresh":
+        return None
+    sid = str(claims.get("sid") or "").strip()
+    return sid or None
+
+
+async def _issue_local_session_response(
+    session: AsyncSession,
+    user: User,
+    request: Request,
+    *,
+    provider: str = "local",
+    extra_claims: Optional[dict] = None,
+) -> TokenResponse:
+    sid = await create_auth_session(
+        session,
+        user.id,
+        provider=provider,
+        request=request,
+    )
+    claims = {
+        "sub": str(user.id),
+        "role": user.role,
+        "email": user.email,
+        "full_name": user.full_name,
+        "sid": sid,
+        "auth_provider": provider,
+    }
+    if extra_claims:
+        claims.update(extra_claims)
+    access_token = create_access_token(data=claims)
+    refresh_token = create_refresh_token(
+        data={"sub": str(user.id), "sid": sid, "provider": provider}
+    )
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        session_id=sid,
+        role=user.role,
+        auth_provider=provider,
+    )
+
+
+async def _send_email_verification_email(email: str, code: str) -> bool:
+    from app.services.email_service import send_email
+
+    subject = "Verify your Nischint email"
+    text_body = (
+        f"Your Nischint email verification code is {code}. "
+        "It expires in 10 minutes. If you did not request this, ignore this email."
+    )
+    html_body = (
+        "<p>Your Nischint email verification code is:</p>"
+        f"<p style='font-size:24px;font-weight:700;letter-spacing:4px'>{code}</p>"
+        "<p>This code expires in 10 minutes.</p>"
+    )
+    return await asyncio.to_thread(
+        send_email,
+        email,
+        subject,
+        html_body,
+        text_body,
+    )
+
+
+# â”€â”€ Registration â”€â”€
 
 def _normalize_phone(phone: Optional[str]) -> str:
     """Store Indian mobile numbers in the E.164 form Cognito expects."""
@@ -479,8 +577,8 @@ async def register(
     Uses Cognito when enabled, falls back to local auth.
     """
     if is_cognito_enabled():
-        return await _cognito_register(req, session)
-    return await _local_register(req, session)
+        return await _cognito_register(req, session, request)
+    return await _local_register(req, session, request)
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -495,8 +593,8 @@ async def login(
     Uses Cognito when enabled, falls back to local auth.
     """
     if is_cognito_enabled():
-        return await _cognito_login(login_request, session)
-    return await _local_login(login_request, session)
+        return await _cognito_login(login_request, session, request)
+    return await _local_login(login_request, session, request)
 
 
 @router.get("/me")
@@ -504,7 +602,6 @@ async def get_me(
     user: User = Depends(get_current_user),
 ):
     """Get current user info including roles."""
-    from app.core.rbac import VALID_ROLES
     roles = [user.role] if user.role else []
     return {
         "id": str(user.id),
@@ -534,8 +631,6 @@ async def update_my_phone(
     created by older clients which accidentally dropped the phone field.
     """
     from sqlalchemy import select
-    from app.services import user_cache
-
     normalized_phone = _require_normalized_phone(req.phone)
 
     if await _phone_exists(
@@ -574,20 +669,17 @@ async def update_my_phone(
 async def upgrade_local_session(
     request: Request,
     user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
 ):
-    """Upgrade a valid legacy access-token session to rotating refresh tokens."""
-    claims = {
-        "sub": str(user.id),
-        "role": user.role,
-        "email": user.email,
-        "full_name": user.full_name,
-    }
-    return TokenResponse(
-        access_token=create_access_token(data=claims),
-        refresh_token=create_refresh_token(data={"sub": str(user.id)}),
-        role=user.role,
-        auth_provider="local",
+    """Upgrade a valid legacy access-token session into AUTH-04."""
+    response = await _issue_local_session_response(
+        session,
+        user,
+        request,
+        provider="local",
     )
+    await session.commit()
+    return response
 
 
 @router.post("/refresh")
@@ -597,7 +689,7 @@ async def refresh(
     req: RefreshRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Rotate a local or Cognito refresh token without asking for a password."""
+    """Rotate a refresh credential inside one durable AUTH-04 session."""
     local_claims = decode_refresh_token(req.refresh_token)
     if local_claims:
         from sqlalchemy import select
@@ -609,11 +701,32 @@ async def refresh(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Refresh session is invalid or expired",
             )
+
         result = await session.execute(
             select(User).where(User.id == refresh_user_id)
         )
         user = result.scalar_one_or_none()
         if not user or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh session is no longer valid",
+            )
+
+        sid = str(local_claims.get("sid") or "").strip()
+        if sid:
+            session_valid = await validate_auth_session(
+                session,
+                sid,
+                refresh_user_id,
+                token_iat=local_claims.get("iat"),
+            )
+        else:
+            session_valid = await validate_legacy_token_epoch(
+                session,
+                refresh_user_id,
+                token_iat=local_claims.get("iat"),
+            )
+        if not session_valid:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Refresh session is no longer valid",
@@ -630,15 +743,43 @@ async def refresh(
                 detail="Refresh session has already been used",
             )
 
+        # Legacy refresh credentials are migrated into one durable session on
+        # first successful rotation.  New tokens keep the same session id.
+        if not sid:
+            sid = await create_auth_session(
+                session,
+                user.id,
+                provider="local",
+                request=request,
+            )
+        else:
+            if not await touch_auth_session(
+                session,
+                sid,
+                user.id,
+                extend_expiry=True,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Refresh session is no longer valid",
+                )
+
+        session_provider = str(local_claims.get("provider") or "local")
         token_claims = {
             "sub": str(user.id),
             "role": user.role,
             "email": user.email,
             "full_name": user.full_name,
+            "sid": sid,
+            "auth_provider": session_provider,
         }
         next_access_token = create_access_token(data=token_claims)
         next_refresh_token = create_refresh_token(
-            data={"sub": str(user.id)}
+            data={
+                "sub": str(user.id),
+                "sid": sid,
+                "provider": session_provider,
+            }
         )
 
         try:
@@ -660,8 +801,9 @@ async def refresh(
         return TokenResponse(
             access_token=next_access_token,
             refresh_token=next_refresh_token,
+            session_id=sid,
             role=user.role,
-            auth_provider="local",
+            auth_provider=session_provider,
         )
 
     if not is_cognito_enabled():
@@ -669,17 +811,77 @@ async def refresh(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh session is invalid or expired",
         )
+
     from app.core.cognito import refresh_tokens
     try:
-        result = refresh_tokens(req.refresh_token, cognito_username=req.cognito_username or "", email=req.email or "")
+        provider_result = refresh_tokens(
+            req.refresh_token,
+            cognito_username=req.cognito_username or "",
+            email=req.email or "",
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+        )
+
+    # AUTH-04 session binding for Cognito-backed users.  Existing third-party
+    # clients without email/session metadata retain the historical provider
+    # response until they next perform a full login.
+    user = None
+    if req.email:
+        user = await user_service.get_user_by_email(
+            session,
+            _normalize_email(req.email),
+        )
+
+    if not user:
         return {
-            "access_token": result["access_token"],
-            "id_token": result.get("id_token"),
-            "expires_in": result["expires_in"],
+            "access_token": provider_result["access_token"],
+            "id_token": provider_result.get("id_token"),
+            "expires_in": provider_result["expires_in"],
             "auth_provider": "cognito",
         }
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh session is no longer valid",
+        )
+
+    sid = str(req.session_id or "").strip()
+    if sid:
+        if not await validate_auth_session(session, sid, user.id):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh session is no longer valid",
+            )
+        await touch_auth_session(session, sid, user.id, extend_expiry=True)
+    else:
+        sid = await create_auth_session(
+            session,
+            user.id,
+            provider="cognito",
+            request=request,
+        )
+
+    access_token = create_access_token(data={
+        "sub": str(user.id),
+        "role": user.role,
+        "email": user.email,
+        "full_name": user.full_name,
+        "sid": sid,
+    })
+    await session.commit()
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=req.refresh_token,
+        session_id=sid,
+        role=user.role,
+        cognito_id_token=provider_result.get("id_token"),
+        cognito_username=req.cognito_username,
+        auth_provider="cognito",
+    )
 
 
 @router.post("/confirm")
@@ -693,6 +895,104 @@ async def confirm(req: ConfirmRequest):
         return {"confirmed": True}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/email-verification/status")
+async def email_verification_status(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    verified = await is_email_verified(
+        session,
+        user_id=user.id,
+        email=user.email,
+    )
+    return {"verified": verified, "email": user.email}
+
+
+@router.post("/email-verification/request", status_code=status.HTTP_202_ACCEPTED)
+@limiter.limit("5/minute")
+async def request_email_verification(
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Create a hashed verification OTP without enforcing it on login yet."""
+    if await is_email_verified(session, user_id=user.id, email=user.email):
+        return {
+            "accepted": True,
+            "verified": True,
+            "delivery_sent": False,
+        }
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    retry_after = await store_otp(
+        session,
+        email=user.email,
+        purpose=EMAIL_VERIFICATION_PURPOSE,
+        code=code,
+    )
+    if retry_after > 0:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                "A verification code was requested recently. "
+                f"Try again in {retry_after} seconds."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    await session.commit()
+    sent = await _send_email_verification_email(user.email, code)
+    if not sent:
+        logger.warning(
+            "Email verification delivery unavailable for %s",
+            user.email,
+        )
+
+    return {
+        "accepted": True,
+        "verified": False,
+        "delivery_sent": bool(sent),
+        "expires_in_seconds": OTP_TTL_SECONDS,
+        "resend_cooldown_seconds": OTP_RESEND_COOLDOWN_SECONDS,
+        "max_attempts": OTP_MAX_ATTEMPTS,
+    }
+
+
+@router.post("/email-verification/confirm")
+@limiter.limit("10/minute")
+async def confirm_email_verification(
+    request: Request,
+    req: EmailVerificationConfirmRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    if await is_email_verified(session, user_id=user.id, email=user.email):
+        return {"verified": True}
+
+    valid = await consume_otp(
+        session,
+        email=user.email,
+        purpose=EMAIL_VERIFICATION_PURPOSE,
+        code=req.code,
+    )
+    if not valid:
+        await session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The verification code is invalid or expired.",
+        )
+
+    await mark_email_verified(
+        session,
+        user_id=user.id,
+        email=user.email,
+        source="otp",
+    )
+    await session.commit()
+    return {"verified": True}
 
 
 @router.post("/forgot-password", status_code=status.HTTP_202_ACCEPTED)
@@ -816,34 +1116,130 @@ async def reset_password(
                 detail="The password reset code is invalid or expired.",
             )
 
-    # Keep the local compatibility credential in sync. This matters because
-    # Cognito login deliberately falls back to Postgres during AWS outages.
+    # Keep the local compatibility credential in sync.  AUTH-04 also revokes
+    # every existing session and bumps the user token epoch so pre-AUTH-04
+    # refresh/access credentials cannot resurrect a session after a password
+    # reset.
     if user:
         user.password_hash = await user_service.hash_password_async(req.password)
+        await revoke_all_auth_sessions(
+            session,
+            user.id,
+            reason="password_reset",
+        )
+        await bump_user_token_epoch(session, user.id)
         await session.commit()
+        user_cache.invalidate_user_keys(
+            str(user.id),
+            str(user.cognito_sub or ""),
+        )
 
-    return {"reset": True}
+    return {"reset": True, "sessions_revoked": bool(user)}
 
 
 class LogoutRequest(BaseModel):
     refresh_token: Optional[str] = None
 
 
+@router.get("/sessions")
+async def get_active_sessions(
+    request: Request,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    current_sid = _current_local_session_id(request)
+    rows = await list_auth_sessions(session, user.id)
+    return {
+        "sessions": [
+            {
+                "session_id": str(row["id"]),
+                "provider": row.get("provider"),
+                "device_label": row.get("device_label"),
+                "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                "last_seen_at": row["last_seen_at"].isoformat() if row.get("last_seen_at") else None,
+                "expires_at": row["expires_at"].isoformat() if row.get("expires_at") else None,
+                "current": str(row["id"]) == str(current_sid or ""),
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+    }
+
+
+@router.delete("/sessions/{session_id}")
+async def revoke_one_session(
+    session_id: str,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    revoked = await revoke_auth_session(
+        session,
+        session_id,
+        user.id,
+        reason="user_remote_revoke",
+    )
+    await session.commit()
+    return {"revoked": revoked, "session_id": session_id}
+
+
+@router.post("/logout-all")
+async def logout_all(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Revoke every server session and all older local token generations."""
+    revoked_count = await revoke_all_auth_sessions(
+        session,
+        user.id,
+        reason="logout_all",
+    )
+    await bump_user_token_epoch(session, user.id)
+
+    provider_revoked = False
+    if is_cognito_enabled() and getattr(user, "cognito_sub", None):
+        from app.core.cognito import admin_global_sign_out
+        try:
+            admin_global_sign_out(str(user.cognito_sub or user.email))
+            provider_revoked = True
+        except Exception as exc:
+            logger.warning(
+                "Cognito logout-all failed for %s: %s",
+                user.email,
+                str(exc)[:200],
+            )
+
+    await session.commit()
+    user_cache.invalidate_user_keys(str(user.id), str(user.cognito_sub or ""))
+    return {
+        "signed_out_all": True,
+        "revoked_sessions": revoked_count,
+        "provider_revoked": provider_revoked,
+    }
+
+
 @router.post("/logout")
 async def logout(
+    request: Request,
     req: LogoutRequest,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Best-effort server sign-out.
+    """Immediately revoke the current AUTH-04 session.
 
-    Cognito sessions are globally revoked when available. For local-auth
-    sessions, the current refresh credential is durably consumed when the
-    client provides it. The mobile client always clears its local credentials
-    even when server-side revocation is temporarily unavailable.
+    Legacy clients may additionally provide their refresh token.  The mobile
+    client clears local credentials even if provider sign-out is unavailable.
     """
     provider = "local"
     server_revoked = False
+    current_sid = _current_local_session_id(request)
+
+    if current_sid:
+        server_revoked = await revoke_auth_session(
+            session,
+            current_sid,
+            user.id,
+            reason="logout",
+        )
 
     if is_cognito_enabled() and getattr(user, "cognito_sub", None):
         from app.core.cognito import admin_global_sign_out
@@ -853,61 +1249,59 @@ async def logout(
             admin_global_sign_out(str(user.cognito_sub or user.email))
             server_revoked = True
         except Exception as exc:
-            # Logout must never trap a user inside the app because an external
-            # identity provider is temporarily unavailable.
             logger.warning(
                 "Cognito global sign-out failed for %s: %s",
                 user.email,
                 exc,
             )
 
-    elif req.refresh_token:
+    if req.refresh_token:
         local_claims = decode_refresh_token(req.refresh_token)
-
         if local_claims:
             try:
-                refresh_user_id = uuid.UUID(
-                    str(local_claims["sub"])
-                )
+                refresh_user_id = uuid.UUID(str(local_claims["sub"]))
             except (KeyError, TypeError, ValueError):
                 refresh_user_id = None
 
             if refresh_user_id == user.id:
-                # Whether this INSERT succeeds or the token was already
-                # consumed, it is no longer usable as a refresh credential.
+                refresh_sid = str(local_claims.get("sid") or "").strip()
+                if refresh_sid:
+                    await revoke_auth_session(
+                        session,
+                        refresh_sid,
+                        user.id,
+                        reason="logout_refresh",
+                    )
+                # Keep the existing one-time credential guard for defence in
+                # depth and for pre-AUTH-04 refresh tokens.
                 await _claim_local_refresh_once(
                     session,
                     req.refresh_token,
                     local_claims,
                     user.id,
                 )
-
-                try:
-                    await session.commit()
-                except Exception as exc:
-                    await session.rollback()
-                    logger.warning(
-                        "Local logout revocation commit failed for %s: %s",
-                        user.email,
-                        str(exc)[:200],
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail=(
-                            "Server sign-out is temporarily unavailable."
-                        ),
-                    )
-
                 server_revoked = True
-            else:
-                logger.warning(
-                    "Ignoring local logout refresh token with mismatched user"
-                )
 
+    try:
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        logger.warning(
+            "Logout revocation commit failed for %s: %s",
+            user.email,
+            str(exc)[:200],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server sign-out is temporarily unavailable.",
+        )
+
+    user_cache.invalidate_user_keys(str(user.id), str(user.cognito_sub or ""))
     return {
         "signed_out": True,
         "provider": provider,
         "server_revoked": server_revoked,
+        "session_id": current_sid,
     }
 
 
@@ -928,7 +1322,7 @@ async def cognito_status():
     )
 
 
-# ── Family Circle Invite Endpoints ──
+# â”€â”€ Family Circle Invite Endpoints â”€â”€
 
 @router.post("/family/generate-invite-code", response_model=GenerateInviteResponse)
 async def generate_invite_code(
@@ -1008,7 +1402,7 @@ async def verify_invite_code(
     from datetime import datetime, timezone
     from sqlalchemy import select
 
-    # 1. Validate the code — look up guardian by invite_code
+    # 1. Validate the code â€” look up guardian by invite_code
     normalized_invite_code = req.invite_code.strip().upper()
     # Lock the guardian row until commit. This makes the scanner truly
     # single-use even if two devices submit the same code at nearly once.
@@ -1069,21 +1463,17 @@ async def verify_invite_code(
         f"joined family of guardian {guardian.email} (id={guardian.id})"
     )
 
-    access_token = create_access_token(data={
-        "sub": str(new_user.id),
-        "role": new_user.role,
-        "email": new_user.email,
-        "full_name": new_user.full_name,
-    })
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=create_refresh_token(data={"sub": str(new_user.id)}),
-        role=new_user.role,
-        auth_provider="local",
+    response = await _issue_local_session_response(
+        session,
+        new_user,
+        request,
+        provider="local",
     )
+    await session.commit()
+    return response
 
 
-# ── My Guardian ──
+# â”€â”€ My Guardian â”€â”€
 
 class GuardianInfoResponse(BaseModel):
     id: str
@@ -1150,9 +1540,13 @@ async def get_my_guardian(
 
 
 
-# ── Local Auth Flows ──
+# â”€â”€ Local Auth Flows â”€â”€
 
-async def _local_register(req: RegisterRequest, session: AsyncSession) -> TokenResponse:
+async def _local_register(
+    req: RegisterRequest,
+    session: AsyncSession,
+    request: Request,
+) -> TokenResponse:
     existing = await user_service.get_user_by_email(session, req.email)
     if existing:
         raise HTTPException(
@@ -1178,25 +1572,24 @@ async def _local_register(req: RegisterRequest, session: AsyncSession) -> TokenR
     await session.commit()
     await session.refresh(user)
 
-    access_token = create_access_token(data={
-        "sub": str(user.id),
-        "role": user.role,
-        "email": user.email,
-        "full_name": user.full_name,
-    })
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=create_refresh_token(data={"sub": str(user.id)}),
-        role=user.role,
-        auth_provider="local",
+    response = await _issue_local_session_response(
+        session,
+        user,
+        request,
+        provider="local",
     )
+    await session.commit()
+    return response
 
 
-async def _local_login(login_request: LoginRequest, session: AsyncSession) -> TokenResponse:
-    # Per-account login backoff (defense-in-depth on top of slowapi
-    # IP limiter). Stops credential-stuffing without locking out
-    # legitimate users behind shared NATs / mobile carriers.
+async def _local_login(
+    login_request: LoginRequest,
+    session: AsyncSession,
+    request: Request,
+) -> TokenResponse:
+    # Per-account login backoff (defense-in-depth on top of slowapi IP limiter).
     from app.core.login_backoff import check_lock, record_failure, reset
+
     normalized_email = str(login_request.email).strip().casefold()
     user = await user_service.get_user_by_email(session, normalized_email)
     password_valid = bool(
@@ -1208,10 +1601,6 @@ async def _local_login(login_request: LoginRequest, session: AsyncSession) -> To
     )
 
     if not password_valid:
-        # Keep the progressive account lock for invalid credentials, but
-        # verify first so the real account owner can recover immediately by
-        # entering the correct password. The per-IP limiter still bounds
-        # password verification traffic.
         lock = check_lock(normalized_email)
         if lock.locked:
             raise HTTPException(
@@ -1232,37 +1621,36 @@ async def _local_login(login_request: LoginRequest, session: AsyncSession) -> To
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Successful auth — clear the failure counter so a forgetful user
-    # who finally types the right password isn't penalised.
+    if not bool(user.is_active):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is inactive. Contact support if you believe this is an error.",
+        )
+
     reset(normalized_email)
 
-    # Warm the auth user cache so the next call to /api/auth/me (and any
-    # other authenticated endpoint within the 30s TTL window) skips the
-    # ~2s Mumbai pooler round-trip in `get_current_user`.
-    from app.services import user_cache
-    user_cache.cache_user(str(user.id), user)
-
-    access_token = create_access_token(data={
-        "sub": str(user.id),
-        "role": user.role,
-        "email": user.email,
-        "full_name": user.full_name,
-    })
-
-    return TokenResponse(
-        access_token=access_token,
-        refresh_token=create_refresh_token(data={"sub": str(user.id)}),
-        role=user.role,
-        auth_provider="local",
+    response = await _issue_local_session_response(
+        session,
+        user,
+        request,
+        provider="local",
     )
+    await session.commit()
+
+    # Warm the user payload only after durable session creation succeeds.
+    user_cache.cache_user(str(user.id), user)
+    return response
 
 
-# ── Cognito Auth Flows ──
+# â”€â”€ Cognito Auth Flows â”€â”€
 
-async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> TokenResponse:
+async def _cognito_register(
+    req: RegisterRequest,
+    session: AsyncSession,
+    request: Request,
+) -> TokenResponse:
     from app.core.cognito import sign_up, admin_confirm_user, sign_in
 
-    # Check local DB
     existing = await user_service.get_user_by_email(session, req.email)
     if existing and existing.cognito_sub:
         raise HTTPException(
@@ -1280,7 +1668,6 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
             detail="This mobile number is already registered. Please sign in instead.",
         )
 
-    # Register in Cognito
     try:
         result = sign_up(
             email=req.email,
@@ -1288,8 +1675,8 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
             full_name=req.full_name or "",
             phone=normalized_phone,
         )
-    except ValueError as e:
-        message = str(e)
+    except ValueError as exc:
+        message = str(exc)
         if "UsernameExistsException" in message or "AliasExistsException" in message:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1299,19 +1686,19 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
 
     cognito_sub = result["user_sub"]
 
-    # Auto-confirm for development (skip email verification)
     try:
         admin_confirm_user(req.email)
-    except Exception as e:
-        logger.warning(f"Could not auto-confirm user {req.email}: {e}")
+    except Exception as exc:
+        logger.warning("Could not auto-confirm user %s: %s", req.email, exc)
 
-    # Sign in to get tokens
     try:
         auth_result = sign_in(req.email, req.password)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Registration successful but login failed: {e}")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Registration successful but login failed: {exc}",
+        )
 
-    # Auto-provision local DB user
     if existing:
         existing.cognito_sub = cognito_sub
         if req.full_name and not existing.full_name:
@@ -1333,61 +1720,70 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
     if not existing:
         await session.refresh(user)
 
-    # Also create a local JWT for backward compatibility
+    sid = await create_auth_session(
+        session,
+        user.id,
+        provider="cognito",
+        request=request,
+    )
     local_token = create_access_token(data={
         "sub": str(user.id),
         "role": user.role,
         "email": user.email,
         "full_name": user.full_name,
+        "sid": sid,
     })
+    await session.commit()
 
     return TokenResponse(
         access_token=local_token,
         role=user.role,
         refresh_token=auth_result.get("refresh_token"),
+        session_id=sid,
         cognito_id_token=auth_result.get("id_token"),
         cognito_username=auth_result.get("cognito_username"),
         auth_provider="cognito",
     )
 
 
-async def _cognito_login(login_request: LoginRequest, session: AsyncSession) -> TokenResponse:
+async def _cognito_login(
+    login_request: LoginRequest,
+    session: AsyncSession,
+    request: Request,
+) -> TokenResponse:
     from app.core.cognito import sign_in
 
-    # Authenticate with Cognito
     try:
         auth_result = sign_in(login_request.email, login_request.password)
-    except ValueError as e:
-        error_str = str(e)
-        # User-action-required states — do NOT fall back (user needs to act)
+    except ValueError as exc:
+        error_str = str(exc)
         if "UserNotConfirmedException" in error_str:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                                detail="Account not confirmed. Please verify your email.")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account not confirmed. Please verify your email.",
+            )
         if "PasswordResetRequiredException" in error_str:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                                detail="Password reset required. Please reset your password.")
-        # All other Cognito errors — infrastructure failure OR invalid credentials → fall back to local auth.
-        # Covers: NotAuthorizedException, UserNotFoundException (user-level),
-        # ResourceNotFoundException, InternalErrorException, InvalidParameterException,
-        # network errors, boto3 ClientError, etc. (infra-level)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Password reset required. Please reset your password.",
+            )
         logger.warning(
-            f"LOGIN_COGNITO_FALLBACK email={login_request.email} cognito_error='{error_str[:200]}' "
-            f"→ attempting local Postgres auth"
+            "LOGIN_COGNITO_FALLBACK email=%s cognito_error='%s' -> local auth",
+            login_request.email,
+            error_str[:200],
         )
-        return await _local_login(login_request, session)
+        return await _local_login(login_request, session, request)
 
-    # Handle challenges
     if "challenge" in auth_result:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Auth challenge required: {auth_result['challenge']}",
         )
 
-    # Auto-provision local user
     from app.core.cognito import verify_cognito_token
+
     id_token = auth_result.get("id_token", "")
     claims = verify_cognito_token(id_token) if id_token else None
-
     cognito_sub = claims.get("sub") if claims else None
     email = claims.get("email", login_request.email) if claims else login_request.email
     name = claims.get("name", "") if claims else ""
@@ -1409,39 +1805,58 @@ async def _cognito_login(login_request: LoginRequest, session: AsyncSession) -> 
         await session.commit()
 
     if not user:
-        # Last resort: create local user
-        user = await user_service.get_user_by_email(session, email)
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to provision user account",
-            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to provision user account",
+        )
 
-    # Extract Cognito groups from claims
+    if not bool(user.is_active):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is inactive. Contact support if you believe this is an error.",
+        )
+
     cognito_groups = claims.get("cognito:groups", []) if claims else []
-
-    # Sync role from Cognito groups using the canonical product vocabulary.
-    # This recognizes protected-member and co-parent roles without treating
-    # co_parent as a primary guardian capability.
     if cognito_groups:
         best_role = select_primary_role(cognito_groups)
         if best_role and user.role != best_role:
             user.role = best_role
             await session.flush()
 
-    # Create local JWT for API calls (includes cognito:groups for RBAC)
+    email_verified_claim = claims.get("email_verified") if claims else False
+    email_verified = (
+        email_verified_claim is True
+        or str(email_verified_claim).strip().lower() in {"true", "1", "yes"}
+    )
+    if email_verified:
+        await mark_email_verified(
+            session,
+            user_id=user.id,
+            email=user.email,
+            source="cognito",
+        )
+
+    sid = await create_auth_session(
+        session,
+        user.id,
+        provider="cognito",
+        request=request,
+    )
     local_token = create_access_token(data={
         "sub": str(user.id),
         "role": user.role,
         "email": user.email,
         "full_name": user.full_name,
         "cognito:groups": sorted(normalize_roles(cognito_groups)),
+        "sid": sid,
     })
+    await session.commit()
 
     return TokenResponse(
         access_token=local_token,
         role=user.role,
         refresh_token=auth_result.get("refresh_token"),
+        session_id=sid,
         cognito_id_token=auth_result.get("id_token"),
         cognito_username=auth_result.get("cognito_username"),
         auth_provider="cognito",

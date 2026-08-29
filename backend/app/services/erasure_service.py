@@ -321,6 +321,18 @@ async def execute_hard_delete(
         summary["tables_cascaded"] = [t for t, c in counts.items() if c > 0]
         summary["row_counts"] = counts
 
+        # AUTH-04: revoke every durable session before deleting the account.
+        # This also broadcasts revoked state through the auth session cache so
+        # another Cloud Run instance cannot continue accepting a just-deleted
+        # account while its database transaction is completing.
+        from app.services.auth_session_service import revoke_all_auth_sessions
+
+        await revoke_all_auth_sessions(
+            session,
+            user_id,
+            reason="account_erased",
+        )
+
         # The actual cascade. FK ondelete=CASCADE propagates.
         await session.execute(
             text("DELETE FROM users WHERE id = :uid"),

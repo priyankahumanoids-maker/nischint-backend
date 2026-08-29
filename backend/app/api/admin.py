@@ -15,6 +15,11 @@ from app.core.rbac import require_role
 from app.core.product_roles import CANONICAL_ROLES, normalize_role
 from app.models.user import User
 from app.models.facility import Facility
+from app.services import user_cache
+from app.services.auth_session_service import (
+    bump_user_token_epoch,
+    revoke_all_auth_sessions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -297,13 +302,33 @@ async def update_user_status(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    previous_active = bool(user.is_active)
     user.is_active = body.is_active
     await session.flush()
+
+    # AUTH-04: an explicit admin deactivation must terminate every durable
+    # session immediately instead of waiting for access-token expiry.  A token
+    # epoch bump also invalidates pre-AUTH-04 credentials.  Re-enabling the
+    # account does not resurrect any old session; the user must sign in again.
+    revoked_sessions = 0
+    if previous_active and not body.is_active:
+        revoked_sessions = await revoke_all_auth_sessions(
+            session,
+            user.id,
+            reason="admin_deactivated",
+        )
+        await bump_user_token_epoch(session, user.id)
+
+    user_cache.invalidate_user_keys(
+        str(user.id),
+        str(getattr(user, "cognito_sub", "") or ""),
+    )
 
     return {
         "id": str(user.id),
         "email": user.email,
         "is_active": user.is_active,
+        "revoked_sessions": revoked_sessions,
     }
 
 

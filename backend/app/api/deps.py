@@ -8,11 +8,15 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import verify_token, decode_token_claims
+from app.core.security import verify_token, decode_token_claims, decode_local_token_claims
 from app.core.product_roles import normalize_role, normalize_roles
 from app.db.session import async_session
 from app.models.user import User
 from app.services import auth_metrics, user_cache, user_service
+from app.services.auth_session_service import (
+    validate_auth_session,
+    validate_legacy_token_epoch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +51,51 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
 
-    # Verify token and extract sub
+    # Verify token and extract sub.  Refresh tokens are explicitly rejected
+    # by verify_token() and can never be substituted as bearer access tokens.
     user_id_or_sub = verify_token(token)
     if user_id_or_sub is None:
         raise credentials_exception
+
+    # AUTH-04: locally issued access tokens are bound to a durable server
+    # session.  Revoked/expired sessions and disabled/deleted accounts fail
+    # before a cached User object is returned.  Pre-AUTH-04 local tokens remain
+    # temporarily compatible until a user-level security epoch is bumped.
+    local_claims = decode_local_token_claims(token)
+    if local_claims is not None:
+        session_id = str(local_claims.get("sid") or "").strip()
+        token_iat = local_claims.get("iat")
+        if session_id:
+            session_valid = await validate_auth_session(
+                session,
+                session_id,
+                user_id_or_sub,
+                token_iat=token_iat,
+            )
+        else:
+            session_valid = await validate_legacy_token_epoch(
+                session,
+                user_id_or_sub,
+                token_iat=token_iat,
+            )
+        if not session_valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session is no longer valid",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     # Fast path: short-window user cache (30s TTL).
     # Cuts the ~2s Mumbai pooler round-trip every authed endpoint pays.
     t0 = time.perf_counter()
     cached = user_cache.get_cached_user(user_id_or_sub)
     if cached is not None:
+        if not bool(getattr(cached, "is_active", True)):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account is inactive",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         auth_metrics.record((time.perf_counter() - t0) * 1000, cache_hit=True)
         return cached
 
@@ -90,6 +129,13 @@ async def get_current_user(
 
     if user is None:
         raise credentials_exception
+
+    if not bool(getattr(user, "is_active", True)):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account is inactive",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     # Warm the cache for subsequent requests in the same TTL window.
     user_cache.cache_user(user_id_or_sub, user)

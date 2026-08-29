@@ -535,6 +535,18 @@ async def startup_db():
             )
 
 
+    if pool:
+        try:
+            from app.migrations.auth04_advanced_security import (
+                ensure_auth_advanced_security_tables,
+            )
+            await ensure_auth_advanced_security_tables()
+        except Exception as _e:
+            logger.error(
+                f"[AUTH-04] startup DDL failed (non-fatal): {_e}"
+            )
+
+
     if os.environ.get("ENV_HAZARD_USE_POSTGIS", "false").strip().lower() in (
         "1", "true", "yes", "on",
     ):
