@@ -113,17 +113,53 @@ async def get_family_profile(
     from app.services.alert_trigger import _resolve_guardian_ids
 
     guardian_ids, _ = await _resolve_guardian_ids(session, str(user.id))
+    normalized_role = str(getattr(user, "role", "") or "").strip().lower().replace("-", "_")
     primary_guardian_id = (
         str(user.guardian_id) if getattr(user, "guardian_id", None) else None
     )
+
+    # Primary-guardian accounts do not point to themselves via guardian_id.
+    # Establish the family root explicitly so direct users.guardian_id co-parent
+    # links survive cold app restarts and are not dependent on a stale mobile
+    # cache or the optional guardian_relationships table.
+    if not primary_guardian_id and normalized_role in {
+        "guardian",
+        "parent",
+        "parents",
+        "primary_guardian",
+        "primary_parent",
+        "admin",
+    }:
+        primary_guardian_id = str(user.id)
 
     if primary_guardian_id:
         guardian_ids = [
             primary_guardian_id,
             *[gid for gid in guardian_ids if gid != primary_guardian_id],
         ]
-    elif user.role in ("guardian", "parent", "admin"):
-        guardian_ids = [str(user.id)]
+
+        # Co-parent accounts created from the family invite are represented by
+        # users.guardian_id -> primary guardian. They are family guardians, not
+        # protected members, and must be returned by family-profile separately.
+        linked_rows = (
+            await session.execute(
+                select(User).where(
+                    User.guardian_id == uuid_mod.UUID(primary_guardian_id),
+                    User.is_active == True,
+                )
+            )
+        ).scalars().all()
+        for linked_user in linked_rows:
+            linked_role = (
+                str(getattr(linked_user, "role", "") or "")
+                .strip()
+                .lower()
+                .replace("-", "_")
+            )
+            if linked_role in {"co_parent", "coparent", "co_guardian"}:
+                linked_id = str(linked_user.id)
+                if linked_id not in guardian_ids:
+                    guardian_ids.append(linked_id)
 
     guardian_users = []
     if guardian_ids:
@@ -142,11 +178,12 @@ async def get_family_profile(
                 "email": guardian.email,
                 "phone": guardian.phone,
                 "priority": index + 1,
-                "is_primary": guardian_id == primary_guardian_id or index == 0,
+                "role": guardian.role,
+                "is_primary": guardian_id == primary_guardian_id,
                 "relationship": (
                     "Primary Guardian"
-                    if guardian_id == primary_guardian_id or index == 0
-                    else "Co-Guardian"
+                    if guardian_id == primary_guardian_id
+                    else "Co-Parent"
                 ),
             })
 

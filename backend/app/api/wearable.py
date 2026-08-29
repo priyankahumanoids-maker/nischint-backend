@@ -23,11 +23,61 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
 from app.models.user import User
+from app.core.product_roles import is_primary_guardian, normalize_role
 from app.services.event_broadcaster import broadcaster
 from app.core.rate_limiter import limiter
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/wearable", tags=["BLE Wearable"])
+
+# A protected phone sends a verified BLE heartbeat every 60 seconds while the
+# physical peripheral is connected. Give two missed heartbeats plus network
+# jitter before guardian surfaces call the device offline. `status` alone is
+# not enough because Android can lose the BLE link while the backend row still
+# says active from a previous heartbeat.
+WEARABLE_CONNECTED_FRESHNESS_SECONDS = 150
+
+
+def _is_connected(status: str | None, last_seen_at, now: datetime | None = None) -> bool:
+    if str(status or "").strip().lower() not in {"active", "connected", "online"}:
+        return False
+    if last_seen_at is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    seen = last_seen_at
+    if getattr(seen, "tzinfo", None) is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return (current - seen.astimezone(timezone.utc)).total_seconds() <= WEARABLE_CONNECTED_FRESHNESS_SECONDS
+
+
+async def _caller_can_manage_owned_device(
+    db: AsyncSession,
+    user: User,
+    owner_user_id,
+) -> bool:
+    # Owner or Primary Guardian may disconnect/release a protected wearable.
+    # Co-parents remain monitoring-only.
+    if owner_user_id is None:
+        return False
+    if str(owner_user_id) == str(user.id):
+        return True
+
+    role = normalize_role(getattr(user, "role", None))
+    if role in {"admin", "operator"}:
+        return True
+    if not is_primary_guardian(role):
+        return False
+
+    from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+    linked = await _get_linked_user_ids(
+        db,
+        getattr(user, "email", None),
+        str(user.id),
+        getattr(user, "role", None),
+        include_checkin_recovery=False,
+    )
+    return any(str(member_id) == str(owner_user_id) for member_id in linked)
 
 
 # ──────────────────────────────────────────────
@@ -149,6 +199,11 @@ class HeartbeatRequest(BaseModel):
     battery: Optional[int] = None
     rssi: Optional[int] = None
     heart_rate_bpm: Optional[int] = None
+
+
+class DeviceDisconnectRequest(BaseModel):
+    reason: Optional[str] = "user_requested"
+    observed_at: Optional[str] = None
 
 
 # ──────────────────────────────────────────────
@@ -345,12 +400,12 @@ async def release_device(
     db: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    """Release a wearable owned by the signed-in account.
+    """Release a wearable from its current owner.
 
-    The physical device identity and audit history are retained, but ownership
-    is cleared so the same watch can later be registered/bound to another
-    NISCHINT account.  Guardians cannot release a protected member's watch from
-    their own account; the current owner must explicitly unpair it.
+    The protected member who owns the wearable or their Primary Guardian may
+    explicitly release it. Co-parents stay monitoring-only. The physical device
+    identity and audit trail are retained, while ownership is cleared so the
+    same watch can later be claimed by another protected account.
     """
     await _ensure_schema(db)
 
@@ -361,20 +416,27 @@ async def release_device(
     device = result.fetchone()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    if not device.user_id or str(device.user_id) != str(user.id):
+    if not device.user_id or not await _caller_can_manage_owned_device(
+        db, user, device.user_id
+    ):
         raise HTTPException(
             status_code=403,
-            detail="Only the account that owns this wearable can release it",
+            detail="Only the wearable owner or Primary Guardian can release it",
         )
 
+    previous_owner = str(device.user_id)
     now = datetime.now(timezone.utc)
     await _audit_log(
         db,
         device_id,
-        str(user.id),
+        previous_owner,
         "DEVICE_UNBOUND",
         f"unbind:{uuid.uuid4()}",
-        {"reason": "user_requested"},
+        {
+            "reason": "user_requested",
+            "requested_by": str(user.id),
+            "requested_by_role": getattr(user, "role", None),
+        },
         "mobile",
     )
     await db.execute(
@@ -387,8 +449,108 @@ async def release_device(
     )
     await db.commit()
 
-    logger.info("[WEARABLE_RELEASE] device=%s owner=%s", device_id, user.id)
-    return {"status": "released", "device_id": device_id}
+    logger.info(
+        "[WEARABLE_RELEASE] device=%s previous_owner=%s requested_by=%s",
+        device_id,
+        previous_owner,
+        user.id,
+    )
+    return {
+        "status": "released",
+        "device_id": device_id,
+        "previous_owner_user_id": previous_owner,
+    }
+
+
+@router.post("/devices/{device_id}/disconnect")
+@limiter.limit("60/minute")
+async def disconnect_device(
+    request: Request,
+    device_id: str,
+    req: DeviceDisconnectRequest,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Mark a bound wearable physically disconnected without releasing ownership.
+
+    The normal protected-phone reconnect loop may bring it back online later.
+    This endpoint is also used immediately by the BLE disconnect callback so
+    guardian status does not wait for the freshness timeout.
+    """
+    await _ensure_schema(db)
+
+    result = await db.execute(
+        text("SELECT id, user_id, status FROM wearable_devices WHERE id = :did"),
+        {"did": device_id},
+    )
+    device = result.fetchone()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if not device.user_id or not await _caller_can_manage_owned_device(
+        db, user, device.user_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="You are not authorized to disconnect this wearable",
+        )
+
+    owner_user_id = str(device.user_id)
+    reason = str(req.reason or "user_requested").strip()[:120] or "user_requested"
+    observed_at = datetime.now(timezone.utc)
+    if req.observed_at:
+        try:
+            parsed = datetime.fromisoformat(str(req.observed_at).replace("Z", "+00:00"))
+            observed_at = (
+                parsed.replace(tzinfo=timezone.utc)
+                if parsed.tzinfo is None
+                else parsed.astimezone(timezone.utc)
+            )
+        except (TypeError, ValueError):
+            pass
+
+    # A delayed disconnect request must never overwrite a newer reconnect
+    # heartbeat. Apply only if the current last_seen is not newer than the
+    # physical-disconnect observation made by the protected phone.
+    update_result = await db.execute(
+        text("""
+            UPDATE wearable_devices
+            SET status = 'inactive'
+            WHERE id = :did
+              AND (last_seen_at IS NULL OR last_seen_at <= :observed_at)
+        """),
+        {"did": device_id, "observed_at": observed_at},
+    )
+    applied = bool(update_result.rowcount)
+    if applied:
+        await _audit_log(
+            db,
+            device_id,
+            owner_user_id,
+            "DEVICE_DISCONNECTED",
+            f"disconnect:{uuid.uuid4()}",
+            {
+                "reason": reason,
+                "observed_at": observed_at.isoformat(),
+                "requested_by": str(user.id),
+                "requested_by_role": getattr(user, "role", None),
+            },
+            "mobile",
+        )
+    await db.commit()
+
+    logger.info(
+        "[WEARABLE_DISCONNECT] device=%s owner=%s requested_by=%s reason=%s",
+        device_id,
+        owner_user_id,
+        user.id,
+        reason,
+    )
+    return {
+        "status": "disconnected" if applied else "ignored_stale_disconnect",
+        "device_id": device_id,
+        "owner_user_id": owner_user_id,
+        "applied": applied,
+    }
 
 
 @router.post("/event")
@@ -633,39 +795,38 @@ async def list_devices(
         FROM wearable_devices WHERE user_id = :uid ORDER BY created_at DESC
     """), {"uid": str(user.id)})
 
-    return {
-        "devices": [
-            {
-                "device_id": str(row.id),
-                "device_uid": row.device_uid,
-                "device_type": row.device_type,
-                "device_name": row.device_name,
-                "capabilities": row.capabilities or {},
-                "status": row.status,
-                "battery_level": row.battery_level,
-                "heart_rate_bpm": row.heart_rate_bpm,
-                "heart_rate_at": row.heart_rate_at.isoformat() if row.heart_rate_at else None,
-                "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-            }
-            for row in r.fetchall()
-        ]
-    }
+    return {"devices": [_device_payload(row) for row in r.fetchall()]}
 
 
 def _device_payload(row) -> dict:
-    return {
+    connected = _is_connected(row.status, row.last_seen_at)
+    last_seen_at = row.last_seen_at.isoformat() if row.last_seen_at else None
+    payload = {
         "device_id": str(row.id),
+        "device_uid": getattr(row, "device_uid", None),
         "device_type": row.device_type,
         "device_name": row.device_name,
         "capabilities": row.capabilities or {},
         "status": row.status,
+        "connected": connected,
+        "connection_state": "connected" if connected else "disconnected",
         "battery_level": row.battery_level,
         "heart_rate_bpm": row.heart_rate_bpm,
         "heart_rate_at": row.heart_rate_at.isoformat() if row.heart_rate_at else None,
-        "last_seen_at": row.last_seen_at.isoformat() if row.last_seen_at else None,
+        "last_seen_at": last_seen_at,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
+    if row.last_seen_at:
+        seen = row.last_seen_at
+        if getattr(seen, "tzinfo", None) is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        payload["seconds_since_seen"] = max(
+            0,
+            int((datetime.now(timezone.utc) - seen.astimezone(timezone.utc)).total_seconds()),
+        )
+    else:
+        payload["seconds_since_seen"] = None
+    return payload
 
 
 @router.get("/dependent/{dependent_id}/devices")
@@ -691,7 +852,7 @@ async def list_dependent_devices(
             raise HTTPException(status_code=403, detail="You are not linked to this protected member")
 
     result = await db.execute(text("""
-        SELECT id, device_type, device_name, capabilities, status,
+        SELECT id, device_uid, device_type, device_name, capabilities, status,
                battery_level, heart_rate_bpm, heart_rate_at, last_seen_at, created_at
         FROM wearable_devices
         WHERE user_id = :uid

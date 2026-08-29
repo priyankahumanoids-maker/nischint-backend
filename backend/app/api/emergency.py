@@ -356,9 +356,47 @@ async def get_active(
     user=Depends(get_current_user),
 ):
     from app.services.emergency_engine import get_active_emergencies
-    # Operators see all, users see their own
-    user_filter = None if user.role == "operator" else str(user.id)
-    events = await get_active_emergencies(session=session, user_id=user_filter)
+
+    caller_role = normalize_role(getattr(user, "role", None))
+    if caller_role in {"operator", "admin"}:
+        events = await get_active_emergencies(session=session, user_id=None)
+        return {"events": events, "count": len(events)}
+
+    # Guardian/co-parent Home must reconcile against the active SOS events of
+    # the protected members they monitor. Returning only the signed-in
+    # guardian's own events leaves a resolved child SOS permanently cached in
+    # the mobile alert store.
+    if caller_role in {
+        "guardian",
+        "parent",
+        "parents",
+        "primary_guardian",
+        "primary_parent",
+        "co_guardian",
+        "co_parent",
+        "coparent",
+    }:
+        from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+        linked_user_ids = await _get_linked_user_ids(
+            session,
+            getattr(user, "email", None),
+            str(user.id),
+            getattr(user, "role", None),
+            include_checkin_recovery=False,
+        )
+        events = []
+        for linked_user_id in linked_user_ids:
+            events.extend(
+                await get_active_emergencies(
+                    session=session,
+                    user_id=str(linked_user_id),
+                )
+            )
+        events.sort(key=lambda event: str(event.get("created_at") or ""), reverse=True)
+        return {"events": events, "count": len(events)}
+
+    events = await get_active_emergencies(session=session, user_id=str(user.id))
     return {"events": events, "count": len(events)}
 
 
