@@ -54,9 +54,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 # Product rule: a family scanner/code is intentionally short-lived. It is
-# valid for 2 minutes at most and is consumed immediately by one successful
+# valid for 15 minutes at most and is consumed immediately by one successful
 # join. The server expiry remains the source of truth for every client.
-INVITE_CODE_TTL_MINUTES = 2
+INVITE_CODE_TTL_MINUTES = 15
 
 # Password recovery is intentionally separate from registration OTP.
 # Reset codes are short-lived and one-time-use. Cognito owns delivery when
