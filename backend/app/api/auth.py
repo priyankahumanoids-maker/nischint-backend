@@ -355,7 +355,7 @@ class VerifyInviteRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)
     full_name: str = Field(min_length=1, max_length=100)
-    phone: Optional[str] = None
+    phone: str = Field(min_length=10, max_length=20)
     role: str = Field("child", pattern="^(child|woman|senior|family|co_parent)$")
 
 
@@ -421,18 +421,42 @@ def _normalize_phone(phone: Optional[str]) -> str:
     return f"+{digits}" if digits else ""
 
 
-async def _phone_exists(session: AsyncSession, phone: Optional[str]) -> bool:
+def _require_normalized_phone(phone: Optional[str]) -> str:
+    """Return a usable E.164-style phone or reject registration explicitly.
+
+    Registration must never silently create a user with ``phone = NULL`` when
+    the UI step is expected to collect a mobile number.
+    """
+    normalized = _normalize_phone(phone)
+    digits = normalized.lstrip("+")
+
+    if not normalized or len(digits) < 10 or len(digits) > 15:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A valid mobile number is required.",
+        )
+
+    return normalized
+
+
+async def _phone_exists(
+    session: AsyncSession,
+    phone: Optional[str],
+    exclude_user_id: Optional[uuid.UUID] = None,
+) -> bool:
     from sqlalchemy import func, select
 
     normalized = _normalize_phone(phone)
     digits = normalized.lstrip("+")[-10:]
     if not digits:
         return False
-    result = await session.execute(
-        select(User.id)
-        .where(func.right(func.regexp_replace(User.phone, r"\D", "", "g"), 10) == digits)
-        .limit(1)
+    query = select(User.id).where(
+        func.right(func.regexp_replace(User.phone, r"\D", "", "g"), 10) == digits
     )
+    if exclude_user_id is not None:
+        query = query.where(User.id != exclude_user_id)
+
+    result = await session.execute(query.limit(1))
     return result.scalar_one_or_none() is not None
 
 
@@ -491,6 +515,57 @@ async def get_me(
         "roles": roles,
         "facility_id": user.facility_id,
         "cognito_sub": user.cognito_sub,
+    }
+
+
+class UpdateMyPhoneRequest(BaseModel):
+    phone: str = Field(min_length=10, max_length=20)
+
+
+@router.patch("/me/phone")
+async def update_my_phone(
+    req: UpdateMyPhoneRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Update the signed-in user's registered mobile number.
+
+    This also provides a safe repair path for legacy accounts that were
+    created by older clients which accidentally dropped the phone field.
+    """
+    from sqlalchemy import select
+    from app.services import user_cache
+
+    normalized_phone = _require_normalized_phone(req.phone)
+
+    if await _phone_exists(
+        session,
+        normalized_phone,
+        exclude_user_id=user.id,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mobile number is already registered. Please use another number.",
+        )
+
+    result = await session.execute(
+        select(User).where(User.id == user.id).with_for_update()
+    )
+    db_user = result.scalar_one_or_none()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User account not found")
+
+    db_user.phone = normalized_phone
+    await session.commit()
+
+    user_cache.invalidate_user_keys(
+        str(db_user.id),
+        str(db_user.cognito_sub or ""),
+    )
+
+    return {
+        "updated": True,
+        "phone": normalized_phone,
     }
 
 
@@ -955,12 +1030,20 @@ async def verify_invite_code(
         await session.commit()
         raise HTTPException(status_code=400, detail="Invite code has expired")
 
-    # 3. Prevent duplicate email
+    # 3. Prevent duplicate email / phone and never create a family member
+    # with a missing phone number.
     existing = await user_service.get_user_by_email(session, req.email)
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists",
+        )
+
+    normalized_phone = _require_normalized_phone(req.phone)
+    if await _phone_exists(session, normalized_phone):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mobile number is already registered. Please sign in instead.",
         )
 
     # 4. Create the new family member account linked to the guardian
@@ -969,7 +1052,7 @@ async def verify_invite_code(
         password_hash=await user_service.hash_password_async(req.password),
         role=req.role,
         full_name=req.full_name,
-        phone=_normalize_phone(req.phone) or None,
+        phone=normalized_phone,
         guardian_id=guardian.id,
     )
     session.add(new_user)
@@ -1076,7 +1159,9 @@ async def _local_register(req: RegisterRequest, session: AsyncSession) -> TokenR
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists",
         )
-    if req.phone and await _phone_exists(session, req.phone):
+
+    normalized_phone = _require_normalized_phone(req.phone)
+    if await _phone_exists(session, normalized_phone):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This mobile number is already registered. Please sign in instead.",
@@ -1086,7 +1171,7 @@ async def _local_register(req: RegisterRequest, session: AsyncSession) -> TokenR
         email=req.email,
         password_hash=await user_service.hash_password_async(req.password),
         role="guardian",
-        phone=_normalize_phone(req.phone) or None,
+        phone=normalized_phone,
         full_name=req.full_name,
     )
     session.add(user)
@@ -1184,7 +1269,12 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists",
         )
-    if req.phone and await _phone_exists(session, req.phone):
+    normalized_phone = _require_normalized_phone(req.phone)
+    if await _phone_exists(
+        session,
+        normalized_phone,
+        exclude_user_id=existing.id if existing else None,
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This mobile number is already registered. Please sign in instead.",
@@ -1196,7 +1286,7 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
             email=req.email,
             password=req.password,
             full_name=req.full_name or "",
-            phone=_normalize_phone(req.phone),
+            phone=normalized_phone,
         )
     except ValueError as e:
         message = str(e)
@@ -1226,6 +1316,7 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
         existing.cognito_sub = cognito_sub
         if req.full_name and not existing.full_name:
             existing.full_name = req.full_name
+        existing.phone = normalized_phone
         user = existing
     else:
         user = User(
@@ -1233,7 +1324,7 @@ async def _cognito_register(req: RegisterRequest, session: AsyncSession) -> Toke
             password_hash=await user_service.hash_password_async(req.password),
             cognito_sub=cognito_sub,
             role="guardian",
-            phone=_normalize_phone(req.phone) or None,
+            phone=normalized_phone,
             full_name=req.full_name,
         )
         session.add(user)
