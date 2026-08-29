@@ -1355,6 +1355,58 @@ async def generate_invite_code(
     return GenerateInviteResponse(code=code, expires_at=expires_at.isoformat())
 
 
+@router.post("/family/cancel-invite-code")
+async def cancel_invite_code(
+    req: ValidateInviteRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Guardian manually revokes the currently displayed family invite.
+
+    The submitted code must match the guardian's current invite so a stale
+    screen cannot accidentally cancel a newer invite generated elsewhere.
+    """
+    from sqlalchemy import select
+
+    if user.role not in ("guardian", "parent", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Only guardian accounts can cancel invite codes",
+        )
+
+    normalized_code = req.invite_code.strip().upper()
+
+    # Serialize cancel against member join / invite regeneration. This keeps
+    # one-QR-one-member semantics intact even during concurrent requests.
+    result = await session.execute(
+        select(User)
+        .where(User.id == user.id)
+        .with_for_update()
+    )
+    guardian = result.scalar_one_or_none()
+    if not guardian:
+        raise HTTPException(status_code=401, detail="Guardian account not found")
+
+    # Idempotent and race-safe: if this code was already used, expired, or
+    # superseded, there is nothing left for this stale client to revoke.
+    current_code = (guardian.invite_code or "").strip().upper()
+    if not current_code or current_code != normalized_code:
+        return {
+            "cancelled": False,
+            "already_inactive": True,
+        }
+
+    guardian.invite_code = None
+    guardian.invite_code_expires_at = None
+    await session.commit()
+
+    logger.info(f"[INVITE] Guardian {user.email} manually cancelled active invite")
+    return {
+        "cancelled": True,
+        "already_inactive": False,
+    }
+
 @router.post("/family/validate-invite-code")
 @limiter.limit("20/minute")
 async def validate_invite_code(
