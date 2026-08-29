@@ -32,9 +32,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# Product rule: a family scanner/code is valid for exactly 15 minutes unless
-# it is consumed earlier by one successful join.
-INVITE_CODE_TTL_MINUTES = 15
+# Product rule: a family scanner/code is intentionally short-lived. It is
+# valid for 2 minutes at most and is consumed immediately by one successful
+# join. The server expiry remains the source of truth for every client.
+INVITE_CODE_TTL_MINUTES = 2
 
 # Password recovery is intentionally separate from registration OTP.
 # Reset codes are short-lived and one-time-use. Cognito owns delivery when
@@ -861,9 +862,9 @@ async def generate_invite_code(
 ):
     """
     Guardian generates a 6-character invite code.
-    Stores it in users.invite_code + users.invite_code_expires_at using the
-    server-configured FAMILY_INVITE_TTL_MINUTES (15 minutes by default).
-    Calling again overwrites the previous code.
+    Stores it in users.invite_code + users.invite_code_expires_at for the
+    short server-controlled invite window. Calling again overwrites the
+    previous code.
     """
     from datetime import datetime, timezone
     from sqlalchemy import select

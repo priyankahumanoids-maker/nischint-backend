@@ -151,6 +151,38 @@ def _is_admin(user) -> bool:
     return (getattr(user, "role", None) or "").lower() in ("admin", "operator")
 
 
+async def _can_view_safety(session: AsyncSession, user: User, target_user_id: str) -> bool:
+    """Return True when caller may read a protected member's safety state.
+
+    A co-parent/co-guardian created from a Family Circle invite points to the
+    Primary Guardian through ``users.guardian_id``.  It inherits that primary
+    guardian's monitoring/read scope, but never mutation rights.
+    """
+    if _is_admin(user):
+        return True
+
+    caller_id = str(user.id)
+    if caller_id == target_user_id:
+        return True
+
+    if await _is_guardian_of(session, caller_id, target_user_id):
+        return True
+
+    role = (getattr(user, "role", None) or "").lower().replace("-", "_")
+    if role not in ("co_guardian", "co_parent", "coparent"):
+        return False
+
+    primary_guardian_id = getattr(user, "guardian_id", None)
+    if not primary_guardian_id:
+        return False
+
+    return await _is_guardian_of(
+        session,
+        str(primary_guardian_id),
+        target_user_id,
+    )
+
+
 async def _can_manage_safety(session: AsyncSession, user: User, target_user_id: str) -> bool:
     """Only admins and linked primary guardians may mutate safety assignments.
 
@@ -225,11 +257,8 @@ async def list_zones_for_user(
     user: User = Depends(get_current_user),
 ):
     """List active safety zones for a user. Caller must own the user or be a linked guardian/admin."""
-    caller_id = str(user.id)
-    if target_user_id != caller_id and not _is_admin(user):
-        ok = await _is_guardian_of(session, caller_id, target_user_id)
-        if not ok:
-            raise HTTPException(status_code=403, detail="Not authorized to view these zones.")
+    if not await _can_view_safety(session, user, target_user_id):
+        raise HTTPException(status_code=403, detail="Not authorized to view these zones.")
     rows = await session.execute(
         select(SafeZone)
         .where(SafeZone.user_id == uuid.UUID(target_user_id), SafeZone.active.is_(True))
@@ -435,11 +464,8 @@ async def get_status(
     """Read the last known geofence state for a user (guardian dashboard)."""
     from app.services.redis_service import get_json
 
-    caller_id = str(user.id)
-    if target_user_id != caller_id and not _is_admin(user):
-        ok = await _is_guardian_of(session, caller_id, target_user_id)
-        if not ok:
-            raise HTTPException(status_code=403, detail="Not authorized to read this status.")
+    if not await _can_view_safety(session, user, target_user_id):
+        raise HTTPException(status_code=403, detail="Not authorized to read this status.")
     state = get_json("geofence:state", target_user_id)
     if not state:
         # No pings yet. Return the configured zone (if any) so UI can render the circle.
@@ -520,11 +546,8 @@ async def get_pins(
 ):
     """Fetch saved Care Locations for a user. Empty list if none saved yet."""
     from app.services.redis_service import get_json
-    caller_id = str(user.id)
-    if target_user_id != caller_id and not _is_admin(user):
-        ok = await _is_guardian_of(session, caller_id, target_user_id)
-        if not ok:
-            raise HTTPException(status_code=403, detail="Not authorized to view these care locations.")
+    if not await _can_view_safety(session, user, target_user_id):
+        raise HTTPException(status_code=403, detail="Not authorized to view these care locations.")
     pins = get_json("geofence:pins", target_user_id) or []
     return {"user_id": target_user_id, "pins": pins, "count": len(pins), "max": MAX_PINS_PER_USER}
 
@@ -649,11 +672,8 @@ async def list_routes_for_user(
     user: User = Depends(get_current_user),
 ):
     """List active monitored routes for a user."""
-    caller_id = str(user.id)
-    if target_user_id != caller_id and not _is_admin(user):
-        ok = await _is_guardian_of(session, caller_id, target_user_id)
-        if not ok:
-            raise HTTPException(status_code=403, detail="Not authorized to view these routes.")
+    if not await _can_view_safety(session, user, target_user_id):
+        raise HTTPException(status_code=403, detail="Not authorized to view these routes.")
 
     rows = await session.execute(
         select(MonitoredRoute)
