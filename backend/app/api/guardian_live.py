@@ -294,15 +294,21 @@ _ESC_TIER: dict[str, int] = {
 async def _compute_live_risk(session: AsyncSession, user: User):
     now = datetime.now(timezone.utc)
 
-    # Find all users where guardian_id is current user's ID
-    rels = (await session.execute(
-        select(User.id).where(and_(
-            User.guardian_id == user.id,
-            User.is_active == True,
-        ))
-    )).scalars().all()
+    # Use the same canonical protected-member scope as the Guardian
+    # Dashboard. This keeps Primary Guardian and Co-Parent monitoring
+    # consistent across SSE and polling while excluding monitor-only roles
+    # from the protected-member result set.
+    from app.services.guardian_dashboard_engine import _get_linked_user_ids
 
-    child_ids = {uid for uid in rels}
+    child_ids = set(
+        await _get_linked_user_ids(
+            session,
+            guardian_email=user.email or "",
+            guardian_user_id=str(user.id),
+            user_role=user.role,
+            include_checkin_recovery=False,
+        )
+    )
 
     results = []
     for child_id in child_ids:
