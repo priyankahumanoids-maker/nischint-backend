@@ -104,43 +104,21 @@ async def get_family_profile(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    """Return the authenticated member, linked guardians and shared contacts.
-
-    Protected members can read the real safety network belonging to their
-    linked guardian accounts. This keeps child Settings consistent with the
-    contacts configured by a parent without exposing unrelated families.
-    """
+    """Return member, guardians and shared contacts with a primary-guardian fast path."""
     from app.services.alert_trigger import _resolve_guardian_ids
 
-    guardian_ids, _ = await _resolve_guardian_ids(session, str(user.id))
     normalized_role = str(getattr(user, "role", "") or "").strip().lower().replace("-", "_")
-    primary_guardian_id = (
-        str(user.guardian_id) if getattr(user, "guardian_id", None) else None
-    )
+    primary_roles = {"guardian", "parent", "parents", "primary_guardian", "primary_parent", "admin"}
+    primary_guardian_id = str(user.guardian_id) if getattr(user, "guardian_id", None) else None
 
-    # Primary-guardian accounts do not point to themselves via guardian_id.
-    # Establish the family root explicitly so direct users.guardian_id co-parent
-    # links survive cold app restarts and are not dependent on a stale mobile
-    # cache or the optional guardian_relationships table.
-    if not primary_guardian_id and normalized_role in {
-        "guardian",
-        "parent",
-        "parents",
-        "primary_guardian",
-        "primary_parent",
-        "admin",
-    }:
+    if not primary_guardian_id and normalized_role in primary_roles:
         primary_guardian_id = str(user.id)
+        guardian_ids: list[str] = []
+    else:
+        guardian_ids, _ = await _resolve_guardian_ids(session, str(user.id))
 
     if primary_guardian_id:
-        guardian_ids = [
-            primary_guardian_id,
-            *[gid for gid in guardian_ids if gid != primary_guardian_id],
-        ]
-
-        # Co-parent accounts created from the family invite are represented by
-        # users.guardian_id -> primary guardian. They are family guardians, not
-        # protected members, and must be returned by family-profile separately.
+        guardian_ids = [primary_guardian_id, *[gid for gid in guardian_ids if gid != primary_guardian_id]]
         linked_rows = (
             await session.execute(
                 select(User).where(
@@ -150,45 +128,44 @@ async def get_family_profile(
             )
         ).scalars().all()
         for linked_user in linked_rows:
-            linked_role = (
-                str(getattr(linked_user, "role", "") or "")
-                .strip()
-                .lower()
-                .replace("-", "_")
-            )
+            linked_role = str(getattr(linked_user, "role", "") or "").strip().lower().replace("-", "_")
             if linked_role in {"co_parent", "coparent", "co_guardian"}:
                 linked_id = str(linked_user.id)
                 if linked_id not in guardian_ids:
                     guardian_ids.append(linked_id)
+    else:
+        linked_rows = []
+
+    guardian_by_id = {str(user.id): user}
+    for linked_user in linked_rows:
+        guardian_by_id[str(linked_user.id)] = linked_user
+
+    missing_guardian_ids = [gid for gid in guardian_ids if gid not in guardian_by_id]
+    if missing_guardian_ids:
+        guardian_rows = (
+            await session.execute(
+                select(User).where(User.id.in_([uuid_mod.UUID(gid) for gid in missing_guardian_ids]))
+            )
+        ).scalars().all()
+        for row in guardian_rows:
+            guardian_by_id[str(row.id)] = row
 
     guardian_users = []
-    if guardian_ids:
-        guardian_uuids = [uuid_mod.UUID(gid) for gid in guardian_ids]
-        guardian_rows = (
-            await session.execute(select(User).where(User.id.in_(guardian_uuids)))
-        ).scalars().all()
-        guardian_by_id = {str(row.id): row for row in guardian_rows}
-        for index, guardian_id in enumerate(guardian_ids):
-            guardian = guardian_by_id.get(guardian_id)
-            if not guardian:
-                continue
-            guardian_users.append({
-                "id": str(guardian.id),
-                "full_name": guardian.full_name,
-                "email": guardian.email,
-                "phone": guardian.phone,
-                "priority": index + 1,
-                "role": guardian.role,
-                "is_primary": guardian_id == primary_guardian_id,
-                "relationship": (
-                    "Primary Guardian"
-                    if guardian_id == primary_guardian_id
-                    else "Co-Parent"
-                ),
-            })
+    for index, guardian_id in enumerate(guardian_ids):
+        guardian = guardian_by_id.get(guardian_id)
+        if not guardian:
+            continue
+        guardian_users.append({
+            "id": str(guardian.id),
+            "full_name": guardian.full_name,
+            "email": guardian.email,
+            "phone": guardian.phone,
+            "priority": index + 1,
+            "role": guardian.role,
+            "is_primary": guardian_id == primary_guardian_id,
+            "relationship": "Primary Guardian" if guardian_id == primary_guardian_id else "Co-Parent",
+        })
 
-    # Parent-configured contacts are family-wide. Include contacts owned by
-    # the protected member or any of their linked guardian accounts.
     contact_owner_ids = {user.id}
     contact_owner_ids.update(uuid_mod.UUID(gid) for gid in guardian_ids)
     contact_rows = (
@@ -227,6 +204,7 @@ async def get_family_profile(
         "emergency_contacts": contacts,
         "total_contacts": len(guardian_users) + len(contacts),
     }
+
 
 
 @router.put("/profile-photo")

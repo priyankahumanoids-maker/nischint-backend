@@ -364,7 +364,12 @@ async def _get_linked_user_ids(
     return await _filter_protected_scope_ids(session, ids)
 
 async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_user_id: str, user_role: str | None = None) -> dict:
-    """Get all people this guardian monitors, with their live status, location, and last_updated."""
+    """Get all people this guardian monitors, with live status/location.
+
+    Normal Home reads use batched current-state queries. Expensive historical
+    location tables are queried only for members that genuinely lack emergency,
+    telemetry, active-session, and durable last-known location.
+    """
     from app.models.emergency import EmergencyEvent
     from app.models.checkin import CheckIn
     from app.models.location_trail import LocationTrailPoint
@@ -379,8 +384,6 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
     now = datetime.now(timezone.utc)
     guardian_uuid = uuid.UUID(guardian_user_id)
 
-    # Batch-load dashboard state. The previous implementation performed
-    # repeated SQL round trips once per loved one.
     users_by_id: dict[uuid.UUID, User] = {}
     active_sessions_by_user: dict[uuid.UUID, GuardianSession] = {}
     active_emergencies_by_user: dict[uuid.UUID, EmergencyEvent] = {}
@@ -389,186 +392,161 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
     trail_by_user: dict[uuid.UUID, tuple] = {}
     past_emergencies_by_user: dict[uuid.UUID, EmergencyEvent] = {}
     alert_counts_by_session: dict[uuid.UUID, int] = {}
+    device_telemetry_by_user: dict[uuid.UUID, dict | None] = {}
+    telemetry_updated_by_user: dict[uuid.UUID, datetime | None] = {}
 
     if user_ids:
-        users_result = await session.execute(
-            select(User).where(User.id.in_(user_ids))
-        )
+        users_result = await session.execute(select(User).where(User.id.in_(user_ids)))
         users_by_id = {u.id: u for u in users_result.scalars().all()}
 
-        active_session_ranked = (
-            select(
-                GuardianSession.id.label("id"),
-                func.row_number().over(
-                    partition_by=GuardianSession.user_id,
-                    order_by=GuardianSession.started_at.desc(),
-                ).label("rn"),
-            )
+        active_session_result = await session.execute(
+            select(GuardianSession)
             .where(
                 GuardianSession.user_id.in_(user_ids),
                 GuardianSession.status == "active",
             )
-            .subquery()
+            .order_by(GuardianSession.started_at.desc())
         )
-        active_session_result = await session.execute(
-            select(GuardianSession)
-            .join(
-                active_session_ranked,
-                GuardianSession.id == active_session_ranked.c.id,
-            )
-            .where(active_session_ranked.c.rn == 1)
-        )
-        active_sessions_by_user = {
-            gs.user_id: gs
-            for gs in active_session_result.scalars().all()
-        }
+        for gs in active_session_result.scalars().all():
+            active_sessions_by_user.setdefault(gs.user_id, gs)
 
-        active_emergency_ranked = (
-            select(
-                EmergencyEvent.id.label("id"),
-                func.row_number().over(
-                    partition_by=EmergencyEvent.user_id,
-                    order_by=EmergencyEvent.created_at.desc(),
-                ).label("rn"),
-            )
+        active_emergency_result = await session.execute(
+            select(EmergencyEvent)
             .where(
                 EmergencyEvent.user_id.in_(user_ids),
                 EmergencyEvent.status == "active",
             )
-            .subquery()
+            .order_by(EmergencyEvent.created_at.desc())
         )
-        active_emergency_result = await session.execute(
-            select(EmergencyEvent)
-            .join(
-                active_emergency_ranked,
-                EmergencyEvent.id == active_emergency_ranked.c.id,
-            )
-            .where(active_emergency_ranked.c.rn == 1)
-        )
-        active_emergencies_by_user = {
-            event.user_id: event
-            for event in active_emergency_result.scalars().all()
-        }
+        for event in active_emergency_result.scalars().all():
+            active_emergencies_by_user.setdefault(event.user_id, event)
 
-        checkin_ranked = (
-            select(
-                CheckIn.id.label("id"),
-                func.row_number().over(
-                    partition_by=CheckIn.child_id,
-                    order_by=CheckIn.created_at.desc(),
-                ).label("rn"),
-            )
+        checkin_result = await session.execute(
+            select(CheckIn)
             .where(
                 CheckIn.child_id.in_(user_ids),
                 CheckIn.guardian_id == guardian_uuid,
             )
-            .subquery()
+            .order_by(CheckIn.created_at.desc())
         )
-        checkin_result = await session.execute(
-            select(CheckIn)
-            .join(checkin_ranked, CheckIn.id == checkin_ranked.c.id)
-            .where(checkin_ranked.c.rn == 1)
-        )
-        latest_checkins_by_user = {
-            checkin.child_id: checkin
-            for checkin in checkin_result.scalars().all()
-        }
+        for checkin in checkin_result.scalars().all():
+            latest_checkins_by_user.setdefault(checkin.child_id, checkin)
 
-        ended_session_ranked = (
-            select(
-                GuardianSession.id.label("id"),
-                func.row_number().over(
-                    partition_by=GuardianSession.user_id,
-                    order_by=GuardianSession.ended_at.desc().nullslast(),
-                ).label("rn"),
-            )
-            .where(
-                GuardianSession.user_id.in_(user_ids),
-                GuardianSession.status != "active",
-                GuardianSession.current_location.isnot(None),
-            )
-            .subquery()
-        )
-        ended_session_result = await session.execute(
-            select(GuardianSession)
-            .join(
-                ended_session_ranked,
-                GuardianSession.id == ended_session_ranked.c.id,
-            )
-            .where(ended_session_ranked.c.rn == 1)
-        )
-        ended_sessions_by_user = {
-            gs.user_id: gs
-            for gs in ended_session_result.scalars().all()
-        }
+        try:
+            from app.services.redis_service import get_json
+        except Exception:
+            get_json = None
 
-        trail_ranked = (
-            select(
-                LocationShare.user_id.label("user_id"),
-                LocationTrailPoint.lat.label("lat"),
-                LocationTrailPoint.lng.label("lng"),
-                LocationTrailPoint.recorded_at.label("recorded_at"),
-                func.row_number().over(
-                    partition_by=LocationShare.user_id,
-                    order_by=LocationTrailPoint.recorded_at.desc(),
-                ).label("rn"),
-            )
-            .join(
-                LocationShare,
-                LocationShare.token == LocationTrailPoint.share_token,
-            )
-            .where(LocationShare.user_id.in_(user_ids))
-            .subquery()
-        )
-        trail_result = await session.execute(
-            select(
-                trail_ranked.c.user_id,
-                trail_ranked.c.lat,
-                trail_ranked.c.lng,
-                trail_ranked.c.recorded_at,
-            ).where(trail_ranked.c.rn == 1)
-        )
-        trail_by_user = {
-            row[0]: (row[1], row[2], row[3])
-            for row in trail_result.all()
-        }
+        for uid in user_ids:
+            telemetry_raw = None
+            if get_json is not None:
+                try:
+                    telemetry_raw = get_json("protected_telemetry", str(uid))
+                except Exception:
+                    telemetry_raw = None
 
-        past_emergency_ranked = (
-            select(
-                EmergencyEvent.id.label("id"),
-                func.row_number().over(
-                    partition_by=EmergencyEvent.user_id,
-                    order_by=EmergencyEvent.created_at.desc(),
-                ).label("rn"),
-            )
-            .where(
-                EmergencyEvent.user_id.in_(user_ids),
-                EmergencyEvent.lat.isnot(None),
-            )
-            .subquery()
-        )
-        past_emergency_result = await session.execute(
-            select(EmergencyEvent)
-            .join(
-                past_emergency_ranked,
-                EmergencyEvent.id == past_emergency_ranked.c.id,
-            )
-            .where(past_emergency_ranked.c.rn == 1)
-        )
-        past_emergencies_by_user = {
-            event.user_id: event
-            for event in past_emergency_result.scalars().all()
-        }
+            active_session = active_sessions_by_user.get(uid)
+            if telemetry_raw is None and active_session:
+                telemetry_raw = active_session.current_location
 
-        active_session_ids = [
-            gs.id for gs in active_sessions_by_user.values()
-        ]
+            device_telemetry, telemetry_updated_at = _fresh_device_telemetry(telemetry_raw, now)
+            device_telemetry_by_user[uid] = device_telemetry
+            telemetry_updated_by_user[uid] = telemetry_updated_at
+
+        missing_location_ids: list[uuid.UUID] = []
+        for uid in user_ids:
+            user = users_by_id.get(uid)
+            if not user:
+                continue
+
+            has_location = False
+            active_emergency = active_emergencies_by_user.get(uid)
+            if active_emergency:
+                if active_emergency.lat is not None and active_emergency.lng is not None:
+                    has_location = True
+                trail = active_emergency.location_trail
+                if trail and isinstance(trail, list):
+                    last_trail = trail[-1]
+                    if (
+                        isinstance(last_trail, dict)
+                        and last_trail.get("lat") is not None
+                        and last_trail.get("lng") is not None
+                    ):
+                        has_location = True
+
+            telemetry = device_telemetry_by_user.get(uid)
+            if (
+                not has_location
+                and telemetry
+                and telemetry.get("lat") is not None
+                and telemetry.get("lng") is not None
+            ):
+                has_location = True
+
+            active_session = active_sessions_by_user.get(uid)
+            if not has_location and active_session and isinstance(active_session.current_location, dict):
+                loc = active_session.current_location
+                if loc.get("lat") is not None and loc.get("lng") is not None:
+                    has_location = True
+
+            if (
+                not has_location
+                and user.last_known_lat is not None
+                and user.last_known_lng is not None
+                and user.last_known_at is not None
+            ):
+                has_location = True
+
+            if not has_location:
+                missing_location_ids.append(uid)
+
+        if missing_location_ids:
+            ended_result = await session.execute(
+                select(GuardianSession)
+                .where(
+                    GuardianSession.user_id.in_(missing_location_ids),
+                    GuardianSession.status != "active",
+                    GuardianSession.current_location.isnot(None),
+                )
+                .order_by(
+                    GuardianSession.ended_at.desc().nullslast(),
+                    GuardianSession.previous_update_at.desc().nullslast(),
+                    GuardianSession.started_at.desc(),
+                )
+            )
+            for gs in ended_result.scalars().all():
+                ended_sessions_by_user.setdefault(gs.user_id, gs)
+
+            trail_result = await session.execute(
+                select(
+                    LocationShare.user_id,
+                    LocationTrailPoint.lat,
+                    LocationTrailPoint.lng,
+                    LocationTrailPoint.recorded_at,
+                )
+                .join(LocationShare, LocationShare.token == LocationTrailPoint.share_token)
+                .where(LocationShare.user_id.in_(missing_location_ids))
+                .order_by(LocationTrailPoint.recorded_at.desc())
+            )
+            for row in trail_result.all():
+                if row[0] not in trail_by_user:
+                    trail_by_user[row[0]] = (row[1], row[2], row[3])
+
+            past_emergency_result = await session.execute(
+                select(EmergencyEvent)
+                .where(
+                    EmergencyEvent.user_id.in_(missing_location_ids),
+                    EmergencyEvent.lat.isnot(None),
+                )
+                .order_by(EmergencyEvent.created_at.desc())
+            )
+            for event in past_emergency_result.scalars().all():
+                past_emergencies_by_user.setdefault(event.user_id, event)
+
+        active_session_ids = [gs.id for gs in active_sessions_by_user.values()]
         if active_session_ids:
             alert_count_result = await session.execute(
-                select(
-                    GuardianAlert.session_id,
-                    func.count(),
-                )
+                select(GuardianAlert.session_id, func.count())
                 .where(GuardianAlert.session_id.in_(active_session_ids))
                 .group_by(GuardianAlert.session_id)
             )
@@ -578,36 +556,15 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
             }
 
     monitored = []
-
     for uid in user_ids:
         user = users_by_id.get(uid)
         if not user:
             continue
 
-        rel_type = "family"
         active_session = active_sessions_by_user.get(uid)
-
-        telemetry_raw = None
-        try:
-            from app.services.redis_service import get_json
-
-            telemetry_raw = get_json("protected_telemetry", str(uid))
-        except Exception:
-            pass
-
-        if telemetry_raw is None and active_session:
-            telemetry_raw = active_session.current_location
-
-        device_telemetry, telemetry_updated_at = _fresh_device_telemetry(
-            telemetry_raw,
-            now,
-        )
-        battery_pct = (
-            device_telemetry.get("battery_pct")
-            if device_telemetry is not None
-            else None
-        )
-
+        device_telemetry = device_telemetry_by_user.get(uid)
+        telemetry_updated_at = telemetry_updated_by_user.get(uid)
+        battery_pct = device_telemetry.get("battery_pct") if device_telemetry is not None else None
         active_emergency = active_emergencies_by_user.get(uid)
         latest_checkin = latest_checkins_by_user.get(uid)
 
@@ -625,109 +582,71 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
         location_ts = None
         location_type = None
 
-        # 1. Active emergency
         if active_emergency:
-            location = {
-                "lat": active_emergency.lat,
-                "lng": active_emergency.lng,
-            }
-            location_ts = active_emergency.created_at
-            location_type = "emergency"
-            if (
-                active_emergency.location_trail
-                and len(active_emergency.location_trail) > 0
-            ):
+            if active_emergency.lat is not None and active_emergency.lng is not None:
+                location = {"lat": active_emergency.lat, "lng": active_emergency.lng}
+                location_ts = active_emergency.created_at
+                location_type = "emergency"
+            if active_emergency.location_trail and len(active_emergency.location_trail) > 0:
                 last_trail = active_emergency.location_trail[-1]
                 if isinstance(last_trail, dict) and "lat" in last_trail:
-                    location = {
-                        "lat": last_trail["lat"],
-                        "lng": last_trail["lng"],
-                    }
+                    location = {"lat": last_trail["lat"], "lng": last_trail["lng"]}
+                    location_ts = active_emergency.created_at
+                    location_type = "emergency"
 
-        # 2. Fresh protected-device telemetry
         if (
             not location
             and device_telemetry
             and device_telemetry.get("lat") is not None
             and device_telemetry.get("lng") is not None
         ):
-            location = {
-                "lat": device_telemetry["lat"],
-                "lng": device_telemetry["lng"],
-            }
+            location = {"lat": device_telemetry["lat"], "lng": device_telemetry["lng"]}
             location_ts = telemetry_updated_at
             location_type = "live"
 
-        # 3. Active session
         if not location and active_session and active_session.current_location:
             loc = active_session.current_location
             if isinstance(loc, dict) and "lat" in loc:
                 location = {"lat": loc["lat"], "lng": loc["lng"]}
-                location_ts = (
-                    active_session.previous_update_at
-                    or active_session.started_at
-                )
+                location_ts = active_session.previous_update_at or active_session.started_at
                 location_type = "live"
 
-        # 4. Durable protected-device last-known location. These columns are
-        # updated by both passive/background GPS and SOS GPS, so Guardian Home
-        # and Family retain the exact last fix even after Redis expires or the
-        # protected phone goes offline.
         if (
             not location
             and user.last_known_lat is not None
             and user.last_known_lng is not None
             and user.last_known_at is not None
         ):
-            location = {
-                "lat": float(user.last_known_lat),
-                "lng": float(user.last_known_lng),
-            }
+            location = {"lat": float(user.last_known_lat), "lng": float(user.last_known_lng)}
             location_ts = user.last_known_at
             normalized_last_known_at = user.last_known_at
             if normalized_last_known_at.tzinfo is None:
-                normalized_last_known_at = normalized_last_known_at.replace(
-                    tzinfo=timezone.utc,
-                )
+                normalized_last_known_at = normalized_last_known_at.replace(tzinfo=timezone.utc)
             else:
-                normalized_last_known_at = normalized_last_known_at.astimezone(
-                    timezone.utc,
-                )
+                normalized_last_known_at = normalized_last_known_at.astimezone(timezone.utc)
             age = now - normalized_last_known_at
             location_type = (
-                "live"
-                if age <= timedelta(minutes=2)
-                else "recent"
-                if age <= timedelta(hours=24)
+                "live" if age <= timedelta(minutes=2)
+                else "recent" if age <= timedelta(hours=24)
                 else "historical"
             )
 
-        # 5. Last ended session
         if not location:
             last_sess = ended_sessions_by_user.get(uid)
             if last_sess:
                 loc = last_sess.current_location
                 if isinstance(loc, dict) and "lat" in loc:
                     location = {"lat": loc["lat"], "lng": loc["lng"]}
-                    location_ts = (
-                        last_sess.ended_at
-                        or last_sess.previous_update_at
-                        or last_sess.started_at
-                    )
+                    location_ts = last_sess.ended_at or last_sess.previous_update_at or last_sess.started_at
                     location_type = "recent"
 
-        # 6. Last location trail point
         if not location:
             trail_row = trail_by_user.get(uid)
             if trail_row and trail_row[0] is not None:
-                location = {
-                    "lat": trail_row[0],
-                    "lng": trail_row[1],
-                }
+                location = {"lat": trail_row[0], "lng": trail_row[1]}
                 location_ts = trail_row[2]
                 location_type = "recent"
 
-        # 7. Last emergency with coordinates
         if not location:
             past_em = past_emergencies_by_user.get(uid)
             if past_em:
@@ -737,11 +656,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
 
         last_updated = None
         if location_ts:
-            last_updated = (
-                location_ts.isoformat()
-                if hasattr(location_ts, "isoformat")
-                else str(location_ts)
-            )
+            last_updated = location_ts.isoformat() if hasattr(location_ts, "isoformat") else str(location_ts)
         elif active_emergency:
             last_updated = active_emergency.created_at.isoformat()
         elif active_session:
@@ -759,7 +674,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
             "phone": user.phone,
             "is_active": bool(user.is_active),
             "role": user.role,
-            "relationship": rel_type,
+            "relationship": "family",
             "status": status,
             "location": location,
             "location_type": location_type,
@@ -777,10 +692,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
         }
 
         if active_session:
-            dur = round(
-                (now - active_session.started_at).total_seconds() / 60,
-                1,
-            )
+            dur = round((now - active_session.started_at).total_seconds() / 60, 1)
             item["active_session"] = {
                 "session_id": str(active_session.id),
                 "started_at": active_session.started_at.isoformat(),
@@ -793,32 +705,19 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                 "eta_minutes": active_session.eta_minutes,
                 "speed_mps": round(active_session.speed_mps, 2),
                 "speed_kmh": round(active_session.speed_mps * 3.6, 1),
-                "total_distance_m": round(
-                    active_session.total_distance_m,
-                    1,
-                ),
+                "total_distance_m": round(active_session.total_distance_m, 1),
                 "escalation_level": active_session.escalation_level,
                 "is_night": active_session.is_night,
                 "is_idle": active_session.is_idle,
                 "route_deviated": active_session.route_deviated,
                 "location_updates": active_session.location_updates,
-                "alert_count": alert_counts_by_session.get(
-                    active_session.id,
-                    0,
-                ),
+                "alert_count": alert_counts_by_session.get(active_session.id, 0),
             }
-
         monitored.append(item)
 
-    seniors_result = await session.execute(
-        select(Senior).where(Senior.guardian_id == guardian_uuid)
-    )
+    seniors_result = await session.execute(select(Senior).where(Senior.guardian_id == guardian_uuid))
     seniors = [
-        {
-            "senior_id": str(s.id),
-            "name": s.full_name,
-            "age": s.age,
-        }
+        {"senior_id": str(s.id), "name": s.full_name, "age": s.age}
         for s in seniors_result.scalars().all()
     ]
 
@@ -826,13 +725,12 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
         "monitored_users": monitored,
         "seniors": seniors,
         "total_loved_ones": len(monitored) + len(seniors),
-        "active_journeys": sum(
-            1 for m in monitored if m["has_active_session"]
-        ),
+        "active_journeys": sum(1 for m in monitored if m["has_active_session"]),
     }
 
+
 async def get_active_sessions(session: AsyncSession, guardian_email: str, guardian_user_id: str | None = None, user_role: str | None = None) -> list[dict]:
-    """Get all active sessions for guardian's loved ones. Auto-expire stale ones."""
+    """Get all active sessions with batched user and alert hydration."""
     user_ids = await _get_linked_user_ids(session, guardian_email, guardian_user_id, user_role)
     if not user_ids:
         return []
@@ -845,23 +743,43 @@ async def get_active_sessions(session: AsyncSession, guardian_email: str, guardi
     )
     now = datetime.now(timezone.utc)
     STALE_MINUTES = 30
-    sessions = []
+    active_rows = []
+    changed = False
 
     for gs in result.scalars().all():
-        # Auto-expire stale sessions (no telemetry for 30 min)
         last_activity = gs.previous_update_at if gs.previous_update_at else gs.started_at
         minutes_idle = (now - last_activity).total_seconds() / 60
         if minutes_idle > STALE_MINUTES:
             gs.status = "expired"
             gs.ended_at = now
-            await session.flush()
+            changed = True
             continue
+        active_rows.append(gs)
 
-        user_result = await session.execute(select(User).where(User.id == gs.user_id))
-        user = user_result.scalar_one_or_none()
-        ac = await session.execute(
-            select(func.count()).where(GuardianAlert.session_id == gs.id)
-        )
+    if changed:
+        await session.flush()
+    if not active_rows:
+        await session.commit()
+        return []
+
+    user_result = await session.execute(
+        select(User).where(User.id.in_({gs.user_id for gs in active_rows}))
+    )
+    users_by_id = {u.id: u for u in user_result.scalars().all()}
+
+    alert_count_result = await session.execute(
+        select(GuardianAlert.session_id, func.count())
+        .where(GuardianAlert.session_id.in_([gs.id for gs in active_rows]))
+        .group_by(GuardianAlert.session_id)
+    )
+    alert_counts = {
+        session_id: int(count or 0)
+        for session_id, count in alert_count_result.all()
+    }
+
+    sessions = []
+    for gs in active_rows:
+        user = users_by_id.get(gs.user_id)
         sessions.append({
             "session_id": str(gs.id),
             "user_id": str(gs.user_id),
@@ -883,7 +801,7 @@ async def get_active_sessions(session: AsyncSession, guardian_email: str, guardi
             "is_night": gs.is_night,
             "is_idle": gs.is_idle,
             "route_deviated": gs.route_deviated,
-            "alert_count": ac.scalar() or 0,
+            "alert_count": alert_counts.get(gs.id, 0),
         })
 
     await session.commit()
@@ -891,13 +809,13 @@ async def get_active_sessions(session: AsyncSession, guardian_email: str, guardi
     return sessions
 
 
+
 async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50, guardian_user_id: str | None = None, user_role: str | None = None) -> list[dict]:
-    """Get recent alerts for guardian's loved ones (session alerts + check-in help responses)."""
+    """Get recent alerts without per-check-in N+1 user queries."""
     user_ids = await _get_linked_user_ids(session, guardian_email, guardian_user_id, user_role)
-
     alerts_list: list[dict] = []
+    user_names: dict[uuid.UUID, str] = {}
 
-    # ── Part 1: GuardianAlert rows (standalone or session-linked) ──
     if user_ids:
         user_result = await session.execute(select(User).where(User.id.in_(user_ids)))
         user_names = {u.id: u.full_name or u.email for u in user_result.scalars().all()}
@@ -910,13 +828,10 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
             ).order_by(GuardianAlert.created_at.desc()).limit(limit)
         )
         alert_rows = alerts_result.scalars().all()
-
-        # Fallback: if 24h returns empty, get latest 5 regardless of age
         if not alert_rows:
             fallback_result = await session.execute(
-                select(GuardianAlert).where(
-                    GuardianAlert.user_id.in_(user_ids),
-                ).order_by(GuardianAlert.created_at.desc()).limit(5)
+                select(GuardianAlert).where(GuardianAlert.user_id.in_(user_ids))
+                .order_by(GuardianAlert.created_at.desc()).limit(5)
             )
             alert_rows = fallback_result.scalars().all()
 
@@ -940,39 +855,47 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
                 "acked_at": a.acked_at.isoformat() if a.acked_at else None,
             })
 
-    # ── Part 2: Check-in records (all states — pending, safe, help, expired) ──
-    guardian_user_result = await session.execute(
-        select(User).where(User.email == guardian_email)
-    )
-    guardian_user = guardian_user_result.scalar_one_or_none()
+    guardian_uuid = None
+    if guardian_user_id:
+        try:
+            guardian_uuid = uuid.UUID(str(guardian_user_id))
+        except (TypeError, ValueError, AttributeError):
+            guardian_uuid = None
+    if guardian_uuid is None and guardian_email:
+        guardian_user_result = await session.execute(select(User).where(User.email == guardian_email))
+        guardian_user = guardian_user_result.scalar_one_or_none()
+        guardian_uuid = guardian_user.id if guardian_user else None
 
-    if guardian_user:
+    if guardian_uuid is not None:
         from app.models.checkin import CheckIn
         cutoff_ci = datetime.now(timezone.utc) - timedelta(hours=24)
         checkin_result = await session.execute(
             select(CheckIn).where(
-                CheckIn.guardian_id == guardian_user.id,
+                CheckIn.guardian_id == guardian_uuid,
                 CheckIn.created_at >= cutoff_ci,
             ).order_by(CheckIn.created_at.desc()).limit(limit)
         )
         ci_rows = checkin_result.scalars().all()
-
-        # Fallback: if 24h returns empty, get latest 5
         if not ci_rows:
             fallback_ci = await session.execute(
-                select(CheckIn).where(
-                    CheckIn.guardian_id == guardian_user.id,
-                ).order_by(CheckIn.created_at.desc()).limit(5)
+                select(CheckIn).where(CheckIn.guardian_id == guardian_uuid)
+                .order_by(CheckIn.created_at.desc()).limit(5)
             )
             ci_rows = fallback_ci.scalars().all()
+
+        missing_child_ids = {
+            ci.child_id for ci in ci_rows
+            if ci.child_id is not None and ci.child_id not in user_names
+        }
+        if missing_child_ids:
+            missing_users_result = await session.execute(select(User).where(User.id.in_(missing_child_ids)))
+            for child in missing_users_result.scalars().all():
+                user_names[child.id] = child.full_name or child.email
+
         CHECKIN_SEVERITY = {"help": "critical", "pending": "medium", "expired": "high", "safe": "low"}
         CHECKIN_TYPE = {"help": "help_requested", "pending": "check_in_pending", "expired": "check_in_expired", "safe": "check_in_safe"}
-
         for ci in ci_rows:
-            child_result = await session.execute(select(User).where(User.id == ci.child_id))
-            child = child_result.scalar_one_or_none()
-            child_name = child.full_name if child else "Unknown"
-
+            child_name = user_names.get(ci.child_id, "Unknown")
             ci_status = ci.status or "pending"
             msg_map = {
                 "help": f"{child_name} needs help! Responded to safety check requesting assistance.",
@@ -980,7 +903,6 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
                 "expired": f"{child_name} did not respond to safety check.",
                 "safe": f"{child_name} confirmed they are safe.",
             }
-
             alerts_list.append({
                 "id": str(ci.id),
                 "session_id": None,
@@ -997,11 +919,7 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
                 "response": ci_status,
             })
 
-    # Sort combined list by created_at descending
     alerts_list.sort(key=lambda x: x.get("created_at") or "", reverse=True)
-
-    # Deduplicate: keep latest per (user_name + alert_type + session_id)
-    # Exception: check_in_pending/check_in_request always pass through
     seen = set()
     deduped = []
     for a in alerts_list:
@@ -1012,20 +930,16 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
         if key not in seen:
             seen.add(key)
             deduped.append(a)
-
     logger.info(f"ALERTS_FETCH guardian={guardian_email} raw={len(alerts_list)} deduped={len(deduped)}")
     return deduped[:limit]
 
 
+
 async def get_session_history(session: AsyncSession, guardian_email: str, limit: int = 20, guardian_user_id: str | None = None, user_role: str | None = None) -> list[dict]:
-    """Get completed journey history for guardian's loved ones."""
+    """Get completed journey history with grouped alert counts."""
     user_ids = await _get_linked_user_ids(session, guardian_email, guardian_user_id, user_role)
     if not user_ids:
         return []
-
-    # Pre-fetch user names
-    user_result = await session.execute(select(User).where(User.id.in_(user_ids)))
-    user_names = {u.id: u.full_name or u.email for u in user_result.scalars().all()}
 
     result = await session.execute(
         select(GuardianSession).where(
@@ -1033,12 +947,25 @@ async def get_session_history(session: AsyncSession, guardian_email: str, limit:
             GuardianSession.status.in_(["ended", "expired"]),
         ).order_by(GuardianSession.ended_at.desc()).limit(limit)
     )
+    rows = result.scalars().all()
+    if not rows:
+        return []
+
+    user_result = await session.execute(select(User).where(User.id.in_({gs.user_id for gs in rows})))
+    user_names = {u.id: u.full_name or u.email for u in user_result.scalars().all()}
+
+    alert_count_result = await session.execute(
+        select(GuardianAlert.session_id, func.count())
+        .where(GuardianAlert.session_id.in_([gs.id for gs in rows]))
+        .group_by(GuardianAlert.session_id)
+    )
+    alert_counts = {
+        session_id: int(count or 0)
+        for session_id, count in alert_count_result.all()
+    }
 
     history = []
-    for gs in result.scalars().all():
-        ac = await session.execute(
-            select(func.count()).where(GuardianAlert.session_id == gs.id)
-        )
+    for gs in rows:
         duration = round(((gs.ended_at or gs.started_at) - gs.started_at).total_seconds() / 60, 1)
         history.append({
             "session_id": str(gs.id),
@@ -1048,11 +975,11 @@ async def get_session_history(session: AsyncSession, guardian_email: str, limit:
             "duration_minutes": duration,
             "max_risk_level": gs.risk_level,
             "total_distance_m": round(gs.total_distance_m, 1),
-            "alert_count": ac.scalar() or 0,
+            "alert_count": alert_counts.get(gs.id, 0),
             "escalation_level": gs.escalation_level,
         })
-
     return history
+
 
 
 async def request_safety_check(session: AsyncSession, session_id: str, guardian_email: str) -> dict:

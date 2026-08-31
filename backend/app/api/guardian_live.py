@@ -293,11 +293,6 @@ _ESC_TIER: dict[str, int] = {
 
 async def _compute_live_risk(session: AsyncSession, user: User):
     now = datetime.now(timezone.utc)
-
-    # Use the same canonical protected-member scope as the Guardian
-    # Dashboard. This keeps Primary Guardian and Co-Parent monitoring
-    # consistent across SSE and polling while excluding monitor-only roles
-    # from the protected-member result set.
     from app.services.guardian_dashboard_engine import _get_linked_user_ids
 
     child_ids = set(
@@ -309,26 +304,158 @@ async def _compute_live_risk(session: AsyncSession, user: User):
             include_checkin_recovery=False,
         )
     )
+    if not child_ids:
+        return []
+
+    user_result = await session.execute(select(User).where(User.id.in_(child_ids)))
+    users_by_id = {row.id: row for row in user_result.scalars().all()}
+
+    session_result = await session.execute(
+        select(GuardianSession)
+        .where(
+            GuardianSession.user_id.in_(child_ids),
+            GuardianSession.status == "active",
+        )
+        .order_by(GuardianSession.started_at.desc())
+    )
+    active_by_user = {}
+    for active in session_result.scalars().all():
+        active_by_user.setdefault(active.user_id, active)
+
+    five_min_ago = now - timedelta(minutes=5)
+    active_session_ids = [active.id for active in active_by_user.values()]
+    recent_alert_counts = {}
+    if active_session_ids:
+        recent_alert_result = await session.execute(
+            select(GuardianAlert.session_id, func.count())
+            .where(
+                GuardianAlert.session_id.in_(active_session_ids),
+                GuardianAlert.created_at >= five_min_ago,
+            )
+            .group_by(GuardianAlert.session_id)
+        )
+        recent_alert_counts = {
+            session_id: int(count or 0)
+            for session_id, count in recent_alert_result.all()
+        }
 
     results = []
     for child_id in child_ids:
         try:
-            row = await _compute_child_risk(session, child_id, now)
-            if row is not None:
-                results.append(row)
-        except Exception as e:  # noqa: BLE001
-            logger.exception(
-                f"[RISK_LIVE] child compute failed child={child_id} err={e}"
-            )
-            # Skip this one, keep the rest of the response intact.
+            child_user = users_by_id.get(child_id)
+            if not child_user:
+                continue
+            active = active_by_user.get(child_id)
+            if not active or not active.current_location:
+                last_known_at = child_user.last_known_at
+                results.append({
+                    "child_id": str(child_id),
+                    "child_name": child_user.full_name or "Unknown",
+                    "risk": "GREEN",
+                    "score": 0,
+                    "factors": ["Not currently tracking"],
+                    "status": "offline",
+                    "last_seen": last_known_at.isoformat() if last_known_at is not None else None,
+                    "lat": float(child_user.last_known_lat) if child_user.last_known_lat is not None else None,
+                    "lng": float(child_user.last_known_lng) if child_user.last_known_lng is not None else None,
+                    "session_id": None,
+                    "is_offline": True,
+                })
+                continue
+
+            loc = active.current_location
+            if not isinstance(loc, dict):
+                results.append({
+                    "child_id": str(child_id), "child_name": child_user.full_name or "Unknown",
+                    "risk": "GREEN", "score": 0, "factors": ["Location data malformed"],
+                    "status": "degraded", "last_seen": None, "lat": None, "lng": None,
+                    "session_id": str(active.id), "is_offline": True,
+                })
+                continue
+
+            lat = loc.get("lat") or loc.get("latitude")
+            lng = loc.get("lng") or loc.get("longitude")
+            if lat is None or lng is None:
+                results.append({
+                    "child_id": str(child_id), "child_name": child_user.full_name or "Unknown",
+                    "risk": "GREEN", "score": 0, "factors": ["No location fix yet"],
+                    "status": "tracking_no_fix", "last_seen": None, "lat": None, "lng": None,
+                    "session_id": str(active.id), "is_offline": False,
+                })
+                continue
+
+            score = 0
+            factors: list[str] = []
+            last_update_s = 999
+            if active.previous_update_at:
+                last_update_s = (now - active.previous_update_at).total_seconds()
+            if last_update_s > 60:
+                score += 4
+                factors.append(f"No update in {int(last_update_s)}s")
+            elif last_update_s > 30:
+                score += 2
+                factors.append(f"Stale location ({int(last_update_s)}s)")
+
+            if active.is_night:
+                score += 2
+                factors.append("Night time travel")
+            if active.route_deviated:
+                score += 3
+                factors.append("Route deviated")
+            elif active.speed_mps and active.speed_mps > 25:
+                score += 3
+                factors.append(f"High speed ({round(active.speed_mps * 3.6)}km/h)")
+            elif active.is_idle and last_update_s > 120:
+                score += 1
+                factors.append("Idle for extended period")
+
+            recent_alert_count = recent_alert_counts.get(active.id, 0)
+            if recent_alert_count > 0:
+                score += 5
+                factors.append(f"{recent_alert_count} alert(s) in last 5 min")
+
+            esc_raw = active.escalation_level
+            esc_tier = 0
+            if isinstance(esc_raw, str):
+                esc_tier = _ESC_TIER.get(esc_raw.lower(), 0)
+            elif isinstance(esc_raw, (int, float)):
+                esc_tier = int(esc_raw)
+            if esc_tier >= 2:
+                score += 2
+                factors.append(f"Escalation: {esc_raw}")
+
+            if score >= 9:
+                risk = "CRITICAL"
+            elif score >= 7:
+                risk = "RED"
+            elif score >= 4:
+                risk = "YELLOW"
+            else:
+                risk = "GREEN"
+
+            results.append({
+                "child_id": str(child_id),
+                "child_name": child_user.full_name or child_user.email,
+                "lat": float(lat),
+                "lng": float(lng),
+                "risk": risk,
+                "score": score,
+                "factors": factors,
+                "speed_kmh": round(active.speed_mps * 3.6, 1) if active.speed_mps else 0,
+                "last_updated": active.previous_update_at.isoformat() if active.previous_update_at else now.isoformat(),
+            })
+        except Exception as exc:
+            logger.exception(f"[RISK_LIVE] child compute failed child={child_id} err={exc}")
             continue
 
-    logger.info(f"[RISK_LIVE] guardian={user.id} children={len(results)} "
-                f"red={sum(1 for r in results if r['risk']=='RED')} "
-                f"yellow={sum(1 for r in results if r['risk']=='YELLOW')} "
-                f"green={sum(1 for r in results if r['risk']=='GREEN')}")
-
+    logger.info(
+        f"[RISK_LIVE] guardian={user.id} children={len(results)} "
+        f"red={sum(1 for r in results if r['risk']=='RED')} "
+        f"yellow={sum(1 for r in results if r['risk']=='YELLOW')} "
+        f"green={sum(1 for r in results if r['risk']=='GREEN')}"
+    )
     return results
+
 
 
 async def _compute_child_risk(session: AsyncSession, child_id, now):
