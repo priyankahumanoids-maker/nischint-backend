@@ -8,12 +8,15 @@ account used by the mobile application.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
+import secrets
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +25,8 @@ from app.api.deps import get_current_user, get_current_user_active, get_db_sessi
 from app.core.product_roles import is_guardian_monitor, normalize_role
 from app.models.user import User
 from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/senior/medicine", tags=["senior-medicine"])
 
@@ -270,6 +275,482 @@ async def _schedule_owner(session: AsyncSession, schedule_id: uuid.UUID) -> uuid
     return owner
 
 
+async def _ensure_medicine_notification_table(session: AsyncSession) -> None:
+    """Create the idempotency ledger used only for medicine push delivery.
+
+    Existing medication schedule/dose tables stay untouched. The unique key is
+    per recipient, so one unavailable co-parent can retry without re-notifying
+    guardians who already received the same event.
+    """
+    await session.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS medication_notification_events (
+                id UUID PRIMARY KEY,
+                schedule_id UUID NOT NULL,
+                protected_user_id UUID NOT NULL,
+                recipient_user_id UUID NOT NULL,
+                scheduled_for TIMESTAMPTZ NOT NULL,
+                kind VARCHAR(48) NOT NULL,
+                sent_at TIMESTAMPTZ NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (schedule_id, recipient_user_id, scheduled_for, kind)
+            )
+            """
+        )
+    )
+
+
+async def _claim_medicine_notification(
+    session: AsyncSession,
+    *,
+    schedule_id: uuid.UUID,
+    protected_user_id: uuid.UUID,
+    recipient_user_id: uuid.UUID,
+    scheduled_for: datetime,
+    kind: str,
+) -> uuid.UUID | None:
+    await _ensure_medicine_notification_table(session)
+    notification_id = uuid.uuid4()
+    return (
+        await session.execute(
+            text(
+                """
+                INSERT INTO medication_notification_events
+                    (id, schedule_id, protected_user_id, recipient_user_id,
+                     scheduled_for, kind)
+                VALUES
+                    (:id, :schedule_id, :protected_user_id, :recipient_user_id,
+                     :scheduled_for, :kind)
+                ON CONFLICT (schedule_id, recipient_user_id, scheduled_for, kind)
+                DO NOTHING
+                RETURNING id
+                """
+            ),
+            {
+                "id": notification_id,
+                "schedule_id": schedule_id,
+                "protected_user_id": protected_user_id,
+                "recipient_user_id": recipient_user_id,
+                "scheduled_for": scheduled_for,
+                "kind": kind,
+            },
+        )
+    ).scalar_one_or_none()
+
+
+async def _finish_medicine_notification(
+    session: AsyncSession,
+    notification_id: uuid.UUID,
+    *,
+    success: bool,
+) -> None:
+    if success:
+        await session.execute(
+            text(
+                """
+                UPDATE medication_notification_events
+                SET sent_at = NOW()
+                WHERE id = :id
+                """
+            ),
+            {"id": notification_id},
+        )
+    else:
+        # No successful push means the next scheduler/status retry may try again.
+        await session.execute(
+            text("DELETE FROM medication_notification_events WHERE id = :id"),
+            {"id": notification_id},
+        )
+    await session.commit()
+
+
+async def _medicine_guardian_ids(
+    session: AsyncSession,
+    protected_user_id: uuid.UUID,
+) -> list[uuid.UUID]:
+    """Primary guardian + active co-parent/co-guardian accounts for a member."""
+    ordered: list[uuid.UUID] = []
+
+    def add(value: object) -> None:
+        if not value:
+            return
+        try:
+            parsed = uuid.UUID(str(value))
+        except (TypeError, ValueError, AttributeError):
+            return
+        if parsed not in ordered:
+            ordered.append(parsed)
+
+    primary = (
+        await session.execute(
+            text("SELECT guardian_id FROM users WHERE id = :uid"),
+            {"uid": protected_user_id},
+        )
+    ).scalar_one_or_none()
+    add(primary)
+
+    # Active Guardian Network links cover explicit guardian/co-guardian links.
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT guardian_user_id
+                FROM guardian_relationships
+                WHERE user_id = :uid
+                  AND is_active = TRUE
+                  AND guardian_user_id IS NOT NULL
+                ORDER BY is_primary DESC, priority ASC
+                """
+            ),
+            {"uid": protected_user_id},
+        )
+    ).fetchall()
+    for row in rows:
+        add(getattr(row, "guardian_user_id", None))
+
+    # Family-invite co-parent accounts may be represented by users.guardian_id
+    # -> primary guardian even when no GuardianRelationship row exists.
+    if primary:
+        co_rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM users
+                    WHERE guardian_id = :primary_id
+                      AND is_active = TRUE
+                      AND LOWER(REPLACE(COALESCE(role, ''), '-', '_'))
+                          IN ('co_parent', 'coparent', 'co_guardian')
+                    ORDER BY created_at ASC
+                    """
+                ),
+                {"primary_id": primary},
+            )
+        ).fetchall()
+        for row in co_rows:
+            add(getattr(row, "id", None))
+
+    return ordered
+
+
+async def _push_medicine_event(
+    session: AsyncSession,
+    recipient_user_id: uuid.UUID,
+    *,
+    title: str,
+    body: str,
+    data: dict,
+) -> bool:
+    try:
+        from app.services.push_service import send_push_to_user
+        sent = await send_push_to_user(
+            session,
+            recipient_user_id,
+            title,
+            body,
+            data=data,
+        )
+        return int(sent or 0) > 0
+    except Exception:
+        logger.exception(
+            "[MEDICINE_PUSH] recipient=%s event=%s failed",
+            recipient_user_id,
+            data.get("eventType") or data.get("type"),
+        )
+        return False
+
+
+async def _deliver_due_reminder(
+    session: AsyncSession,
+    *,
+    schedule_id: uuid.UUID,
+    protected_user_id: uuid.UUID,
+    medicine_name: str,
+    dosage: str,
+    scheduled_for: datetime,
+) -> bool:
+    claim = await _claim_medicine_notification(
+        session,
+        schedule_id=schedule_id,
+        protected_user_id=protected_user_id,
+        recipient_user_id=protected_user_id,
+        scheduled_for=scheduled_for,
+        kind="due",
+    )
+    if not claim:
+        return False
+    await session.commit()  # claim before FCM so concurrent workers cannot duplicate
+
+    ok = await _push_medicine_event(
+        session,
+        protected_user_id,
+        title="Medicine Reminder",
+        body=f"Time to take {medicine_name} ({dosage}).",
+        data={
+            "eventType": "medicine_due",
+            "type": "medicine_due",
+            "screen": "medicine",
+            "protected_member_id": str(protected_user_id),
+            "schedule_id": str(schedule_id),
+            "scheduled_for": scheduled_for.isoformat(),
+            "medicine": medicine_name,
+            "dosage": dosage,
+            "status": "due",
+        },
+    )
+    await _finish_medicine_notification(session, claim, success=ok)
+    return ok
+
+
+async def _schedule_name(session: AsyncSession, schedule_id: uuid.UUID) -> str:
+    value = (
+        await session.execute(
+            text("SELECT name FROM medication_schedules WHERE id = :id"),
+            {"id": schedule_id},
+        )
+    ).scalar_one_or_none()
+    return str(value or "Medicine").strip() or "Medicine"
+
+
+async def _protected_name(session: AsyncSession, protected_user_id: uuid.UUID) -> str:
+    value = (
+        await session.execute(
+            text("SELECT full_name FROM users WHERE id = :uid"),
+            {"uid": protected_user_id},
+        )
+    ).scalar_one_or_none()
+    return str(value or "Protected member").strip() or "Protected member"
+
+
+async def _deliver_status_to_guardians(
+    session: AsyncSession,
+    *,
+    schedule_id: uuid.UUID,
+    protected_user_id: uuid.UUID,
+    scheduled_for: datetime,
+    dose_status: str,
+    medicine_name: str | None = None,
+) -> int:
+    normalized = str(dose_status or "").strip().lower()
+    if normalized not in _ALLOWED_DOSE_STATUSES:
+        return 0
+
+    name = medicine_name or await _schedule_name(session, schedule_id)
+    protected_name = await _protected_name(session, protected_user_id)
+    guardian_ids = await _medicine_guardian_ids(session, protected_user_id)
+    delivered = 0
+
+    for guardian_id in guardian_ids:
+        claim = await _claim_medicine_notification(
+            session,
+            schedule_id=schedule_id,
+            protected_user_id=protected_user_id,
+            recipient_user_id=guardian_id,
+            scheduled_for=scheduled_for,
+            kind=f"status:{normalized}",
+        )
+        if not claim:
+            continue
+        await session.commit()
+
+        ok = await _push_medicine_event(
+            session,
+            guardian_id,
+            title=f"{protected_name} - Medicine {normalized.title()}",
+            body=f"{name} was marked as {normalized}.",
+            data={
+                "eventType": "medicine_status",
+                "type": "medicine_status",
+                "screen": "medicine",
+                "protected_member_id": str(protected_user_id),
+                "schedule_id": str(schedule_id),
+                "scheduled_for": scheduled_for.isoformat(),
+                "medicine": name,
+                "status": normalized,
+            },
+        )
+        await _finish_medicine_notification(session, claim, success=ok)
+        delivered += int(ok)
+
+    return delivered
+
+
+def _schedule_days(value: object) -> set[int]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            value = []
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+    days: set[int] = set()
+    for item in value:
+        try:
+            day = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= day <= 6:
+            days.add(day)
+    return days
+
+
+def _scheduled_instant(row, local_day: date) -> datetime | None:
+    if row.starts_on and local_day < row.starts_on:
+        return None
+    if row.ends_on and local_day > row.ends_on:
+        return None
+    days = _schedule_days(row.days_of_week)
+    if days and local_day.weekday() not in days:
+        return None
+    try:
+        zone = ZoneInfo(row.timezone or "Asia/Kolkata")
+        hour, minute = [int(part) for part in str(row.time_of_day).split(":", 1)]
+        return datetime.combine(local_day, time(hour, minute), tzinfo=zone).astimezone(timezone.utc)
+    except Exception:
+        logger.exception("[MEDICINE_SCHEDULER] invalid schedule id=%s", row.id)
+        return None
+
+
+@router.post("/internal/process-reminders")
+async def process_medicine_reminders(
+    x_nischint_scheduler_token: str | None = Header(
+        default=None,
+        alias="X-Nischint-Scheduler-Token",
+    ),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Idempotent Cloud Scheduler entry point for due + missed medicine events."""
+    expected = str(os.getenv("NISCHINT_MEDICINE_SCHEDULER_TOKEN", "")).strip()
+    supplied = str(x_nischint_scheduler_token or "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Medicine scheduler token is not configured")
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=403, detail="Invalid scheduler token")
+
+    await _ensure_medicine_notification_table(session)
+    await session.commit()
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT id, user_id, name, dosage, time_of_day, timezone,
+                       days_of_week, starts_on, ends_on
+                FROM medication_schedules
+                WHERE is_active = TRUE
+                """
+            )
+        )
+    ).fetchall()
+
+    now_utc = datetime.now(timezone.utc)
+    due_sent = 0
+    missed_created = 0
+    guardian_status_pushes = 0
+
+    for row in rows:
+        try:
+            schedule_id = uuid.UUID(str(row.id))
+            protected_user_id = uuid.UUID(str(row.user_id))
+            zone = ZoneInfo(row.timezone or "Asia/Kolkata")
+            local_today = now_utc.astimezone(zone).date()
+        except Exception:
+            logger.exception("[MEDICINE_SCHEDULER] invalid schedule identity id=%s", getattr(row, "id", None))
+            continue
+
+        # Yesterday is included so a brief scheduler outage around midnight cannot
+        # permanently lose a missed-dose transition.
+        for local_day in (local_today, local_today - timedelta(days=1)):
+            scheduled_for = _scheduled_instant(row, local_day)
+            if not scheduled_for:
+                continue
+            age = now_utc - scheduled_for
+            if age.total_seconds() < 0 or age >= timedelta(hours=24):
+                continue
+
+            existing = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT status
+                        FROM medication_dose_events
+                        WHERE schedule_id = :schedule_id
+                          AND scheduled_for = :scheduled_for
+                        """
+                    ),
+                    {"schedule_id": schedule_id, "scheduled_for": scheduled_for},
+                )
+            ).first()
+
+            if existing:
+                guardian_status_pushes += await _deliver_status_to_guardians(
+                    session,
+                    schedule_id=schedule_id,
+                    protected_user_id=protected_user_id,
+                    scheduled_for=scheduled_for,
+                    dose_status=str(existing.status or ""),
+                    medicine_name=str(row.name or "Medicine"),
+                )
+                continue
+
+            if age < timedelta(minutes=30):
+                due_sent += int(
+                    await _deliver_due_reminder(
+                        session,
+                        schedule_id=schedule_id,
+                        protected_user_id=protected_user_id,
+                        medicine_name=str(row.name or "Medicine"),
+                        dosage=str(row.dosage or ""),
+                        scheduled_for=scheduled_for,
+                    )
+                )
+                continue
+
+            inserted = (
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO medication_dose_events
+                            (id, schedule_id, user_id, scheduled_for, status,
+                             responded_at, responded_by, notes, updated_at)
+                        VALUES
+                            (:id, :schedule_id, :user_id, :scheduled_for,
+                             'missed', NOW(), NULL,
+                             'Automatically marked missed after 30 minutes', NOW())
+                        ON CONFLICT (schedule_id, scheduled_for) DO NOTHING
+                        RETURNING id
+                        """
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "schedule_id": schedule_id,
+                        "user_id": protected_user_id,
+                        "scheduled_for": scheduled_for,
+                    },
+                )
+            ).scalar_one_or_none()
+            await session.commit()
+            missed_created += int(bool(inserted))
+
+            guardian_status_pushes += await _deliver_status_to_guardians(
+                session,
+                schedule_id=schedule_id,
+                protected_user_id=protected_user_id,
+                scheduled_for=scheduled_for,
+                dose_status="missed",
+                medicine_name=str(row.name or "Medicine"),
+            )
+
+    return {
+        "ok": True,
+        "schedules_checked": len(rows),
+        "due_notifications_sent": due_sent,
+        "missed_events_created": missed_created,
+        "guardian_status_pushes_sent": guardian_status_pushes,
+        "processed_at": now_utc.isoformat(),
+    }
+
+
 @router.get("")
 async def get_medicine_plan(
     user_id: str | None = Query(default=None),
@@ -481,8 +962,18 @@ async def record_dose_status(
             "notes": payload.notes.strip() if payload.notes else None,
         },
     )
+    # Persist the dose first. Push delivery is best-effort and idempotent.
+    await session.commit()
+    guardians_notified = await _deliver_status_to_guardians(
+        session,
+        schedule_id=sid,
+        protected_user_id=owner_id,
+        scheduled_for=scheduled_for,
+        dose_status=dose_status,
+    )
     return {
         "schedule_id": str(sid),
         "scheduled_for": scheduled_for.isoformat(),
         "status": dose_status,
+        "guardians_notified": guardians_notified,
     }
