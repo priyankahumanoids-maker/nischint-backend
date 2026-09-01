@@ -17,17 +17,47 @@ from app.models.guardian_network import GuardianRelationship
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/guardian/live", tags=["Guardian Live Map"])
 
+# Guardian/caregiver accounts are family controllers, not protected members.
+# Keep this list aligned with the protected roles exposed by the mobile app.
+_PROTECTED_MEMBER_ROLES = {
+    "child",
+    "kid",
+    "woman",
+    "women",
+    "senior",
+    "elder",
+    "elderly",
+    "dependent",
+    "ward",
+    "protectedmember",
+    "familymember",
+}
+
+
+def _normalized_role(value) -> str:
+    return str(value or "").strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _is_protected_member(user: User) -> bool:
+    return _normalized_role(getattr(user, "role", None)) in _PROTECTED_MEMBER_ROLES
+
 
 @router.get("/protected-users")
 async def get_protected_users(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    """Get all users this guardian protects, with basic live status.
-    Includes self for personal safety monitoring."""
+    """Return only actual protected members for the guardian live/protection UI.
+
+    Guardian, parent, caregiver, co-parent, and self accounts are deliberately
+    excluded from this collection. Personal self-safety remains supported by
+    the dedicated status endpoint, but self is not a protected-member card.
+    """
     users = []
 
-    # 1. Users where current user is listed as guardian (via User.guardian_id)
+    # User.guardian_id is a relationship pointer and can also be present on
+    # caregiver/co-parent records. Filter by protected role before exposing a
+    # record as a protected member.
     rels = (await session.execute(
         select(User).where(and_(
             User.guardian_id == user.id,
@@ -37,7 +67,7 @@ async def get_protected_users(
 
     seen_ids = set()
     for u in rels:
-        if u.id in seen_ids:
+        if u.id in seen_ids or not _is_protected_member(u):
             continue
         seen_ids.add(u.id)
 
@@ -52,31 +82,12 @@ async def get_protected_users(
             "user_id": str(u.id),
             "name": u.full_name or u.email,
             "email": u.email,
+            "role": u.role,
             "relationship": "family",
             "has_active_session": active is not None,
             "risk_level": active.risk_level if active else "SAFE",
             "risk_score": round(active.risk_score, 1) if active else 0,
             "is_self": False,
-        })
-
-    # 2. Always include self for personal safety monitoring
-    if user.id not in seen_ids:
-        self_active = (await session.execute(
-            select(GuardianSession).where(and_(
-                GuardianSession.user_id == user.id,
-                GuardianSession.status == "active",
-            )).limit(1)
-        )).scalar_one_or_none()
-
-        users.insert(0, {
-            "user_id": str(user.id),
-            "name": f"{user.full_name or user.email} (You)",
-            "email": user.email,
-            "relationship": "self",
-            "has_active_session": self_active is not None,
-            "risk_level": self_active.risk_level if self_active else "SAFE",
-            "risk_score": round(self_active.risk_score, 1) if self_active else 0,
-            "is_self": True,
         })
 
     return {"protected_users": users, "count": len(users)}
@@ -107,8 +118,12 @@ async def get_live_status(
 
         if not rel:
             raise HTTPException(403, "You are not a guardian of this user")
+        if not _is_protected_member(rel):
+            raise HTTPException(403, "This account is not a protected member")
         relationship = "family"
     else:
+        # Preserve the existing personal self-safety status path without
+        # advertising the guardian as a protected-member card.
         relationship = "self"
 
     # Get target user info
