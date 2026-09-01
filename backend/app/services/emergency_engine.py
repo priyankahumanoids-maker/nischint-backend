@@ -21,6 +21,111 @@ from app.services.event_broadcaster import broadcaster
 logger = logging.getLogger(__name__)
 
 
+_sos_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_sos_background(coro, *, label: str) -> None:
+    """Run non-realtime notification work without holding the SOS HTTP path."""
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError as exc:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        logger.warning("[SOS_BACKGROUND_NOTIFY] schedule failed label=%s error=%s", label, exc)
+        return
+
+    _sos_background_tasks.add(task)
+
+    def _done(done_task: asyncio.Task) -> None:
+        _sos_background_tasks.discard(done_task)
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            logger.warning("[SOS_BACKGROUND_NOTIFY] cancelled label=%s", label)
+        except Exception as exc:
+            logger.warning("[SOS_BACKGROUND_NOTIFY] failed label=%s error=%s", label, exc)
+
+    task.add_done_callback(_done)
+
+
+async def _notify_guardians_background(
+    user_id: str,
+    event_id: str,
+    lat: float,
+    lng: float,
+    trigger_source: str,
+    timestamp: datetime,
+) -> None:
+    """Legacy push/SMS fan-out on a fresh DB session, never the SOS request session."""
+    from app.db.session import async_session
+
+    async with async_session() as bg_session:
+        await _notify_guardians(
+            bg_session,
+            user_id,
+            event_id,
+            lat,
+            lng,
+            trigger_source,
+            timestamp,
+        )
+        await bg_session.commit()
+
+
+async def _notify_guardians_all_clear_background(
+    user_id: str,
+    event_id: str,
+    status: str,
+) -> None:
+    """All-clear push on a fresh DB session; SSE has already been sent."""
+    from app.db.session import async_session
+
+    async with async_session() as bg_session:
+        await _notify_guardians_all_clear(bg_session, user_id, event_id, status)
+        await bg_session.commit()
+
+
+async def _dispatch_repeat_sos_background(
+    *,
+    event_id: str,
+    user_id: str,
+    lat: float,
+    lng: float,
+    trigger_source: str,
+    repeat_id: str,
+) -> None:
+    """Persist + push a repeat SOS after the realtime SSE lane has returned."""
+    from app.db.session import async_session
+    from app.services.alert_trigger import trigger_alert
+
+    async with async_session() as bg_session:
+        await trigger_alert(
+            bg_session,
+            kind="sos",
+            user_id=user_id,
+            severity="critical",
+            message="Emergency SOS triggered again",
+            details=f"Repeated SOS tap. Trigger: {trigger_source}",
+            location={"lat": lat, "lng": lng},
+            sse_event_type="emergency_triggered",
+            sse_payload_extras={
+                "event": "SOS_TRIGGERED",
+                "event_id": event_id,
+                "repeat_trigger_id": repeat_id,
+                "trigger_source": trigger_source,
+                "severity_level": 2,
+                "is_repeat": True,
+            },
+            louder=True,
+            idempotency_key=None,
+            cooldown_s=0,
+            suppress_co_located=False,
+        )
+        await bg_session.commit()
+
+
 async def notify_repeat_sos(
     session: AsyncSession,
     event_id: str,
@@ -29,56 +134,63 @@ async def notify_repeat_sos(
     lng: float,
     trigger_source: str,
 ) -> dict:
-    """Fan out every deliberate repeat SOS tap without creating another event."""
-    from app.services.alert_trigger import trigger_alert
-
+    """Realtime repeat SOS: SSE now, durable/push fan-out in background."""
     repeat_id = str(uuid.uuid4())
-    result = await trigger_alert(
-        session,
-        kind="sos",
-        user_id=user_id,
-        severity="critical",
-        message="Emergency SOS triggered again",
-        details=f"Repeated SOS tap. Trigger: {trigger_source}",
-        location={"lat": lat, "lng": lng},
-        sse_event_type="emergency_triggered",
-        sse_payload_extras={
-            "event": "SOS_TRIGGERED",
-            "event_id": event_id,
-            "repeat_trigger_id": repeat_id,
-            "trigger_source": trigger_source,
-            "severity_level": 2,
-            "is_repeat": True,
-        },
-        louder=True,
-        idempotency_key=None,
-        cooldown_s=0,
-        suppress_co_located=False,
-    )
-    await broadcaster.broadcast_to_operators("emergency_triggered", {
+
+    try:
+        from app.services.alert_trigger import _resolve_guardian_ids
+        guardian_ids, child_name = await _resolve_guardian_ids(session, user_id)
+    except Exception as exc:
+        guardian_ids, child_name = [], "Protected member"
+        logger.warning("[SOS_REPEAT_FAST] guardian resolution failed event=%s error=%s", event_id, exc)
+
+    payload = {
         "event": "SOS_TRIGGERED",
         "event_id": event_id,
+        "repeat_trigger_id": repeat_id,
+        "trigger_source": trigger_source,
+        "severity_level": 2,
+        "severity": "critical",
+        "is_repeat": True,
         "child_id": user_id,
         "user_id": user_id,
+        "child_name": child_name or "Protected member",
         "lat": lat,
         "lng": lng,
-        "trigger_source": trigger_source,
-        "repeat_trigger_id": repeat_id,
-        "is_repeat": True,
-    })
-    await broadcaster.broadcast_to_user(user_id, "emergency_triggered", {
-        "event": "SOS_TRIGGERED",
-        "event_id": event_id,
-        "repeat_trigger_id": repeat_id,
-        "is_repeat": True,
-    })
+        "message": f"EMERGENCY: {child_name or 'Protected member'} triggered SOS again!",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fast_lane": True,
+    }
+
+    await asyncio.gather(
+        broadcaster.broadcast_to_operators("emergency_triggered", payload),
+        broadcaster.broadcast_to_user(user_id, "emergency_triggered", payload),
+        *(
+            broadcaster.broadcast_to_user(gid, "emergency_triggered", payload)
+            for gid in guardian_ids
+        ),
+        return_exceptions=True,
+    )
+
+    _spawn_sos_background(
+        _dispatch_repeat_sos_background(
+            event_id=event_id,
+            user_id=user_id,
+            lat=lat,
+            lng=lng,
+            trigger_source=trigger_source,
+            repeat_id=repeat_id,
+        ),
+        label=f"repeat:{event_id}",
+    )
+
     logger.warning(
-        "Repeated SOS dispatched: event=%s user=%s guardians=%s",
+        "[SOS_REPEAT_FAST] event=%s child=%s guardians=%s",
         event_id,
         user_id,
-        result.guardians_notified,
+        guardian_ids,
     )
-    return {"guardians_notified": result.guardians_notified, "repeat_trigger_id": repeat_id}
+    return {"guardians_notified": len(guardian_ids), "repeat_trigger_id": repeat_id}
 
 
 # ── SOS Trigger (immediate) ──
@@ -121,17 +233,19 @@ async def trigger_silent_sos(
 
     event_id = str(event.id)
 
-    # P0 realtime fast lane. Do not make the primary guardian's in-app SOS
-    # wait behind FCM, SMS, or the full compatibility fan-out.
+    # P0 realtime fast lane V6.3. Use the canonical guardian resolver so
+    # primary guardian, co-parent and accepted relationship paths match the
+    # already-working resolve flow. This lane deliberately runs before push/SMS.
+    fast_guardian_ids: list[str] = []
+    child_name_fast = "Protected member"
     try:
-        from app.core.product_roles import is_co_guardian
+        from app.services.alert_trigger import _resolve_guardian_ids
 
-        child_fast = await session.get(User, uuid.UUID(user_id))
-        child_name_fast = (
-            child_fast.full_name
-            if child_fast and child_fast.full_name
-            else "Protected member"
+        fast_guardian_ids, child_name_fast = await _resolve_guardian_ids(
+            session,
+            user_id,
         )
+        child_name_fast = child_name_fast or "Protected member"
 
         fast_payload = {
             "event": "SOS_TRIGGERED",
@@ -149,63 +263,31 @@ async def trigger_silent_sos(
             "fast_lane": True,
         }
 
-        fast_guardian_ids: list[str] = []
-
-        if child_fast and child_fast.guardian_id:
-            primary_id = str(child_fast.guardian_id)
-            fast_guardian_ids.append(primary_id)
-
-            await broadcaster.broadcast_to_user(
-                primary_id,
-                "emergency_triggered",
-                fast_payload,
-            )
-
-            co_parent_rows = (
-                await session.execute(
-                    select(User).where(
-                        User.guardian_id == child_fast.guardian_id,
-                        User.is_active.is_(True),
-                    )
+        await asyncio.gather(
+            broadcaster.broadcast_to_user(user_id, "emergency_triggered", fast_payload),
+            *(
+                broadcaster.broadcast_to_user(
+                    guardian_id,
+                    "emergency_triggered",
+                    fast_payload,
                 )
-            ).scalars().all()
-
-            co_parent_ids: list[str] = []
-            for candidate in co_parent_rows:
-                if not is_co_guardian(candidate.role):
-                    continue
-                candidate_id = str(candidate.id)
-                if candidate_id in fast_guardian_ids:
-                    continue
-                fast_guardian_ids.append(candidate_id)
-                co_parent_ids.append(candidate_id)
-
-            if co_parent_ids:
-                await asyncio.gather(
-                    *(
-                        broadcaster.broadcast_to_user(
-                            guardian_id,
-                            "emergency_triggered",
-                            fast_payload,
-                        )
-                        for guardian_id in co_parent_ids
-                    ),
-                    return_exceptions=True,
-                )
+                for guardian_id in fast_guardian_ids
+            ),
+            return_exceptions=True,
+        )
 
         logger.warning(
-            "[SOS_FAST_SSE] event=%s child=%s guardians=%s",
+            "[SOS_FAST_SSE_V63] event=%s child=%s guardians=%s",
             event_id,
             user_id,
             fast_guardian_ids,
         )
     except Exception as fast_sse_error:
         logger.warning(
-            "[SOS_FAST_SSE] fallback event=%s error=%s",
+            "[SOS_FAST_SSE_V63] fallback event=%s error=%s",
             event_id,
             fast_sse_error,
         )
-
 
     # ── Migration to unified `trigger_alert` (NISCH-001 Phase 2) ──
     # Behind feature flag `ALERT_TRIGGER_V2_SOS`. When True, the unified
@@ -241,8 +323,9 @@ async def trigger_silent_sos(
             f"[ALERT_TRIGGER_V2] sos dispatched: {result.to_dict()}"
         )
     else:
-        # Legacy path — push + SMS via inline _notify_guardians.
-        notified = await _notify_guardians(session, user_id, event_id, lat, lng, trigger_source, now)
+        # V6.3: realtime guardian recipients are already resolved/sent above.
+        # Push/SMS is intentionally removed from the child SOS HTTP hot path.
+        notified = len(fast_guardian_ids)
 
     # Update notification count
     event.guardians_notified = notified
@@ -270,19 +353,10 @@ async def trigger_silent_sos(
     from app.services.redis_service import invalidate_forecast_grid
     invalidate_forecast_grid(lat, lng)  # Clear stale forecast for this cell
 
-    # ── SSE BROADCAST: operators + child + ALL linked guardians ──
-    from app.models.user import User
+    # ── SSE BROADCAST: realtime first; push/SMS is background-only ──
+    child_name = child_name_fast or "Protected member"
 
-    # Get child's name for the event payload
-    child_result = await session.execute(select(User).where(User.id == uuid.UUID(user_id)))
-    child_user = child_result.scalar_one_or_none()
-    child_name = child_user.full_name if child_user else "Child"
-
-    # Persist exactly ONE guardian-facing alert row. Under ALERT_TRIGGER_V2_SOS
-    # the unified trigger_alert() call above already created GuardianAlert, sent
-    # guardian SSE, and dispatched push/SMS. Creating another row here was the
-    # source of duplicate SOS cards. The legacy path still needs this row because
-    # _notify_guardians() only sends push/SMS.
+    # Persist exactly ONE guardian-facing alert row in the legacy path.
     if not _use_v2:
         from app.models.guardian import GuardianAlert
 
@@ -296,8 +370,21 @@ async def trigger_silent_sos(
         )
         session.add(alert)
 
-    # Commit the EmergencyEvent state and (legacy only) GuardianAlert together.
+    # Durable event + legacy alert row before the slow transport fan-out starts.
     await session.commit()
+
+    if not _use_v2:
+        _spawn_sos_background(
+            _notify_guardians_background(
+                user_id,
+                event_id,
+                lat,
+                lng,
+                trigger_source,
+                now,
+            ),
+            label=f"trigger:{event_id}",
+        )
 
     sse_payload = {
         "event": "SOS_TRIGGERED",
@@ -309,62 +396,58 @@ async def trigger_silent_sos(
         "lng": lng,
         "trigger_source": trigger_source,
         "severity_level": 2,
+        "severity": "critical",
         "guardians_notified": notified,
+        "timestamp": now.isoformat(),
     }
 
-    # Broadcast to operators
+    # Operator audit remains best-effort and does not involve FCM.
     await broadcaster.broadcast_to_operators("emergency_triggered", sse_payload)
 
-    # Broadcast to child's own channel
-    await broadcaster.broadcast_to_user(user_id, "emergency_triggered", {
-        "event": "SOS_TRIGGERED",
-        "event_id": event_id,
-    })
-
-    # Broadcast to ALL linked guardians (check BOTH Guardian table AND Relationship table)
-    # Skipped under V2 — `trigger_alert` already SSE-broadcast to each linked guardian above.
-    from app.models.guardian import Guardian
-    sse_guardian_ids = []
-
-    if not _use_v2:
-        # Source 1: Guardian table (email-based join)
-        g_result = await session.execute(
-            select(Guardian).where(
-                Guardian.user_id == uuid.UUID(user_id),
-                Guardian.is_active.is_(True),
+    # Fast lane already sent to child + guardians. If guardian resolution failed
+    # there, make one canonical fallback attempt here without touching push/SMS.
+    if not _use_v2 and not fast_guardian_ids:
+        try:
+            from app.services.alert_trigger import _resolve_guardian_ids
+            fallback_guardian_ids, fallback_child_name = await _resolve_guardian_ids(
+                session,
+                user_id,
             )
-        )
-        guardian_contacts = g_result.scalars().all()
-        for gc in guardian_contacts:
-            if gc.email:
-                gu_result = await session.execute(select(User).where(User.email == gc.email))
-                guardian_user = gu_result.scalar_one_or_none()
-                if guardian_user:
-                    gid = str(guardian_user.id)
-                    sse_guardian_ids.append(gid)
-                    await broadcaster.broadcast_to_user(gid, "emergency_triggered", sse_payload)
-                    logger.info(f"[EMERGENCY_SSE_SENT] guardian={gc.name} ({gid}) child={user_id} (via Guardian table)")
-                else:
-                    logger.warning(f"[SOS-SSE] Guardian {gc.name} ({gc.email}) has no User account — SMS/push only")
-
-        # Source 2: Relationship table (code-based linking — primary link source)
-        from app.models.relationship import Relationship
-        rel_result = await session.execute(
-            select(Relationship).where(
-                Relationship.child_id == uuid.UUID(user_id),
-                Relationship.status == "accepted",
+            if fallback_child_name:
+                sse_payload["child_name"] = fallback_child_name
+            await asyncio.gather(
+                broadcaster.broadcast_to_user(user_id, "emergency_triggered", sse_payload),
+                *(
+                    broadcaster.broadcast_to_user(
+                        guardian_id,
+                        "emergency_triggered",
+                        sse_payload,
+                    )
+                    for guardian_id in fallback_guardian_ids
+                ),
+                return_exceptions=True,
             )
-        )
-        for rel in rel_result.scalars().all():
-            gid = str(rel.guardian_id)
-            if gid not in sse_guardian_ids:
-                sse_guardian_ids.append(gid)
-                await broadcaster.broadcast_to_user(gid, "emergency_triggered", sse_payload)
-                logger.info(f"[EMERGENCY_SSE_SENT] guardian={gid} child={user_id} (via Relationship table)")
+            fast_guardian_ids = fallback_guardian_ids
+            notified = len(fallback_guardian_ids)
+            event.guardians_notified = notified
+            logger.warning(
+                "[SOS_FAST_SSE_V63] compatibility fallback event=%s guardians=%s",
+                event_id,
+                fallback_guardian_ids,
+            )
+        except Exception as fallback_error:
+            logger.warning(
+                "[SOS_FAST_SSE_V63] compatibility fallback failed event=%s error=%s",
+                event_id,
+                fallback_error,
+            )
 
-        logger.info(f"[SOS-SSE] Total SSE: operators + child + {len(sse_guardian_ids)} guardian(s) — sources: Guardian={len(guardian_contacts)} Relationship={len(sse_guardian_ids) - len([gc for gc in guardian_contacts if gc.email])}")
-    else:
-        logger.info(f"[SOS-SSE] guardian fan-out delegated to trigger_alert (V2). Operators + child still broadcast above.")
+    logger.info(
+        "[SOS_REALTIME_V63] event=%s child=%s realtime_guardians=%s push_sms=background",
+        event_id,
+        user_id,
+        fast_guardian_ids,
+    )
 
     return {
         "event_id": event_id,
@@ -499,15 +582,8 @@ async def cancel_emergency(
     delete_key("emergency", event_id)
     _update_active_list(str(event.user_id), event_id, "remove")
 
-    # Notify guardians of cancellation
-    await _notify_guardians_cancel(session, str(event.user_id), event_id)
-
-    logger.info(f"Emergency CANCELLED: event={event_id}")
-
-    # Broadcast cancellation via SSE to operators + guardians
+    # V6.3: cancellation response is realtime in both directions.
     user_id = str(event.user_id)
-
-    from app.models.user import User
     child_result_c = await session.execute(select(User).where(User.id == event.user_id))
     child_user = child_result_c.scalar_one_or_none()
     child_name = child_user.full_name if child_user else "Child"
@@ -520,17 +596,33 @@ async def cancel_emergency(
         "user_id": user_id,
         "resolved_at": now.isoformat(),
     }
-    await broadcaster.broadcast_to_operators("emergency_cancelled", cancel_payload)
 
     from app.services.alert_trigger import _resolve_guardian_ids
     guardian_ids, _ = await _resolve_guardian_ids(session, user_id)
-    for guardian_id in guardian_ids:
-        await broadcaster.broadcast_to_user(
-            guardian_id,
-            "emergency_cancelled",
-            cancel_payload,
-        )
-    logger.info(f"[SOS-SSE] Cancellation broadcast to operators + guardians")
+    await asyncio.gather(
+        broadcaster.broadcast_to_user(user_id, "emergency_cancelled", cancel_payload),
+        broadcaster.broadcast_to_operators("emergency_cancelled", cancel_payload),
+        *(
+            broadcaster.broadcast_to_user(
+                guardian_id,
+                "emergency_cancelled",
+                cancel_payload,
+            )
+            for guardian_id in guardian_ids
+        ),
+        return_exceptions=True,
+    )
+
+    _spawn_sos_background(
+        _notify_guardians_all_clear_background(user_id, event_id, "cancelled"),
+        label=f"cancel:{event_id}",
+    )
+
+    logger.info(
+        "[SOS_CANCEL_V63] event=%s realtime_guardians=%s push=background",
+        event_id,
+        guardian_ids,
+    )
 
     return {
         "event_id": event_id,
@@ -569,20 +661,8 @@ async def resolve_emergency(
     delete_key("emergency", event_id)
     _update_active_list(str(event.user_id), event_id, "remove")
 
-    if notify_guardians:
-        await _notify_guardians_all_clear(
-            session,
-            str(event.user_id),
-            event_id,
-            "resolved",
-        )
-
-    logger.info(f"Emergency RESOLVED: event={event_id}")
-
-    # Broadcast resolution via SSE to operators + guardians
+    # V6.3: deliver the guardian response to the protected member first.
     user_id = str(event.user_id)
-
-    from app.models.user import User
     child_result_r = await session.execute(select(User).where(User.id == event.user_id))
     child_user = child_result_r.scalar_one_or_none()
     child_name = child_user.full_name if child_user else "Child"
@@ -595,24 +675,35 @@ async def resolve_emergency(
         "user_id": user_id,
         "resolved_at": now.isoformat(),
     }
-    # Send to the protected member too so an already-open SOS screen can
-    # immediately clear its local emergency state.
-    await broadcaster.broadcast_to_user(
-        user_id,
-        "emergency_resolved",
-        resolve_payload,
-    )
-    await broadcaster.broadcast_to_operators("emergency_resolved", resolve_payload)
 
     from app.services.alert_trigger import _resolve_guardian_ids
     guardian_ids, _ = await _resolve_guardian_ids(session, user_id)
-    for guardian_id in guardian_ids:
-        await broadcaster.broadcast_to_user(
-            guardian_id,
-            "emergency_resolved",
-            resolve_payload,
+    await asyncio.gather(
+        broadcaster.broadcast_to_user(user_id, "emergency_resolved", resolve_payload),
+        broadcaster.broadcast_to_operators("emergency_resolved", resolve_payload),
+        *(
+            broadcaster.broadcast_to_user(
+                guardian_id,
+                "emergency_resolved",
+                resolve_payload,
+            )
+            for guardian_id in guardian_ids
+        ),
+        return_exceptions=True,
+    )
+
+    if notify_guardians:
+        _spawn_sos_background(
+            _notify_guardians_all_clear_background(user_id, event_id, "resolved"),
+            label=f"resolve:{event_id}",
         )
-    logger.info(f"[SOS-SSE] Resolution broadcast to operators + guardians")
+
+    logger.info(
+        "[SOS_RESOLVE_V63] event=%s child_realtime=1 guardians=%s push=%s",
+        event_id,
+        guardian_ids,
+        "background" if notify_guardians else "skipped",
+    )
 
     return {
         "event_id": event_id,
