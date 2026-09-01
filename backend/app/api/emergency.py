@@ -256,6 +256,12 @@ async def silent_sos(
         trigger_source=req.trigger_source,
         cancel_pin=req.cancel_pin,
         device_metadata=req.device_metadata,
+        fast_child_name=getattr(user, "full_name", None),
+        fast_primary_guardian_id=(
+            str(user.guardian_id)
+            if getattr(user, "guardian_id", None)
+            else None
+        ),
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])

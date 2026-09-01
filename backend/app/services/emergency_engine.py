@@ -332,6 +332,8 @@ async def trigger_silent_sos(
     trigger_source: str,
     cancel_pin: str | None = None,
     device_metadata: dict | None = None,
+    fast_child_name: str | None = None,
+    fast_primary_guardian_id: str | None = None,
 ) -> dict:
     """
     Create emergency event and notify guardians IMMEDIATELY.
@@ -344,60 +346,148 @@ async def trigger_silent_sos(
     if cancel_pin:
         pin_hash = hashlib.sha256(cancel_pin.encode()).hexdigest()
 
-    # Create emergency event
+    # V6.5: allocate the EmergencyEvent UUID locally so the realtime
+    # payload does not need to wait for a remote database flush.
+    event_uuid = uuid.uuid4()
+
     event = EmergencyEvent(
+        id=event_uuid,
         user_id=uuid.UUID(user_id),
         lat=lat,
         lng=lng,
         trigger_source=trigger_source,
-        severity_level=2,  # distress
+        severity_level=2,
         status="active",
         cancel_pin_hash=pin_hash,
         location_trail=[{"lat": lat, "lng": lng, "ts": now.isoformat()}],
         guardians_notified=0,
         metadata_json=device_metadata,
     )
+
     session.add(event)
-    await session.flush()
+    event_id = str(event_uuid)
 
-    event_id = str(event.id)
+    # V6.5 PRIMARY GUARDIAN FAST LANE
+    #
+    # Authentication, role gating, active-SOS protection and rate limiting
+    # have already completed in the API endpoint before this function runs.
+    #
+    # Reuse the authenticated User's full_name + guardian_id so the first
+    # child/primary-guardian SSE does not require another DB lookup.
+    child_name_fast = fast_child_name or "Protected member"
 
-    # P0 realtime fast lane V6.4.
-    fast_guardian_ids: list[str] = []
-    child_name_fast = "Protected member"
+    fast_payload = {
+        "event": "SOS_TRIGGERED",
+        "event_id": event_id,
+        "child_id": user_id,
+        "child_name": child_name_fast,
+        "user_id": user_id,
+        "lat": lat,
+        "lng": lng,
+        "trigger_source": trigger_source,
+        "severity_level": 2,
+        "severity": "critical",
+        "message": f"EMERGENCY: {child_name_fast} triggered SOS!",
+        "timestamp": now.isoformat(),
+        "fast_lane": True,
+    }
+
+    primary_fast_guardian_ids: list[str] = []
+
     try:
-        fast_guardian_ids, child_name_fast = await _resolve_fast_guardians_v64(
-            session,
-            user_id,
+        primary_guardian_id = (
+            str(fast_primary_guardian_id).strip()
+            if fast_primary_guardian_id
+            else ""
         )
 
-        fast_payload = {
-            "event": "SOS_TRIGGERED",
-            "event_id": event_id,
-            "child_id": user_id,
-            "child_name": child_name_fast,
-            "user_id": user_id,
-            "lat": lat,
-            "lng": lng,
-            "trigger_source": trigger_source,
-            "severity_level": 2,
-            "severity": "critical",
-            "message": f"EMERGENCY: {child_name_fast} triggered SOS!",
-            "timestamp": now.isoformat(),
-            "fast_lane": True,
-        }
+        realtime_tasks = [
+            broadcaster.broadcast_to_user(
+                user_id,
+                "emergency_triggered",
+                fast_payload,
+            )
+        ]
 
-        await asyncio.gather(
-            broadcaster.broadcast_to_user(user_id, "emergency_triggered", fast_payload),
-            *(
+        if (
+            primary_guardian_id
+            and primary_guardian_id != str(user_id)
+        ):
+            primary_fast_guardian_ids.append(primary_guardian_id)
+
+            realtime_tasks.append(
                 broadcaster.broadcast_to_user(
-                    guardian_id,
+                    primary_guardian_id,
                     "emergency_triggered",
                     fast_payload,
                 )
-                for guardian_id in fast_guardian_ids
-            ),
+            )
+
+        await asyncio.gather(
+            *realtime_tasks,
             return_exceptions=True,
+        )
+
+        logger.warning(
+            "[SOS_PRIMARY_SSE_V65] event=%s child=%s primary_guardians=%s",
+            event_id,
+            user_id,
+            primary_fast_guardian_ids,
+        )
+
+    except Exception as primary_fast_error:
+        logger.warning(
+            "[SOS_PRIMARY_SSE_V65] fallback event=%s error=%s",
+            event_id,
+            primary_fast_error,
+        )
+
+    # Persist after the first realtime interruption attempt.
+    await session.flush()
+
+    # Preserve the existing V6.4 resolver for co-parent and compatibility
+    # recipients. Do not duplicate the primary guardian SSE.
+    fast_guardian_ids: list[str] = list(primary_fast_guardian_ids)
+
+    try:
+        resolved_guardian_ids, resolved_child_name = (
+            await _resolve_fast_guardians_v64(
+                session,
+                user_id,
+            )
+        )
+
+        if resolved_child_name:
+            child_name_fast = resolved_child_name
+            fast_payload["child_name"] = resolved_child_name
+            fast_payload["message"] = (
+                f"EMERGENCY: {resolved_child_name} triggered SOS!"
+            )
+
+        compatibility_targets = [
+            guardian_id
+            for guardian_id in resolved_guardian_ids
+            if guardian_id not in primary_fast_guardian_ids
+        ]
+
+        if compatibility_targets:
+            await asyncio.gather(
+                *(
+                    broadcaster.broadcast_to_user(
+                        guardian_id,
+                        "emergency_triggered",
+                        fast_payload,
+                    )
+                    for guardian_id in compatibility_targets
+                ),
+                return_exceptions=True,
+            )
+
+        fast_guardian_ids = list(
+            dict.fromkeys(
+                primary_fast_guardian_ids
+                + list(resolved_guardian_ids)
+            )
         )
 
         logger.warning(
@@ -406,6 +496,7 @@ async def trigger_silent_sos(
             user_id,
             fast_guardian_ids,
         )
+
     except Exception as fast_sse_error:
         logger.warning(
             "[SOS_FAST_SSE_V64] fallback event=%s error=%s",
