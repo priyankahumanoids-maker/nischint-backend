@@ -4,6 +4,7 @@ import json
 import logging
 from uuid import UUID
 
+import google.auth
 import google.auth.transport.requests
 from google.oauth2 import service_account
 import httpx
@@ -58,6 +59,17 @@ def _get_credentials():
                     info,
                     scopes=FCM_SCOPES,
                 )
+    if _credentials is None:
+        try:
+            _credentials, adc_project = google.auth.default(scopes=FCM_SCOPES)
+            logger.info(
+                "[FCM_AUTH] using ADC adc_project=%s target_project=%s",
+                adc_project,
+                settings.firebase_project_id,
+            )
+        except Exception as adc_error:
+            logger.warning("[FCM_AUTH] ADC unavailable: %s", adc_error)
+
     return _credentials
 
 

@@ -22,6 +22,7 @@ _USER_PREFIX = "user:"
 _ROLE_PREFIX = "role:"
 _REPLAY_WINDOW_S = 300  # 5 minutes — keep events for replay
 _REPLAY_MAX_PER_CHANNEL = 50  # max events stored per channel
+_REDIS_PUBSUB_CHANNEL = "nischint:sse:broadcast:v1"
 
 
 class EventBroadcaster:
@@ -36,6 +37,7 @@ class EventBroadcaster:
         self._subscribers: Dict[str, Set[asyncio.Queue]] = defaultdict(set)
         self._lock = asyncio.Lock()
         self._redis_listener_started = False
+        self._instance_id = str(uuid4())
         # Replay buffer: channel → deque of (timestamp, event_dict)
         self._replay_buffer: Dict[str, deque] = defaultdict(lambda: deque(maxlen=_REPLAY_MAX_PER_CHANNEL))
         self._replay_lock = asyncio.Lock()
@@ -47,6 +49,15 @@ class EventBroadcaster:
         async with self._lock:
             self._subscribers[channel].add(queue)
             logger.info(f"Subscribed to {channel}. Active: {len(self._subscribers[channel])}")
+        # A guardian SSE socket may live on a different Cloud Run instance
+        # from the child SOS POST. Start the shared Redis Pub/Sub listener on
+        # every instance that owns at least one local SSE subscriber.
+        if not self._redis_listener_started:
+            try:
+                self.start_redis_listener(asyncio.get_running_loop())
+            except Exception as exc:
+                logger.warning(f"[SSE_REDIS] listener start deferred: {exc}")
+
         return queue
 
     async def unsubscribe(self, channel: str, queue: asyncio.Queue):
@@ -107,77 +118,127 @@ class EventBroadcaster:
             "channel": channel,
             "data": data,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "origin_instance": self._instance_id,
         }
 
-        # Deliver to local subscribers (same-process SSE clients)
+        # Same-instance delivery is always first and never waits on Redis.
         await self._deliver(channel, event)
 
-    # ── Redis Streams Listener (background thread → asyncio loop bridge) ──
+        # Fan the identical envelope to all other Cloud Run instances.
+        try:
+            from app.services.redis_service import is_available, publish_event
+
+            if is_available():
+                published = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        publish_event,
+                        _REDIS_PUBSUB_CHANNEL,
+                        event,
+                    ),
+                    timeout=1.0,
+                )
+                if published:
+                    logger.info(
+                        f"[SSE_REDIS] published {event_type} channel={channel}"
+                    )
+        except Exception as exc:
+            logger.warning(
+                f"[SSE_REDIS] publish failed {event_type} channel={channel}: {exc}"
+            )
 
     def start_redis_listener(self, loop: asyncio.AbstractEventLoop):
-        """Start background thread that consumes from Redis Stream and bridges to asyncio."""
+        """Bridge shared Redis Pub/Sub events into this instance's SSE queues."""
         if self._redis_listener_started:
             return
 
-        from app.services.redis_service import (
-            ensure_stream_group, stream_read, stream_ack, is_available,
-        )
+        from app.services.redis_service import get_pubsub, is_available
 
         def _listener():
             import time
-            backoff = 2
-            max_backoff = 60
+
+            backoff = 1
+            max_backoff = 30
 
             while True:
-                if not is_available():
-                    logger.info("Redis unavailable — using in-memory broadcast only")
-                    time.sleep(max_backoff)
-                    continue
-
-                # Ensure consumer group exists
-                if not ensure_stream_group():
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, max_backoff)
-                    continue
-
-                logger.info("Redis Stream consumer started (group=nischint_guardians)")
-                consecutive_timeouts = 0
-
+                pubsub = None
                 try:
+                    if not is_available():
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
+
+                    pubsub = get_pubsub()
+                    if pubsub is None:
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, max_backoff)
+                        continue
+
+                    pubsub.subscribe(_REDIS_PUBSUB_CHANNEL)
+                    logger.info(
+                        f"[SSE_REDIS] subscribed instance={self._instance_id}"
+                    )
+                    backoff = 1
+
                     while True:
-                        # Use 1000ms block to stay under Upstash connection timeout
-                        entries = stream_read(count=10, block_ms=1000)
-                        if entries:
-                            consecutive_timeouts = 0
-                            for event_id, fields in entries:
-                                try:
-                                    payload_raw = fields.get("payload", "{}")
-                                    event = json.loads(payload_raw)
-                                    channel = event.get("channel", fields.get("channel", ""))
-                                    asyncio.run_coroutine_threadsafe(
-                                        self._deliver(channel, event), loop
-                                    )
-                                    stream_ack(event_id)
-                                except Exception as e:
-                                    logger.error(f"Redis Stream parse error for {event_id}: {e}")
-                                    stream_ack(event_id)
-                        else:
-                            consecutive_timeouts += 1
-                            # Sleep between empty polls to reduce connection pressure
-                            if consecutive_timeouts > 5:
-                                time.sleep(2)
-                except Exception as e:
-                    # Only log at warning level occasionally, not every 3 seconds
-                    if backoff <= 4:
-                        logger.warning(f"Redis Stream listener disconnected: {e}")
+                        message = pubsub.get_message(
+                            ignore_subscribe_messages=True,
+                            timeout=1.0,
+                        )
+                        if not message:
+                            continue
+
+                        raw = message.get("data")
+                        if not raw:
+                            continue
+
+                        try:
+                            if isinstance(raw, bytes):
+                                raw = raw.decode("utf-8")
+                            event = json.loads(raw)
+                        except Exception as exc:
+                            logger.warning(f"[SSE_REDIS] invalid payload: {exc}")
+                            continue
+
+                        if event.get("origin_instance") == self._instance_id:
+                            continue
+
+                        channel = str(event.get("channel") or "")
+                        if not channel:
+                            continue
+
+                        future = asyncio.run_coroutine_threadsafe(
+                            self._deliver(channel, event),
+                            loop,
+                        )
+
+                        def _done(fut):
+                            try:
+                                fut.result()
+                            except Exception as exc:
+                                logger.warning(
+                                    f"[SSE_REDIS] local delivery failed: {exc}"
+                                )
+
+                        future.add_done_callback(_done)
+
+                except Exception as exc:
+                    logger.warning(f"[SSE_REDIS] listener reconnect: {exc}")
                     time.sleep(backoff)
                     backoff = min(backoff * 2, max_backoff)
+                finally:
+                    if pubsub is not None:
+                        try:
+                            pubsub.close()
+                        except Exception:
+                            pass
 
-        thread = threading.Thread(target=_listener, daemon=True, name="redis-stream")
+        thread = threading.Thread(
+            target=_listener,
+            daemon=True,
+            name="redis-sse-pubsub",
+        )
         thread.start()
         self._redis_listener_started = True
-
-    # ── Public broadcast helpers ──
 
     async def broadcast_to_user(self, user_id: str, event_type: str, data: dict):
         await self._publish(f"{_USER_PREFIX}{user_id}", event_type, data)

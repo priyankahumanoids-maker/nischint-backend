@@ -121,6 +121,92 @@ async def trigger_silent_sos(
 
     event_id = str(event.id)
 
+    # P0 realtime fast lane. Do not make the primary guardian's in-app SOS
+    # wait behind FCM, SMS, or the full compatibility fan-out.
+    try:
+        from app.core.product_roles import is_co_guardian
+
+        child_fast = await session.get(User, uuid.UUID(user_id))
+        child_name_fast = (
+            child_fast.full_name
+            if child_fast and child_fast.full_name
+            else "Protected member"
+        )
+
+        fast_payload = {
+            "event": "SOS_TRIGGERED",
+            "event_id": event_id,
+            "child_id": user_id,
+            "child_name": child_name_fast,
+            "user_id": user_id,
+            "lat": lat,
+            "lng": lng,
+            "trigger_source": trigger_source,
+            "severity_level": 2,
+            "severity": "critical",
+            "message": f"EMERGENCY: {child_name_fast} triggered SOS!",
+            "timestamp": now.isoformat(),
+            "fast_lane": True,
+        }
+
+        fast_guardian_ids: list[str] = []
+
+        if child_fast and child_fast.guardian_id:
+            primary_id = str(child_fast.guardian_id)
+            fast_guardian_ids.append(primary_id)
+
+            await broadcaster.broadcast_to_user(
+                primary_id,
+                "emergency_triggered",
+                fast_payload,
+            )
+
+            co_parent_rows = (
+                await session.execute(
+                    select(User).where(
+                        User.guardian_id == child_fast.guardian_id,
+                        User.is_active.is_(True),
+                    )
+                )
+            ).scalars().all()
+
+            co_parent_ids: list[str] = []
+            for candidate in co_parent_rows:
+                if not is_co_guardian(candidate.role):
+                    continue
+                candidate_id = str(candidate.id)
+                if candidate_id in fast_guardian_ids:
+                    continue
+                fast_guardian_ids.append(candidate_id)
+                co_parent_ids.append(candidate_id)
+
+            if co_parent_ids:
+                await asyncio.gather(
+                    *(
+                        broadcaster.broadcast_to_user(
+                            guardian_id,
+                            "emergency_triggered",
+                            fast_payload,
+                        )
+                        for guardian_id in co_parent_ids
+                    ),
+                    return_exceptions=True,
+                )
+
+        logger.warning(
+            "[SOS_FAST_SSE] event=%s child=%s guardians=%s",
+            event_id,
+            user_id,
+            fast_guardian_ids,
+        )
+    except Exception as fast_sse_error:
+        logger.warning(
+            "[SOS_FAST_SSE] fallback event=%s error=%s",
+            event_id,
+            fast_sse_error,
+        )
+
+
     # ── Migration to unified `trigger_alert` (NISCH-001 Phase 2) ──
     # Behind feature flag `ALERT_TRIGGER_V2_SOS`. When True, the unified
     # path replaces the inline guardian fan-out + push + SMS block. The
