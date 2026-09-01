@@ -1344,11 +1344,20 @@ async def generate_invite_code(
     code = _generate_invite_code()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=INVITE_CODE_TTL_MINUTES)
 
-    # Re-fetch inside this session so we can mutate it
-    result = await session.execute(select(User).where(User.id == user.id))
-    db_user = result.scalar_one()
-    db_user.invite_code = code
-    db_user.invite_code_expires_at = expires_at
+    # Single atomic write avoids an extra database round-trip on staging.
+    result = await session.execute(
+        text("""
+            UPDATE users
+               SET invite_code = :code,
+                   invite_code_expires_at = :expires_at
+             WHERE id = :user_id
+         RETURNING id
+        """),
+        {"code": code, "expires_at": expires_at, "user_id": user.id},
+    )
+    if result.scalar_one_or_none() is None:
+        await session.rollback()
+        raise HTTPException(status_code=401, detail="Guardian account not found")
     await session.commit()
 
     logger.info(f"[INVITE] Guardian {user.email} generated invite code (expires {expires_at.isoformat()})")
@@ -1377,28 +1386,24 @@ async def cancel_invite_code(
 
     normalized_code = req.invite_code.strip().upper()
 
-    # Serialize cancel against member join / invite regeneration. This keeps
-    # one-QR-one-member semantics intact even during concurrent requests.
+    # Atomic compare-and-clear is race-safe: a stale screen cannot revoke a
+    # newer invite, and we avoid the SELECT + UPDATE round-trip pair.
     result = await session.execute(
-        select(User)
-        .where(User.id == user.id)
-        .with_for_update()
+        text("""
+            UPDATE users
+               SET invite_code = NULL,
+                   invite_code_expires_at = NULL
+             WHERE id = :user_id
+               AND UPPER(COALESCE(invite_code, '')) = :code
+         RETURNING id
+        """),
+        {"user_id": user.id, "code": normalized_code},
     )
-    guardian = result.scalar_one_or_none()
-    if not guardian:
-        raise HTTPException(status_code=401, detail="Guardian account not found")
+    cancelled_id = result.scalar_one_or_none()
+    if cancelled_id is None:
+        await session.rollback()
+        return {"cancelled": False, "already_inactive": True}
 
-    # Idempotent and race-safe: if this code was already used, expired, or
-    # superseded, there is nothing left for this stale client to revoke.
-    current_code = (guardian.invite_code or "").strip().upper()
-    if not current_code or current_code != normalized_code:
-        return {
-            "cancelled": False,
-            "already_inactive": True,
-        }
-
-    guardian.invite_code = None
-    guardian.invite_code_expires_at = None
     await session.commit()
 
     logger.info(f"[INVITE] Guardian {user.email} manually cancelled active invite")

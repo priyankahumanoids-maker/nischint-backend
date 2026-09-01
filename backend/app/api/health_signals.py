@@ -44,12 +44,29 @@ router = APIRouter(prefix="/health-signals", tags=["wearable", "health-connect"]
 
 # ── Schemas ────────────────────────────────────────────────────────────
 
-SignalType = Literal["heart_rate", "spo2", "steps", "fall"]
+SignalType = Literal[
+    "heart_rate",
+    "resting_heart_rate",
+    "spo2",
+    "blood_pressure_systolic",
+    "blood_pressure_diastolic",
+    "body_temperature",
+    "respiratory_rate",
+    "steps",
+    "sleep_minutes",
+    "fall",
+]
 
 _VALUE_LIMITS: dict[str, tuple[float, float]] = {
     "heart_rate": (20.0, 300.0),
+    "resting_heart_rate": (20.0, 250.0),
     "spo2": (70.0, 100.0),
+    "blood_pressure_systolic": (50.0, 260.0),
+    "blood_pressure_diastolic": (30.0, 160.0),
+    "body_temperature": (30.0, 45.0),
+    "respiratory_rate": (4.0, 80.0),
     "steps": (0.0, 100_000.0),
+    "sleep_minutes": (0.0, 1_440.0),
     "fall": (0.0, 1.0),
 }
 
@@ -440,32 +457,47 @@ async def get_dependent_latest_vitals(
             raise HTTPException(status_code=403, detail="Not a guardian of this user")
 
     client = redis_service._get_client()
+    empty = {
+        "dependent_id": dependent_id,
+        "hr": None,
+        "resting_hr": None,
+        "spo2": None,
+        "bp_systolic": None,
+        "bp_diastolic": None,
+        "temperature_c": None,
+        "respiratory_rate": None,
+        "steps": None,
+        "sleep_minutes": None,
+        "last_sync": None,
+    }
     if client is None:
-        return {
-            "dependent_id": dependent_id,
-            "hr": None,
-            "spo2": None,
-            "last_sync": None,
-        }
+        return empty
 
-    hr_key = redis_service._key("wearable", f"{dependent_id}:heart_rate")
-    spo2_key = redis_service._key("wearable", f"{dependent_id}:spo2")
+    signal_names = {
+        "hr": "heart_rate",
+        "resting_hr": "resting_heart_rate",
+        "spo2": "spo2",
+        "bp_systolic": "blood_pressure_systolic",
+        "bp_diastolic": "blood_pressure_diastolic",
+        "temperature_c": "body_temperature",
+        "respiratory_rate": "respiratory_rate",
+        "steps": "steps",
+        "sleep_minutes": "sleep_minutes",
+    }
 
-    hr_val, hr_ts = _read_latest_zset(client, hr_key)
-    spo2_val, spo2_ts = _read_latest_zset(client, spo2_key)
-
-    last_sync: str | None = None
-    for ts in (hr_ts, spo2_ts):
-        if ts is None:
-            continue
-        if last_sync is None or ts > last_sync:
-            last_sync = ts
+    values: dict[str, float | None] = {}
+    timestamps: list[str] = []
+    for response_key, signal_type in signal_names.items():
+        key = redis_service._key("wearable", f"{dependent_id}:{signal_type}")
+        value, timestamp = _read_latest_zset(client, key)
+        values[response_key] = value
+        if timestamp:
+            timestamps.append(timestamp)
 
     return {
         "dependent_id": dependent_id,
-        "hr": hr_val,
-        "spo2": spo2_val,
-        "last_sync": last_sync,
+        **values,
+        "last_sync": max(timestamps) if timestamps else None,
     }
 
 
