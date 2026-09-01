@@ -50,6 +50,119 @@ def _spawn_sos_background(coro, *, label: str) -> None:
     task.add_done_callback(_done)
 
 
+def _sos_external_transport_ready() -> bool:
+    """True only when server-owned Firebase/Twilio credentials are provisioned."""
+    try:
+        from app.core.config import settings
+
+        firebase_explicit = bool(
+            getattr(settings, "firebase_sa_key_path", None)
+            or getattr(settings, "firebase_sa_key_json", None)
+            or (
+                getattr(settings, "firebase_private_key", None)
+                and getattr(settings, "firebase_client_email", None)
+            )
+        )
+        sms_explicit = bool(getattr(settings, "twilio_account_sid", None))
+        return firebase_explicit or sms_explicit
+    except Exception:
+        return False
+
+
+async def _resolve_fast_guardians_v64(
+    session: AsyncSession,
+    child_user_id: str,
+) -> tuple[list[str], str]:
+    """Primary guardian + current co-parent path in at most two DB reads."""
+    try:
+        child_uuid = uuid.UUID(str(child_user_id))
+    except (ValueError, TypeError, AttributeError):
+        return [], "Protected member"
+
+    child = await session.get(User, child_uuid)
+    if child is None:
+        return [], "Protected member"
+
+    child_name = child.full_name or "Protected member"
+    guardian_ids: list[str] = []
+
+    primary_guardian_id = getattr(child, "guardian_id", None)
+    if primary_guardian_id:
+        primary = str(primary_guardian_id)
+        guardian_ids.append(primary)
+
+        try:
+            from app.core.product_roles import is_co_guardian
+
+            co_parent_rows = (
+                await session.execute(
+                    select(User).where(
+                        User.guardian_id == primary_guardian_id,
+                        User.is_active.is_(True),
+                    )
+                )
+            ).scalars().all()
+
+            for candidate in co_parent_rows:
+                if not is_co_guardian(candidate.role):
+                    continue
+                candidate_id = str(candidate.id)
+                if candidate_id not in guardian_ids:
+                    guardian_ids.append(candidate_id)
+        except Exception as exc:
+            logger.warning(
+                "[SOS_FAST_RESOLVE_V64] co-parent lookup failed child=%s error=%s",
+                child_user_id,
+                exc,
+            )
+
+    return guardian_ids, child_name
+
+
+async def _guardian_realtime_after_response_v64(
+    *,
+    user_id: str,
+    event_type: str,
+    payload: dict,
+    already_sent: list[str] | None = None,
+) -> None:
+    """Full compatibility guardian graph after the first realtime response."""
+    from app.db.session import async_session
+    from app.services.alert_trigger import _resolve_guardian_ids
+
+    sent = set(already_sent or [])
+    try:
+        async with async_session() as bg_session:
+            guardian_ids, child_name = await _resolve_guardian_ids(bg_session, user_id)
+
+        if child_name:
+            payload = {**payload, "child_name": child_name}
+
+        targets = [gid for gid in guardian_ids if gid not in sent]
+        if targets:
+            await asyncio.gather(
+                *(
+                    broadcaster.broadcast_to_user(gid, event_type, payload)
+                    for gid in targets
+                ),
+                return_exceptions=True,
+            )
+
+        logger.info(
+            "[SOS_COMPAT_SSE_V64] event=%s child=%s targets=%s",
+            event_type,
+            user_id,
+            targets,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[SOS_COMPAT_SSE_V64] failed event=%s child=%s error=%s",
+            event_type,
+            user_id,
+            exc,
+        )
+
+
 async def _notify_guardians_background(
     user_id: str,
     event_id: str,
@@ -58,7 +171,15 @@ async def _notify_guardians_background(
     trigger_source: str,
     timestamp: datetime,
 ) -> None:
-    """Legacy push/SMS fan-out on a fresh DB session, never the SOS request session."""
+    """Legacy push/SMS fan-out, isolated from the SOS hot path."""
+    if not _sos_external_transport_ready():
+        logger.warning(
+            "[SOS_TRANSPORT_DEFERRED_V64] trigger event=%s "
+            "Firebase/Twilio server credentials not provisioned",
+            event_id,
+        )
+        return
+
     from app.db.session import async_session
 
     async with async_session() as bg_session:
@@ -79,7 +200,16 @@ async def _notify_guardians_all_clear_background(
     event_id: str,
     status: str,
 ) -> None:
-    """All-clear push on a fresh DB session; SSE has already been sent."""
+    """All-clear push after realtime response, when transport is provisioned."""
+    if not _sos_external_transport_ready():
+        logger.warning(
+            "[SOS_TRANSPORT_DEFERRED_V64] %s event=%s "
+            "Firebase/Twilio server credentials not provisioned",
+            status,
+            event_id,
+        )
+        return
+
     from app.db.session import async_session
 
     async with async_session() as bg_session:
@@ -138,8 +268,7 @@ async def notify_repeat_sos(
     repeat_id = str(uuid.uuid4())
 
     try:
-        from app.services.alert_trigger import _resolve_guardian_ids
-        guardian_ids, child_name = await _resolve_guardian_ids(session, user_id)
+        guardian_ids, child_name = await _resolve_fast_guardians_v64(session, user_id)
     except Exception as exc:
         guardian_ids, child_name = [], "Protected member"
         logger.warning("[SOS_REPEAT_FAST] guardian resolution failed event=%s error=%s", event_id, exc)
@@ -233,19 +362,14 @@ async def trigger_silent_sos(
 
     event_id = str(event.id)
 
-    # P0 realtime fast lane V6.3. Use the canonical guardian resolver so
-    # primary guardian, co-parent and accepted relationship paths match the
-    # already-working resolve flow. This lane deliberately runs before push/SMS.
+    # P0 realtime fast lane V6.4.
     fast_guardian_ids: list[str] = []
     child_name_fast = "Protected member"
     try:
-        from app.services.alert_trigger import _resolve_guardian_ids
-
-        fast_guardian_ids, child_name_fast = await _resolve_guardian_ids(
+        fast_guardian_ids, child_name_fast = await _resolve_fast_guardians_v64(
             session,
             user_id,
         )
-        child_name_fast = child_name_fast or "Protected member"
 
         fast_payload = {
             "event": "SOS_TRIGGERED",
@@ -277,14 +401,14 @@ async def trigger_silent_sos(
         )
 
         logger.warning(
-            "[SOS_FAST_SSE_V63] event=%s child=%s guardians=%s",
+            "[SOS_FAST_SSE_V64] event=%s child=%s guardians=%s",
             event_id,
             user_id,
             fast_guardian_ids,
         )
     except Exception as fast_sse_error:
         logger.warning(
-            "[SOS_FAST_SSE_V63] fallback event=%s error=%s",
+            "[SOS_FAST_SSE_V64] fallback event=%s error=%s",
             event_id,
             fast_sse_error,
         )
@@ -401,15 +525,26 @@ async def trigger_silent_sos(
         "timestamp": now.isoformat(),
     }
 
-    # Operator audit remains best-effort and does not involve FCM.
-    await broadcaster.broadcast_to_operators("emergency_triggered", sse_payload)
+    # V6.4: operator audit + compatibility guardian graph are background-only.
+    _spawn_sos_background(
+        broadcaster.broadcast_to_operators("emergency_triggered", sse_payload),
+        label=f"operator-trigger:{event_id}",
+    )
+    _spawn_sos_background(
+        _guardian_realtime_after_response_v64(
+            user_id=user_id,
+            event_type="emergency_triggered",
+            payload=sse_payload,
+            already_sent=fast_guardian_ids,
+        ),
+        label=f"compat-trigger:{event_id}",
+    )
 
     # Fast lane already sent to child + guardians. If guardian resolution failed
     # there, make one canonical fallback attempt here without touching push/SMS.
     if not _use_v2 and not fast_guardian_ids:
         try:
-            from app.services.alert_trigger import _resolve_guardian_ids
-            fallback_guardian_ids, fallback_child_name = await _resolve_guardian_ids(
+            fallback_guardian_ids, fallback_child_name = await _resolve_fast_guardians_v64(
                 session,
                 user_id,
             )
@@ -431,19 +566,19 @@ async def trigger_silent_sos(
             notified = len(fallback_guardian_ids)
             event.guardians_notified = notified
             logger.warning(
-                "[SOS_FAST_SSE_V63] compatibility fallback event=%s guardians=%s",
+                "[SOS_FAST_SSE_V64] compatibility fallback event=%s guardians=%s",
                 event_id,
                 fallback_guardian_ids,
             )
         except Exception as fallback_error:
             logger.warning(
-                "[SOS_FAST_SSE_V63] compatibility fallback failed event=%s error=%s",
+                "[SOS_FAST_SSE_V64] compatibility fallback failed event=%s error=%s",
                 event_id,
                 fallback_error,
             )
 
     logger.info(
-        "[SOS_REALTIME_V63] event=%s child=%s realtime_guardians=%s push_sms=background",
+        "[SOS_REALTIME_V64] event=%s child=%s realtime_guardians=%s push_sms=background",
         event_id,
         user_id,
         fast_guardian_ids,
@@ -582,46 +717,78 @@ async def cancel_emergency(
     delete_key("emergency", event_id)
     _update_active_list(str(event.user_id), event_id, "remove")
 
-    # V6.3: cancellation response is realtime in both directions.
+    # V6.4: protected-member cancellation state first; guardian sync follows.
     user_id = str(event.user_id)
-    child_result_c = await session.execute(select(User).where(User.id == event.user_id))
-    child_user = child_result_c.scalar_one_or_none()
-    child_name = child_user.full_name if child_user else "Child"
 
     cancel_payload = {
         "event": "SOS_CANCELLED",
         "event_id": event_id,
         "child_id": user_id,
-        "child_name": child_name,
+        "child_name": "Protected member",
         "user_id": user_id,
         "resolved_at": now.isoformat(),
     }
 
-    from app.services.alert_trigger import _resolve_guardian_ids
-    guardian_ids, _ = await _resolve_guardian_ids(session, user_id)
-    await asyncio.gather(
-        broadcaster.broadcast_to_user(user_id, "emergency_cancelled", cancel_payload),
-        broadcaster.broadcast_to_operators("emergency_cancelled", cancel_payload),
-        *(
-            broadcaster.broadcast_to_user(
-                guardian_id,
-                "emergency_cancelled",
-                cancel_payload,
-            )
-            for guardian_id in guardian_ids
-        ),
-        return_exceptions=True,
+    await broadcaster.broadcast_to_user(
+        user_id,
+        "emergency_cancelled",
+        cancel_payload,
     )
 
+    cancel_fast_guardian_ids: list[str] = []
+    try:
+        cancel_fast_guardian_ids, cancel_child_name = await _resolve_fast_guardians_v64(
+            session,
+            user_id,
+        )
+        if cancel_child_name:
+            cancel_payload["child_name"] = cancel_child_name
+        if cancel_fast_guardian_ids:
+            await asyncio.gather(
+                *(
+                    broadcaster.broadcast_to_user(
+                        guardian_id,
+                        "emergency_cancelled",
+                        cancel_payload,
+                    )
+                    for guardian_id in cancel_fast_guardian_ids
+                ),
+                return_exceptions=True,
+            )
+        logger.info(
+            "[SOS_CANCEL_FAST_GUARDIAN_V641] event=%s guardians=%s",
+            event_id,
+            cancel_fast_guardian_ids,
+        )
+    except Exception as fast_guardian_error:
+        logger.warning(
+            "[SOS_CANCEL_FAST_GUARDIAN_V641] failed event=%s error=%s",
+            event_id,
+            fast_guardian_error,
+        )
+
+    _spawn_sos_background(
+        broadcaster.broadcast_to_operators("emergency_cancelled", cancel_payload),
+        label=f"operator-cancel:{event_id}",
+    )
+    _spawn_sos_background(
+        _guardian_realtime_after_response_v64(
+            user_id=user_id,
+            event_type="emergency_cancelled",
+            payload=cancel_payload,
+            already_sent=cancel_fast_guardian_ids,
+        ),
+        label=f"compat-cancel:{event_id}",
+    )
     _spawn_sos_background(
         _notify_guardians_all_clear_background(user_id, event_id, "cancelled"),
         label=f"cancel:{event_id}",
     )
 
     logger.info(
-        "[SOS_CANCEL_V63] event=%s realtime_guardians=%s push=background",
+        "[SOS_CANCEL_V64] event=%s child_realtime=1 "
+        "guardian_sync=background transport=background",
         event_id,
-        guardian_ids,
     )
 
     return {
@@ -661,35 +828,68 @@ async def resolve_emergency(
     delete_key("emergency", event_id)
     _update_active_list(str(event.user_id), event_id, "remove")
 
-    # V6.3: deliver the guardian response to the protected member first.
+    # V6.4: guardian response -> protected member is the first network action.
     user_id = str(event.user_id)
-    child_result_r = await session.execute(select(User).where(User.id == event.user_id))
-    child_user = child_result_r.scalar_one_or_none()
-    child_name = child_user.full_name if child_user else "Child"
 
     resolve_payload = {
         "event": "SOS_RESOLVED",
         "event_id": event_id,
         "child_id": user_id,
-        "child_name": child_name,
+        "child_name": "Protected member",
         "user_id": user_id,
         "resolved_at": now.isoformat(),
     }
 
-    from app.services.alert_trigger import _resolve_guardian_ids
-    guardian_ids, _ = await _resolve_guardian_ids(session, user_id)
-    await asyncio.gather(
-        broadcaster.broadcast_to_user(user_id, "emergency_resolved", resolve_payload),
-        broadcaster.broadcast_to_operators("emergency_resolved", resolve_payload),
-        *(
-            broadcaster.broadcast_to_user(
-                guardian_id,
-                "emergency_resolved",
-                resolve_payload,
+    await broadcaster.broadcast_to_user(
+        user_id,
+        "emergency_resolved",
+        resolve_payload,
+    )
+
+    resolve_fast_guardian_ids: list[str] = []
+    try:
+        resolve_fast_guardian_ids, resolve_child_name = await _resolve_fast_guardians_v64(
+            session,
+            user_id,
+        )
+        if resolve_child_name:
+            resolve_payload["child_name"] = resolve_child_name
+        if resolve_fast_guardian_ids:
+            await asyncio.gather(
+                *(
+                    broadcaster.broadcast_to_user(
+                        guardian_id,
+                        "emergency_resolved",
+                        resolve_payload,
+                    )
+                    for guardian_id in resolve_fast_guardian_ids
+                ),
+                return_exceptions=True,
             )
-            for guardian_id in guardian_ids
+        logger.info(
+            "[SOS_RESOLVE_FAST_GUARDIAN_V641] event=%s guardians=%s",
+            event_id,
+            resolve_fast_guardian_ids,
+        )
+    except Exception as fast_guardian_error:
+        logger.warning(
+            "[SOS_RESOLVE_FAST_GUARDIAN_V641] failed event=%s error=%s",
+            event_id,
+            fast_guardian_error,
+        )
+
+    _spawn_sos_background(
+        broadcaster.broadcast_to_operators("emergency_resolved", resolve_payload),
+        label=f"operator-resolve:{event_id}",
+    )
+    _spawn_sos_background(
+        _guardian_realtime_after_response_v64(
+            user_id=user_id,
+            event_type="emergency_resolved",
+            payload=resolve_payload,
+            already_sent=resolve_fast_guardian_ids,
         ),
-        return_exceptions=True,
+        label=f"compat-resolve:{event_id}",
     )
 
     if notify_guardians:
@@ -699,9 +899,9 @@ async def resolve_emergency(
         )
 
     logger.info(
-        "[SOS_RESOLVE_V63] event=%s child_realtime=1 guardians=%s push=%s",
+        "[SOS_RESOLVE_V64] event=%s child_realtime=1 "
+        "guardian_sync=background transport=%s",
         event_id,
-        guardian_ids,
         "background" if notify_guardians else "skipped",
     )
 
