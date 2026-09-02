@@ -48,6 +48,126 @@ def _push_checkin_audit_dlq(payload: dict) -> bool:
         return False
 
 
+
+async def _resolve_checkin_guardian_ids_fast(
+    session: AsyncSession,
+    child: User,
+) -> list[str]:
+    """Check-in-scoped guardian resolver using one SQL round trip.
+
+    It mirrors the existing alert resolver sources (contact, Relationship,
+    Guardian Network, direct parent, and current co-parent model). If an
+    optional relationship table is unavailable, it falls back to the existing
+    canonical resolver so compatibility and authorization semantics are kept.
+    """
+    from sqlalchemy import literal, union_all
+    from app.core.product_roles import is_co_guardian, is_protected_member
+    from app.models.relationship import Relationship
+    from app.models.guardian_network import GuardianRelationship
+
+    queries = [
+        select(
+            User.id.label("guardian_id"),
+            literal("contact").label("source"),
+            User.role.label("role"),
+        )
+        .join(Guardian, User.email == Guardian.email)
+        .where(
+            Guardian.user_id == child.id,
+            Guardian.is_active.is_(True),
+        ),
+        select(
+            Relationship.guardian_id.label("guardian_id"),
+            literal("relationship").label("source"),
+            literal(None).label("role"),
+        ).where(
+            Relationship.child_id == child.id,
+            Relationship.status == "accepted",
+        ),
+        select(
+            GuardianRelationship.guardian_user_id.label("guardian_id"),
+            literal("network").label("source"),
+            literal(None).label("role"),
+        ).where(
+            GuardianRelationship.user_id == child.id,
+            GuardianRelationship.guardian_user_id.isnot(None),
+            GuardianRelationship.is_active.is_(True),
+        ),
+    ]
+
+    if child.guardian_id and is_protected_member(child.role):
+        queries.append(
+            select(
+                User.id.label("guardian_id"),
+                literal("co_parent").label("source"),
+                User.role.label("role"),
+            ).where(
+                User.guardian_id == child.guardian_id,
+                User.is_active.is_(True),
+            )
+        )
+
+    try:
+        rows = (await session.execute(union_all(*queries))).all()
+
+        seen: set[str] = set()
+        out: list[str] = []
+
+        def add(value) -> None:
+            if value is None:
+                return
+            value_str = str(value)
+            if value_str not in seen:
+                seen.add(value_str)
+                out.append(value_str)
+
+        # Existing resolver always includes the child's direct primary guardian.
+        add(child.guardian_id)
+
+        for guardian_id, source, role in rows:
+            if source == "co_parent" and not is_co_guardian(role):
+                continue
+            add(guardian_id)
+
+        return out
+
+    except Exception as exc:
+        logger.warning(
+            "CHECKIN fast guardian resolution failed child=%s: %s; "
+            "using canonical fallback",
+            child.id,
+            exc,
+        )
+        from app.services.alert_trigger import _resolve_guardian_ids
+
+        guardian_ids, _ = await _resolve_guardian_ids(
+            session,
+            str(child.id),
+        )
+        return list(dict.fromkeys(guardian_ids))
+
+
+def _direct_family_link_is_authorized(guardian: User, child: User) -> bool:
+    """Conservative fast path for the current direct/co-parent family model."""
+    from app.core.product_roles import is_co_guardian, is_protected_member
+
+    if not bool(getattr(child, "is_active", True)):
+        return False
+    if not is_protected_member(child.role):
+        return False
+
+    if child.guardian_id == guardian.id:
+        return True
+
+    return bool(
+        is_co_guardian(guardian.role)
+        and guardian.guardian_id
+        and child.guardian_id
+        and guardian.guardian_id == child.guardian_id
+    )
+
+
+
 async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str) -> dict:
     """Guardian initiates a safety check-in for a child."""
     logger.info(f"CHECKIN_CREATE guardian={guardian_id} child={child_id}")
@@ -61,22 +181,29 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
     if not guardian:
         return {"error": "Guardian not found"}
 
-    # Use the same canonical family resolver as the Guardian dashboard.  The
-    # older implementation checked only the legacy Guardian table and the
-    # Relationship table, so valid direct User.guardian_id and co-guardian
-    # links could be rejected with "not linked as a guardian".
-    #
-    # Do NOT use legacy CheckIn rows as authorization for a new action.
-    from app.services.guardian_dashboard_engine import _get_linked_user_ids
+    # Load the exact target once. The common direct-parent/co-parent model can
+    # be authorized from these already-needed User fields without resolving the
+    # guardian's entire family. Alternate/legacy relationship sources still use
+    # the canonical resolver below.
+    child_user = await session.execute(select(User).where(User.id == child_uuid))
+    child = child_user.scalar_one_or_none()
+    if not child:
+        return {"error": "Protected member not found"}
 
-    linked_user_ids = await _get_linked_user_ids(
-        session,
-        guardian.email or "",
-        str(guardian_uuid),
-        guardian.role,
-        include_checkin_recovery=False,
-    )
-    if child_uuid not in set(linked_user_ids):
+    authorized = _direct_family_link_is_authorized(guardian, child)
+    if not authorized:
+        from app.services.guardian_dashboard_engine import _get_linked_user_ids
+
+        linked_user_ids = await _get_linked_user_ids(
+            session,
+            guardian.email or "",
+            str(guardian_uuid),
+            guardian.role,
+            include_checkin_recovery=False,
+        )
+        authorized = child_uuid in set(linked_user_ids)
+
+    if not authorized:
         logger.warning(
             "CHECKIN_LINK_REJECTED guardian=%s child=%s role=%s",
             guardian_id,
@@ -106,9 +233,7 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
     check_in_id = str(checkin.id)
     created_at = checkin.created_at.isoformat()
 
-    # Get child info for response
-    child_user = await session.execute(select(User).where(User.id == child_uuid))
-    child = child_user.scalar_one_or_none()
+    # Child was already loaded for authorization above.
     child_name = child.full_name if child else "Unknown"
 
     # Commit the real check-in before any external transport. The committed
@@ -236,8 +361,7 @@ async def report_safe_status(
     if not child:
         return {"error": "Protected member account not found"}
 
-    from app.services.alert_trigger import _resolve_guardian_ids
-    guardian_ids, _ = await _resolve_guardian_ids(session, child_id)
+    guardian_ids = await _resolve_checkin_guardian_ids_fast(session, child)
     guardian_ids = list(dict.fromkeys(guardian_ids))
     if not guardian_ids:
         return {"error": "No linked guardian is available to receive your safe status"}
@@ -370,15 +494,13 @@ async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: 
     await session.flush()
     logger.info(f"CHECKIN_RESPOND DB updated: check_in={check_in_id} status={response}")
 
-    # Get names for notification
-    guardian_result = await session.execute(select(User).where(User.id == ci.guardian_id))
-    guardian = guardian_result.scalar_one_or_none()
+    # Get child display/family fields once. The guardian User SELECT that used
+    # to run here was unused; guardian recipients are resolved from the child.
     child_result = await session.execute(select(User).where(User.id == ci.child_id))
     child = child_result.scalar_one_or_none()
     child_name = child.full_name if child else "Your child"
     guardian_id_str = str(ci.guardian_id)
-    from app.services.alert_trigger import _resolve_guardian_ids
-    linked_guardian_ids, _ = await _resolve_guardian_ids(session, child_id)
+    linked_guardian_ids = await _resolve_checkin_guardian_ids_fast(session, child)
     guardian_recipient_ids = list(dict.fromkeys([
         guardian_id_str,
         *linked_guardian_ids,
