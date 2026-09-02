@@ -111,13 +111,35 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
     child = child_user.scalar_one_or_none()
     child_name = child.full_name if child else "Unknown"
 
-    # Commit the real check-in before any external FCM call. A slow/unavailable
-    # push provider must never leave the guardian button spinning or hide the
-    # pending request from the protected member's authenticated polling path.
+    # Commit the real check-in before any external transport. The committed
+    # row remains the source of truth even if realtime/push delivery is slow.
     await session.commit()
 
-    # Send push notification to child. Bound delivery latency; the committed
-    # row plus SSE/polling remain authoritative if FCM is temporarily slow.
+    # Realtime delivery is the interactive fast path. Emit the already-durable
+    # pending request before waiting on FCM so Escalate Now / Safety Check is not
+    # delayed by a slow push provider. Push remains a compatibility/background
+    # transport immediately afterwards.
+    try:
+        from app.services.event_broadcaster import broadcaster
+        pending_payload = {
+            "check_in_id": check_in_id,
+            "child_id": child_id,
+            "child_name": child_name,
+            "guardian_id": guardian_id,
+            "guardian_name": guardian.full_name or "Your parent",
+            "status": "pending",
+            "created_at": created_at,
+            "expires_in_seconds": CHECKIN_EXPIRY_SECONDS,
+        }
+        await broadcaster.broadcast_to_user(guardian_id, "checkin_pending", pending_payload)
+        logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_pending user={guardian_id} checkin={check_in_id}")
+        await broadcaster.broadcast_to_user(child_id, "checkin_pending", pending_payload)
+        logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_pending user={child_id} checkin={check_in_id}")
+    except Exception as e:
+        logger.warning(f"[SSE_CHECKIN_EMIT] checkin_pending broadcast failed: {e}")
+
+    # Keep the existing push behavior, but only after the realtime event is out.
+    # The 3-second bound is unchanged from the accepted implementation.
     try:
         from app.services.push_service import send_push_to_user
         await asyncio.wait_for(
@@ -147,26 +169,6 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
     except (asyncio.TimeoutError, Exception) as e:
         logger.warning(f"CHECKIN_PUSH_FAILED {e}")
     logger.info(f"CHECKIN_CREATE_SUCCESS id={check_in_id} guardian={guardian_id} child={child_id}")
-
-    # Broadcast checkin_pending to BOTH guardian AND child via SSE
-    try:
-        from app.services.event_broadcaster import broadcaster
-        pending_payload = {
-            "check_in_id": check_in_id,
-            "child_id": child_id,
-            "child_name": child_name,
-            "guardian_id": guardian_id,
-            "guardian_name": guardian.full_name or "Your parent",
-            "status": "pending",
-            "created_at": created_at,
-            "expires_in_seconds": CHECKIN_EXPIRY_SECONDS,
-        }
-        await broadcaster.broadcast_to_user(guardian_id, "checkin_pending", pending_payload)
-        logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_pending user={guardian_id} checkin={check_in_id}")
-        await broadcaster.broadcast_to_user(child_id, "checkin_pending", pending_payload)
-        logger.info(f"[SSE_CHECKIN_EMIT] type=checkin_pending user={child_id} checkin={check_in_id}")
-    except Exception as e:
-        logger.warning(f"[SSE_CHECKIN_EMIT] checkin_pending broadcast failed: {e}")
 
     return {
         "check_in_id": check_in_id,
@@ -306,6 +308,22 @@ async def report_safe_status(
     push_count = 0
     from app.services.push_service import send_push_to_user
     from app.services.event_broadcaster import broadcaster
+
+    # The safe state is already committed above. Realtime confirmation is sent
+    # first so guardian UI and the protected member can reconcile success even
+    # if a later push provider call is slow or the HTTP client times out.
+    for guardian_id in guardian_ids:
+        try:
+            await broadcaster.broadcast_to_user(guardian_id, "checkin_safe", payload)
+        except Exception as exc:
+            logger.warning("SAFE_STATUS realtime alert failed guardian=%s: %s", guardian_id, exc)
+
+    try:
+        await broadcaster.broadcast_to_user(child_id, "checkin_safe", payload)
+    except Exception as exc:
+        logger.warning("SAFE_STATUS child confirmation failed child=%s: %s", child_id, exc)
+
+    # Preserve push delivery exactly as a secondary/background transport.
     for guardian_id in guardian_ids:
         try:
             push_count += await send_push_to_user(
@@ -317,15 +335,6 @@ async def report_safe_status(
             )
         except Exception as exc:
             logger.warning("SAFE_STATUS push failed guardian=%s: %s", guardian_id, exc)
-        try:
-            await broadcaster.broadcast_to_user(guardian_id, "checkin_safe", payload)
-        except Exception as exc:
-            logger.warning("SAFE_STATUS realtime alert failed guardian=%s: %s", guardian_id, exc)
-
-    try:
-        await broadcaster.broadcast_to_user(child_id, "checkin_safe", payload)
-    except Exception:
-        pass
 
     return {
         "status": "safe",
@@ -414,7 +423,48 @@ async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: 
                 f"child={child_id} event={resolved_emergency_id}"
             )
 
-    # ── Step A: Push notification ──
+    # Persist the authenticated response (and any canonical active-SOS
+    # resolution above) before external notifications. If the client loses the
+    # HTTP response afterwards, /checkin/status can safely reconcile the actual
+    # durable state instead of showing a false network failure.
+    await session.commit()
+    logger.info(
+        f"CHECKIN_RESPOND durable state committed: check_in={check_in_id} status={response}"
+    )
+
+    response_payload = {
+        "check_in_id": check_in_id,
+        "child_id": child_id,
+        "child_name": child_name,
+        "guardian_id": guardian_id_str,
+        "response": response,
+        "responded_at": now.isoformat(),
+    }
+    event_type = "checkin_help" if response == "help" else "checkin_safe"
+
+    # ── Step A: Broadcast real-time SSE event to guardian + child + operators ──
+    # Realtime follows the durable commit and precedes slower push delivery.
+    try:
+        from app.services.event_broadcaster import broadcaster
+        for recipient_id in guardian_recipient_ids:
+            await broadcaster.broadcast_to_user(
+                recipient_id,
+                event_type,
+                response_payload,
+            )
+            logger.info(
+                f"[SSE_CHECKIN_EMIT] type={event_type} "
+                f"user={recipient_id} checkin={check_in_id}"
+            )
+        await broadcaster.broadcast_to_user(child_id, event_type, response_payload)
+        logger.info(f"[SSE_CHECKIN_EMIT] type={event_type} user={child_id} checkin={check_in_id}")
+        await broadcaster.broadcast_to_operators(event_type, response_payload)
+    except Exception as e:
+        logger.error(f"[SSE_CHECKIN_EMIT] {event_type} broadcast failed: {e}")
+
+    # ── Step B: Push notification ──
+    # Preserve the existing push semantics, but do not make realtime delivery
+    # wait behind the push provider.
     push_count = 0
     if response == "safe":
         from app.services.push_service import send_push_to_user
@@ -465,34 +515,6 @@ async def respond_to_checkin(session: AsyncSession, check_in_id: str, child_id: 
                 logger.warning(
                     f"CHECKIN_RESPOND help push failed guardian={recipient_id}: {e}"
                 )
-
-    # ── Step B: Broadcast real-time SSE event to guardian + child + operators ──
-    response_payload = {
-        "check_in_id": check_in_id,
-        "child_id": child_id,
-        "child_name": child_name,
-        "guardian_id": guardian_id_str,
-        "response": response,
-        "responded_at": now.isoformat(),
-    }
-    try:
-        from app.services.event_broadcaster import broadcaster
-        event_type = "checkin_help" if response == "help" else "checkin_safe"
-        for recipient_id in guardian_recipient_ids:
-            await broadcaster.broadcast_to_user(
-                recipient_id,
-                event_type,
-                response_payload,
-            )
-            logger.info(
-                f"[SSE_CHECKIN_EMIT] type={event_type} "
-                f"user={recipient_id} checkin={check_in_id}"
-            )
-        await broadcaster.broadcast_to_user(child_id, event_type, response_payload)
-        logger.info(f"[SSE_CHECKIN_EMIT] type={event_type} user={child_id} checkin={check_in_id}")
-        await broadcaster.broadcast_to_operators(event_type, response_payload)
-    except Exception as e:
-        logger.error(f"[SSE_CHECKIN_EMIT] {event_type} broadcast failed: {e}")
 
     # ── Step C: Create a GuardianAlert record (so it appears in the Alerts tab) ──
     if response == "help":
