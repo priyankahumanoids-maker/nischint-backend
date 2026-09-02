@@ -69,87 +69,6 @@ def _sos_external_transport_ready() -> bool:
         return False
 
 
-async def _broadcast_fast_coparents_v65c(
-    *,
-    primary_guardian_id: str,
-    event_type: str,
-    payload: dict,
-) -> list[str]:
-    """Resolve + broadcast linked co-parents without blocking primary SSE.
-
-    Uses an independent short-lived DB session so this lookup can run in
-    parallel with the frozen V6.5 child/primary fast lane and the main event
-    flush. Failures return only successfully delivered IDs, leaving the
-    existing V6.4 resolver as the compatibility fallback.
-    """
-    try:
-        primary_uuid = uuid.UUID(str(primary_guardian_id))
-    except (ValueError, TypeError, AttributeError):
-        return []
-
-    try:
-        from app.core.product_roles import is_co_guardian
-        from app.db.session import async_session
-
-        async with async_session() as bg_session:
-            rows = (
-                await bg_session.execute(
-                    select(User.id, User.role).where(
-                        User.guardian_id == primary_uuid,
-                        User.is_active.is_(True),
-                    )
-                )
-            ).all()
-
-        co_parent_ids: list[str] = []
-        for row in rows:
-            if not is_co_guardian(getattr(row, "role", None)):
-                continue
-
-            candidate_id = str(getattr(row, "id", "") or "").strip()
-            if (
-                candidate_id
-                and candidate_id != str(primary_guardian_id)
-                and candidate_id not in co_parent_ids
-            ):
-                co_parent_ids.append(candidate_id)
-
-        delivered_ids: list[str] = []
-        if co_parent_ids:
-            results = await asyncio.gather(
-                *(
-                    broadcaster.broadcast_to_user(
-                        co_parent_id,
-                        event_type,
-                        payload,
-                    )
-                    for co_parent_id in co_parent_ids
-                ),
-                return_exceptions=True,
-            )
-            delivered_ids = [
-                co_parent_id
-                for co_parent_id, result in zip(co_parent_ids, results)
-                if not isinstance(result, BaseException)
-            ]
-
-        logger.warning(
-            "[SOS_COPARENT_SSE_V65C] primary=%s delivered=%s resolved=%s",
-            primary_guardian_id,
-            delivered_ids,
-            co_parent_ids,
-        )
-        return delivered_ids
-
-    except Exception as exc:
-        logger.warning(
-            "[SOS_COPARENT_SSE_V65C] fallback primary=%s error=%s",
-            primary_guardian_id,
-            exc,
-        )
-        return []
-
-
 async def _resolve_fast_guardians_v64(
     session: AsyncSession,
     child_user_id: str,
@@ -474,7 +393,6 @@ async def trigger_silent_sos(
     }
 
     primary_fast_guardian_ids: list[str] = []
-    early_coparent_task: asyncio.Task | None = None
 
     try:
         primary_guardian_id = (
@@ -482,20 +400,6 @@ async def trigger_silent_sos(
             if fast_primary_guardian_id
             else ""
         )
-
-        # Additive co-parent lane: schedule an independent lookup/broadcast,
-        # but never await it in front of the proven V6.5 primary SSE.
-        if (
-            primary_guardian_id
-            and primary_guardian_id != str(user_id)
-        ):
-            early_coparent_task = asyncio.create_task(
-                _broadcast_fast_coparents_v65c(
-                    primary_guardian_id=primary_guardian_id,
-                    event_type="emergency_triggered",
-                    payload=fast_payload,
-                )
-            )
 
         realtime_tasks = [
             broadcaster.broadcast_to_user(
@@ -538,31 +442,12 @@ async def trigger_silent_sos(
             primary_fast_error,
         )
 
-    # Persist after the first realtime interruption attempt. The independent
-    # co-parent task continues concurrently while this DB flush runs.
+    # Persist after the first realtime interruption attempt.
     await session.flush()
 
-    # Collect only co-parent IDs whose early broadcast completed successfully,
-    # so the V6.4 compatibility resolver can still retry any missed recipient.
-    early_coparent_ids: list[str] = []
-    if early_coparent_task is not None:
-        try:
-            early_coparent_ids = await early_coparent_task
-        except Exception as early_coparent_error:
-            logger.warning(
-                "[SOS_COPARENT_SSE_V65C] join fallback event=%s error=%s",
-                event_id,
-                early_coparent_error,
-            )
-
-    # Preserve the existing V6.4 resolver as the canonical compatibility
-    # fallback for any guardian the early lanes did not reach.
-    fast_guardian_ids: list[str] = list(
-        dict.fromkeys(
-            primary_fast_guardian_ids
-            + early_coparent_ids
-        )
-    )
+    # Preserve the existing V6.4 resolver for co-parent and compatibility
+    # recipients. Do not duplicate the primary guardian SSE.
+    fast_guardian_ids: list[str] = list(primary_fast_guardian_ids)
 
     try:
         resolved_guardian_ids, resolved_child_name = (
@@ -582,7 +467,7 @@ async def trigger_silent_sos(
         compatibility_targets = [
             guardian_id
             for guardian_id in resolved_guardian_ids
-            if guardian_id not in fast_guardian_ids
+            if guardian_id not in primary_fast_guardian_ids
         ]
 
         if compatibility_targets:
@@ -600,7 +485,7 @@ async def trigger_silent_sos(
 
         fast_guardian_ids = list(
             dict.fromkeys(
-                fast_guardian_ids
+                primary_fast_guardian_ids
                 + list(resolved_guardian_ids)
             )
         )
