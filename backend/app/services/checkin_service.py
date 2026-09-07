@@ -263,11 +263,12 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
     except Exception as e:
         logger.warning(f"[SSE_CHECKIN_EMIT] checkin_pending broadcast failed: {e}")
 
-    # Keep the existing push behavior, but only after the realtime event is out.
-    # The 3-second bound is unchanged from the accepted implementation.
+    # Keep push best-effort and bounded, after the realtime event is already out.
+    # Allow the modern sender enough time to finish FCM delivery and token-health
+    # bookkeeping without letting a slow external transport block indefinitely.
     try:
         from app.services.push_service import send_push_to_user
-        await asyncio.wait_for(
+        sent = await asyncio.wait_for(
             send_push_to_user(
                 session,
                 child_uuid,
@@ -288,11 +289,20 @@ async def create_checkin(session: AsyncSession, guardian_id: str, child_id: str)
                 },
                 channel_id="safety-alerts",
             ),
-            timeout=3.0,
+            timeout=8.0,
         )
-        logger.info(f"CHECKIN_PUSH_SENT child={child_id}")
-    except (asyncio.TimeoutError, Exception) as e:
-        logger.warning(f"CHECKIN_PUSH_FAILED {e}")
+        if sent > 0:
+            logger.info(f"CHECKIN_PUSH_SENT child={child_id} sent={sent}")
+        else:
+            logger.warning(f"CHECKIN_PUSH_NO_DELIVERY child={child_id} sent=0")
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"CHECKIN_PUSH_TIMEOUT child={child_id} timeout_seconds=8"
+        )
+    except Exception as e:
+        logger.warning(
+            f"CHECKIN_PUSH_FAILED child={child_id} error={e!r}"
+        )
     logger.info(f"CHECKIN_CREATE_SUCCESS id={check_in_id} guardian={guardian_id} child={child_id}")
 
     return {
