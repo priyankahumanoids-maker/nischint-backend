@@ -73,10 +73,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -160,7 +160,7 @@ jobs:
 
       - name: Upload Lighthouse report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lighthouse-${{ matrix.page.name }}
           path: reports/${{ matrix.page.name }}.report.*
@@ -191,7 +191,7 @@ jobs:
 
       - name: Download all reports
         if: steps.precheck.outputs.configured == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: reports
           pattern: lighthouse-*
