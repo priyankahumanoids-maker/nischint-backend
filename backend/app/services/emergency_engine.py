@@ -51,10 +51,14 @@ def _spawn_sos_background(coro, *, label: str) -> None:
 
 
 def _sos_external_transport_ready() -> bool:
-    """True only when server-owned Firebase/Twilio credentials are provisioned."""
+    """True when SOS can attempt server-side push or SMS delivery."""
     try:
         from app.core.config import settings
 
+        # The modern HTTP-v1 push sender supports Google Application Default
+        # Credentials (ADC), so explicit Firebase key material is not required
+        # when a Firebase target project is configured (for example Cloud Run).
+        firebase_target = bool(getattr(settings, "firebase_project_id", None))
         firebase_explicit = bool(
             getattr(settings, "firebase_sa_key_path", None)
             or getattr(settings, "firebase_sa_key_json", None)
@@ -64,7 +68,7 @@ def _sos_external_transport_ready() -> bool:
             )
         )
         sms_explicit = bool(getattr(settings, "twilio_account_sid", None))
-        return firebase_explicit or sms_explicit
+        return firebase_target or firebase_explicit or sms_explicit
     except Exception:
         return False
 
