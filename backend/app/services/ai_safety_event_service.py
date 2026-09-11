@@ -464,7 +464,7 @@ async def ingest_ai_safety_event(
         parsed_observed_at = datetime.fromisoformat(raw_observed_at.replace("Z", "+00:00"))
         if parsed_observed_at.tzinfo is None:
             parsed_observed_at = parsed_observed_at.replace(tzinfo=timezone.utc)
-        observed_at = parsed_observed_at.astimezone(timezone.utc).isoformat()
+        observed_at = parsed_observed_at.astimezone(timezone.utc)
     except Exception as exc:
         raise HTTPException(status_code=422, detail="observed_at must be an ISO-8601 timestamp") from exc
 
