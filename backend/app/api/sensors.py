@@ -366,3 +366,133 @@ async def re_verify_voice_event(
     if "error" in result:
         raise HTTPException(404, result["error"])
     return result
+
+# ── Member-specific Monitoring Policy Control Plane ──
+# These endpoints persist desired state only. They never trigger sensor events,
+# notifications, escalation or SOS.
+
+class MonitoringPolicyUpdateRequest(BaseModel):
+    ai_enabled: Optional[bool] = None
+    location_enabled: Optional[bool] = None
+    microphone_enabled: Optional[bool] = None
+
+    def has_update(self) -> bool:
+        return any(
+            value is not None
+            for value in (
+                self.ai_enabled,
+                self.location_enabled,
+                self.microphone_enabled,
+            )
+        )
+
+
+@router.get("/monitoring-policy/me")
+async def get_my_monitoring_policy(
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Protected member's own phone reads its desired monitoring policy."""
+    from app.services.member_monitoring_policy import get_policy_for_actor
+    return await get_policy_for_actor(session, user, str(user.id))
+
+
+@router.get("/monitoring-policy/{member_id}")
+async def get_member_monitoring_policy(
+    member_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Guardian/co-parent reads exactly one authorized protected member."""
+    from app.services.member_monitoring_policy import get_policy_for_actor
+    return await get_policy_for_actor(session, user, member_id)
+
+
+@router.put("/monitoring-policy/{member_id}")
+async def update_member_monitoring_policy(
+    member_id: str,
+    req: MonitoringPolicyUpdateRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Guardian/co-parent updates exactly one authorized protected member."""
+    if not req.has_update():
+        raise HTTPException(status_code=400, detail="At least one monitoring policy field is required")
+    from app.services.member_monitoring_policy import update_policy_for_actor
+    return await update_policy_for_actor(
+        session,
+        user,
+        member_id,
+        ai_enabled=req.ai_enabled,
+        location_enabled=req.location_enabled,
+        microphone_enabled=req.microphone_enabled,
+    )
+
+
+
+# ── Phase 3: Central AI Safety Decision + Protected-Member Confirmation ──
+# The protected member's device submits ONE fused AI candidate here. The backend
+# re-validates it, enriches risk with SACHET/Weather/TomTom context, and ALWAYS
+# asks the protected member before any AI-origin Guardian alert. SAFE resolves;
+# HELP or timeout may use the existing Guardian dispatcher.
+
+class AiSafetyEventRequest(BaseModel):
+    client_event_id: str = Field(..., min_length=1, max_length=200)
+    protected_member_id: str = Field(..., min_length=1, max_length=64)
+    observed_at: str
+    level: str
+    score: float = Field(..., ge=0, le=1)
+    reasons: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(default_factory=list)
+    motion: Optional[dict] = None
+    voice: Optional[dict] = None
+    location: Optional[dict] = None
+    location_fix: Optional[dict] = None
+    candidate_event_kind: Optional[str] = None
+    candidate_event_eligible: bool = False
+    backend_context_required: bool = False
+    confirmation_gate_required: bool = True
+
+
+class AiSafetyConfirmationResponseRequest(BaseModel):
+    response: str = Field(..., description="safe|help")
+
+
+@router.post("/ai-safety-event")
+async def ingest_ai_safety_event_endpoint(
+    req: AiSafetyEventRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Evaluate/store one AI candidate and create a child confirmation when actionable."""
+    from app.services.ai_safety_event_service import ingest_ai_safety_event
+
+    return await ingest_ai_safety_event(
+        session,
+        user,
+        req.model_dump(),
+    )
+
+
+@router.get("/ai-safety-event/pending")
+async def get_pending_ai_safety_confirmation_endpoint(
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Protected member recovers their pending AI safety confirmation after restart/background."""
+    from app.services.ai_safety_event_service import get_pending_ai_safety_confirmation
+
+    return await get_pending_ai_safety_confirmation(session, user)
+
+
+@router.post("/ai-safety-event/{event_id}/respond")
+async def respond_to_ai_safety_confirmation_endpoint(
+    event_id: str,
+    req: AiSafetyConfirmationResponseRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Protected member answers SAFE or HELP; only HELP/timeout can notify Guardians."""
+    from app.services.ai_safety_event_service import respond_to_ai_safety_confirmation
+
+    return await respond_to_ai_safety_confirmation(session, user, event_id, req.response)

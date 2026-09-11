@@ -518,6 +518,17 @@ async def expire_stale_checkins_job():
             logger.error(f"Check-in expiry job error: {e}")
 
 
+async def expire_ai_safety_confirmations_job():
+    """Background job: escalate unanswered confirmation-gated AI safety checks."""
+    try:
+        from app.services.ai_safety_event_service import expire_stale_ai_safety_confirmations
+        count = await expire_stale_ai_safety_confirmations(limit=20)
+        if count > 0:
+            logger.info("Escalated %s unanswered AI safety confirmation(s)", count)
+    except Exception as e:
+        logger.error(f"AI safety confirmation expiry job error: {e}")
+
+
 async def expire_stale_sessions_job():
     """Background job: mark stale/expired journey sessions."""
     async with async_session() as session:
@@ -582,6 +593,14 @@ def start_scheduler():
             max_instances=1, coalesce=True, misfire_grace_time=30,
         )
         scheduler.add_job(
+            expire_ai_safety_confirmations_job,
+            'interval',
+            seconds=10,
+            id='ai_safety_confirmation_expiry',
+            replace_existing=True,
+            max_instances=1, coalesce=True, misfire_grace_time=30,
+        )
+        scheduler.add_job(
             expire_stale_sessions_job,
             'interval',
             seconds=60,
@@ -601,6 +620,7 @@ def start_scheduler():
         logger.info(f"Escalation scheduler started - checking every {settings.escalation_check_interval}s")
         logger.info("Device health scheduler started - checking every 300s")
         logger.info("Check-in expiry scheduler started - checking every 60s")
+        logger.info("AI safety confirmation expiry scheduler started - checking every 10s")
         logger.info("Session lifecycle scheduler started - checking every 60s")
         logger.info("Location heartbeat watchdog started - checking every 60s")
 
