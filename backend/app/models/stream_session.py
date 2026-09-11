@@ -53,7 +53,7 @@ class StreamSession(Base):
         String(20), nullable=False, default=STREAM_OFFERED,
     )
     stream_type: Mapped[str] = mapped_column(
-        String(10), nullable=False, default="audio",
+        String(32), nullable=False, default="audio",
     )
     ice_servers:   Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     recording_url: Mapped[str | None]  = mapped_column(Text, nullable=True)
