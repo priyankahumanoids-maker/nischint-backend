@@ -244,22 +244,53 @@ async def _external_context(base_score: float, location: dict[str, Any] | None) 
         }
 
 
-def _event_message(anchor: str, reason: str) -> str:
-    if reason == "help":
-        prefix = "Protected member confirmed they need help after"
-    else:
-        prefix = "Protected member did not respond to"
+def _event_message(anchor: str, reason: str, semantic_label: str | None = None) -> str:
+    needs_help = reason == "help"
     if anchor == "MOTION_HUMAN_FALL":
-        return f"{prefix} a NISCHINT AI possible-fall safety check."
-    if anchor == "VOICE_GUNSHOT":
-        return f"{prefix} a NISCHINT AI possible-gunshot safety check."
-    if anchor == "VOICE_GLASS_BREAK":
-        return f"{prefix} a NISCHINT AI possible-glass-break safety check."
+        return (
+            "Possible fall detected. Protected member confirmed they need help."
+            if needs_help else
+            "Possible fall detected. Protected member did not respond to the safety check."
+        )
     if anchor == "VOICE_SEMANTIC_DISTRESS":
-        return f"{prefix} a NISCHINT AI spoken-distress safety check."
+        label = str(semantic_label or "").upper()
+        phrases = {
+            "HELP_REQUEST": "Protected member asked for help",
+            "MEDICAL_DISTRESS": "Protected member reported medical distress / difficulty breathing",
+            "THREAT_OR_VIOLENCE": "Protected member reported a threat or attack",
+            "FIRE_OR_HAZARD_REQUEST": "Protected member reported a fire or hazard",
+            "ESCAPE_OR_RESTRAINT_DISTRESS": "Protected member reported being trapped or unable to get out",
+            "POLICE_OR_EMERGENCY_REQUEST": "Protected member requested police or emergency assistance",
+        }
+        phrase = phrases.get(label, "Protected member used distress language")
+        return (
+            f"{phrase} and confirmed they need assistance."
+            if needs_help else
+            f"{phrase} but did not respond to the safety check."
+        )
+    if anchor == "VOICE_GUNSHOT":
+        return (
+            "Possible gunshot detected. Protected member confirmed they need help."
+            if needs_help else
+            "Possible gunshot detected. Protected member did not respond to the safety check."
+        )
+    if anchor == "VOICE_GLASS_BREAK":
+        return (
+            "Possible glass-break danger detected. Protected member confirmed they need help."
+            if needs_help else
+            "Possible glass-break danger detected. Protected member did not respond to the safety check."
+        )
     if anchor == "LOCATION_EXTERNAL_CONTEXT":
-        return f"{prefix} a NISCHINT AI location-and-environment safety check."
-    return f"{prefix} a NISCHINT AI safety check."
+        return (
+            "Location/environment safety concern detected. Protected member confirmed they need help."
+            if needs_help else
+            "Location/environment safety concern detected. Protected member did not respond to the safety check."
+        )
+    return (
+        "NISCHINT AI safety concern confirmed by the protected member."
+        if needs_help else
+        "Protected member did not respond to the NISCHINT AI safety check."
+    )
 
 
 def _confirmation_payload(
@@ -371,10 +402,26 @@ async def _dispatch_guardian_for_event(
             "guardian_alert_dispatched": False,
         }
 
+    member_row = (
+        await session.execute(
+            select(User.full_name, User.email).where(User.id == uuid.UUID(member_id))
+        )
+    ).first()
+    member_name = (
+        (member_row[0] or member_row[1])
+        if member_row
+        else "Protected member"
+    )
+
     sources = row["sources"] if isinstance(row["sources"], list) else []
+    evidence = row["evidence"] if isinstance(row["evidence"], dict) else {}
+    voice_evidence = evidence.get("voice") if isinstance(evidence.get("voice"), dict) else {}
+    semantic_label = str(voice_evidence.get("semanticLabel") or "").strip() or None
     external_context = row["external_context"] if isinstance(row["external_context"], dict) else {}
     provider_names = list(external_context.get("providers") or [])
     details = [f"AI evidence anchor: {anchor}"]
+    if semantic_label:
+        details.append(f"Voice semantic type: {semantic_label}")
     if provider_names:
         details.append("External context: " + ", ".join(provider_names))
     details.append("Protected-member response: NEED HELP" if reason == "help" else "Protected-member response: TIMEOUT")
@@ -385,7 +432,7 @@ async def _dispatch_guardian_for_event(
         kind="ai_safety",
         user_id=member_id,
         severity="critical",
-        message=_event_message(anchor, reason),
+        message=f"{member_name}: {_event_message(anchor, reason, semantic_label)}",
         details="; ".join(details),
         location=row["location"] if isinstance(row["location"], dict) else None,
         sse_event_type="ai_safety_alert",
@@ -396,6 +443,7 @@ async def _dispatch_guardian_for_event(
             "ai_score": float(row["adjusted_score"] or row["score"] or 0),
             "ai_sources": sources,
             "ai_confirmation_result": reason,
+            "ai_voice_semantic_type": semantic_label or "",
             "ai_external_context_providers": provider_names,
         },
         louder=False,
@@ -434,6 +482,18 @@ async def _dispatch_guardian_for_event(
         "guardian_alert_dispatched": bool(result.dispatched),
         "dispatch": result.to_dict(),
     }
+
+
+def _informational_phone_motion(payload: dict[str, Any]) -> tuple[str, str] | None:
+    motion = payload.get("motion") or {}
+    if not motion.get("ready"):
+        return None
+    predicted = str(motion.get("predictedClass") or "").upper().strip()
+    if predicted == "PHONE_DROP":
+        return ("phone_drop", "Phone drop recorded")
+    if predicted == "PHONE_THROW":
+        return ("phone_throw", "Phone throw recorded")
+    return None
 
 
 async def ingest_ai_safety_event(
@@ -577,6 +637,37 @@ async def ingest_ai_safety_event(
         }
 
     if not actionable or expires_at is None:
+        phone_motion = _informational_phone_motion(payload)
+        info_dispatch = None
+        if phone_motion is not None:
+            kind, label = phone_motion
+            motion = payload.get("motion") or {}
+            probability = _clamp01(
+                (motion.get("probabilities") or {}).get(
+                    str(motion.get("predictedClass") or ""), score
+                )
+            )
+            from app.services.alert_trigger import trigger_alert
+            info_dispatch = await trigger_alert(
+                session, kind=kind, user_id=actor_id, severity="info",
+                message=f"{actor.full_name or actor.email or 'Protected member'}: {label}.",
+                details=(
+                    f"Motion AI classified {str(motion.get('predictedClass') or '').upper()} "
+                    f"with {probability * 100:.1f}% model probability. "
+                    "This is an informational device-motion alert, not an SOS."
+                ),
+                location=location, sse_event_type=kind,
+                sse_payload_extras={
+                    "ai_event_id": event_id,
+                    "motion_class": str(motion.get("predictedClass") or "").upper(),
+                    "motion_probability": probability,
+                    "informational_only": True,
+                },
+                louder=False, idempotency_key=f"{kind}:model-event",
+                cooldown_s=60, persist_alert=True, suppress_co_located=False,
+                track_incident=False,
+            )
+            await session.commit()
         return {
             "status": "stored_not_actionable",
             "event_id": event_id,
@@ -585,7 +676,10 @@ async def ingest_ai_safety_event(
             "score": score,
             "adjusted_score": adjusted_score,
             "external_context": external_context,
-            "guardian_alert_dispatched": False,
+            "guardian_alert_dispatched": bool(info_dispatch and info_dispatch.dispatched),
+            "informational_motion_alert": (
+                info_dispatch.to_dict() if info_dispatch is not None else None
+            ),
             "confirmation_required": False,
         }
 

@@ -256,7 +256,7 @@ async def send_push_to_tokens(
                         # Keep emergency pushes briefly queued if the device is
                         # reconnecting as the SOS fires. A zero TTL discards the
                         # alert whenever FCM cannot deliver it immediately.
-                        "ttl": "300s" if louder else "3600s",
+                        "ttl": "3600s" if louder else "21600s",
                         "notification": android_notif,
                     },
                     "apns": {

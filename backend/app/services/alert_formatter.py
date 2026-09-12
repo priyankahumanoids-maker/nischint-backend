@@ -177,6 +177,18 @@ REGISTRY: dict[str, dict[str, AlertSpec]] = {
             "category":      "emergency",
         },
 
+        "ai_safety": {
+            "title_emoji": _EMOJI["critical"],
+            "label":       "AI SAFETY",
+            "body_template": "{name} — AI safety escalation. {trail}",
+            "priority":      "critical",
+            "sound":         "alert",
+            "channels":      ["sse", "push"],
+            "requires_action": True,
+            "louder":        False,
+            "category":      "emergency",
+        },
+
         # ── High priority safety ──────────────────────────────────
         "geofence_breach": {
             "title_emoji": _EMOJI["warning"],
@@ -243,6 +255,51 @@ REGISTRY: dict[str, dict[str, AlertSpec]] = {
             "requires_action": False,
             "louder":        False,
             "category":      "safety",
+        },
+
+        "route_deviation": {
+            "title_emoji": _EMOJI["warning"],
+            "label":       "ROUTE DEVIATION",
+            "body_template": "{name} moved outside a monitored route. {trail}",
+            "priority":      "high",
+            "sound":         "alert",
+            "channels":      ["sse", "push"],
+            "requires_action": True,
+            "louder":        False,
+            "category":      "safety",
+        },
+        "route_recovery": {
+            "title_emoji": _EMOJI["safe"],
+            "label":       "BACK ON ROUTE",
+            "body_template": "{name} returned to the monitored route. {trail}",
+            "priority":      "low",
+            "sound":         "default",
+            "channels":      ["sse", "push"],
+            "requires_action": False,
+            "louder":        False,
+            "category":      "info",
+        },
+        "phone_drop": {
+            "title_emoji": _EMOJI["warning"],
+            "label":       "PHONE DROP RECORDED",
+            "body_template": "{name}'s phone movement matched a phone-drop event. {trail}",
+            "priority":      "warning",
+            "sound":         "default",
+            "channels":      ["sse", "push"],
+            "requires_action": False,
+            "louder":        False,
+            "category":      "info",
+        },
+        "phone_throw": {
+            "title_emoji": _EMOJI["warning"],
+            "label":       "PHONE THROW RECORDED",
+            "body_template": "{name}'s phone movement matched a phone-throw event. {trail}",
+            "priority":      "warning",
+            "sound":         "default",
+            "channels":      ["sse", "push"],
+            "requires_action": False,
+            "louder":        False,
+            "category":      "info",
         },
 
         # ── Warning / informational ───────────────────────────────

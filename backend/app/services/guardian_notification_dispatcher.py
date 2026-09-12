@@ -42,6 +42,9 @@ DISPATCH_RULES = {
     "wearable_impact": {"push": True, "sms": False, "priority": "HIGH"},
     "wearable_tamper": {"push": True, "sms": False, "priority": "HIGH"},
     "health_anomaly": {"push": True, "sms": False, "priority": "HIGH"},
+    "ai_safety": {"push": True, "sms": False, "priority": "CRITICAL"},
+    "phone_drop": {"push": True, "sms": False, "priority": "MEDIUM"},
+    "phone_throw": {"push": True, "sms": False, "priority": "MEDIUM"},
 }
 
 
@@ -56,34 +59,57 @@ def _mark_sms_sent(guardian_id: str, alert_type: str):
     _sms_rate_limit[key] = time.time()
 
 
-def _format_push_title(alert_type: str, severity: str) -> str:
+def _format_push_title(alert_type: str, severity: str, message: str = "", details: str = "") -> str:
+    text = f"{message} {details}".lower()
     if alert_type in ("emergency", "sos"):
-        return "\U0001F534 NISCHINT ALERT"
+        return "🔴 NISCHINT SOS"
+    if alert_type == "ai_safety":
+        if "possible fall" in text or "motion_human_fall" in text:
+            return "🔴 NISCHINT POSSIBLE FALL"
+        if "medical distress" in text:
+            return "🔴 NISCHINT MEDICAL DISTRESS"
+        if "threat" in text or "attack" in text:
+            return "🔴 NISCHINT THREAT ALERT"
+        if "fire" in text or "hazard" in text:
+            return "🔴 NISCHINT FIRE / HAZARD ALERT"
+        if "trapped" in text or "restraint" in text:
+            return "🔴 NISCHINT DISTRESS ALERT"
+        if "police" in text or "emergency request" in text:
+            return "🔴 NISCHINT EMERGENCY REQUEST"
+        if "voice" in text or "spoken" in text or "asked for help" in text:
+            return "🔴 NISCHINT VOICE HELP"
+        return "🔴 NISCHINT AI SAFETY"
     if alert_type == "fall_detected":
-        return "\U0001F534 NISCHINT POSSIBLE FALL"
+        return "🔴 NISCHINT POSSIBLE FALL"
     if alert_type == "help_requested":
-        return "\U0001F534 NISCHINT HELP REQUEST"
+        return "🔴 NISCHINT HELP REQUEST"
+    if alert_type == "phone_drop":
+        return "🟡 NISCHINT PHONE DROP RECORDED"
+    if alert_type == "phone_throw":
+        return "🟡 NISCHINT PHONE THROW RECORDED"
     if alert_type == "geofence_breach":
-        return "\U0001F7E1 NISCHINT SAFETY ZONE"
+        if "entered restricted zone" in text:
+            return "🟡 NISCHINT RESTRICTED ZONE ENTRY"
+        if "left safe zone" in text:
+            return "🟡 NISCHINT SAFE ZONE EXIT"
+        return "🟡 NISCHINT SAFETY ZONE"
     if alert_type == "geofence_recovery":
-        return "\U0001F7E2 NISCHINT BACK IN SAFE AREA"
-    if alert_type == "environmental_hazard":
-        return "\U0001F7E0 NISCHINT AREA WARNING"
-    if alert_type == "low_battery":
-        return "\U0001F7E1 NISCHINT LOW BATTERY"
-    if alert_type in ("wearable_impact", "wearable_tamper", "health_anomaly"):
-        return "\U0001F7E1 NISCHINT DEVICE ALERT"
-    if alert_type == "zone_risk":
-        return "\U0001F7E1 NISCHINT ALERT"
-    if alert_type == "idle":
-        return "\U0001F7E1 NISCHINT ALERT"
-    if alert_type == "arrived":
-        return "\U0001F7E2 NISCHINT SAFE"
+        if "left restricted zone" in text:
+            return "🟢 NISCHINT RESTRICTED ZONE EXIT"
+        return "🟢 NISCHINT BACK IN SAFE AREA"
     if alert_type == "route_deviation":
-        return "\U0001F7E1 NISCHINT ALERT"
+        return "🟡 NISCHINT ROUTE DEVIATION"
     if alert_type == "route_recovery":
-        return "\U0001F7E2 NISCHINT BACK ON ROUTE"
-    return "\U0001F534 NISCHINT ALERT"
+        return "🟢 NISCHINT BACK ON ROUTE"
+    if alert_type == "environmental_hazard":
+        return "🟠 NISCHINT AREA WARNING"
+    if alert_type == "low_battery":
+        return "🟡 NISCHINT LOW BATTERY"
+    if alert_type in ("wearable_impact", "wearable_tamper", "health_anomaly"):
+        return "🟡 NISCHINT DEVICE ALERT"
+    if alert_type == "arrived":
+        return "🟢 NISCHINT SAFE"
+    return "🟡 NISCHINT ALERT"
 
 
 def _format_sms_body(alert: GuardianAlert, user_name: str = "User", session_id: str = "") -> str:
@@ -150,7 +176,9 @@ async def dispatch_guardian_alert(
     sms_skipped = 0
     errors = []
     sent_push_user_ids: set[uuid.UUID] = set()
-    title = _format_push_title(alert.alert_type, alert.severity)
+    title = _format_push_title(
+        alert.alert_type, alert.severity, alert.message or "", alert.details or ""
+    )
     if louder:
         title = f"\U0001F6A8 {title} \u2014 ESCALATED"
     body = f"{alert.message}"

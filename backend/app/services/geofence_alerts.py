@@ -472,6 +472,9 @@ async def evaluate_user_location(
     user_id: str,
     lat: float,
     lng: float,
+    *,
+    previous_lat: float | None = None,
+    previous_lng: float | None = None,
 ) -> GeofenceEvaluation:
     """Evaluate every active zone and route assigned to this protected user."""
     from app.services.redis_service import get_json, set_json, delete_key
@@ -532,7 +535,19 @@ async def evaluate_user_location(
             else "breach"
         )
         previous = get_json(_NS_STATE, state_key) or {}
-        transition = previous.get("state") != state
+        previous_state = previous.get("state")
+        if previous_lat is not None and previous_lng is not None:
+            previous_distance_m = haversine_m(previous_lat, previous_lng, zone.lat, zone.lng)
+            previous_inside = previous_distance_m <= zone.radius_m
+            previous_state = (
+                "restricted_inside" if is_restricted and previous_inside
+                else "restricted_clear" if is_restricted
+                else "safe" if previous_inside
+                else "breach"
+            )
+        # Never fabricate an exit/entry just because runtime cache is empty.
+        # A true transition requires a known previous state.
+        transition = previous_state is not None and previous_state != state
         payload = {
             "user_id": user_id, "child_id": user_id, "user_name": name,
             "state": state, "zone_id": zone_id, "zone_name": zone.name,
@@ -555,7 +570,7 @@ async def evaluate_user_location(
                 alert_kind, alert_event = "geofence_breach", "geofence_breach"
                 alert_message = f"{name} left safe zone {zone.name}."
                 details = f"Currently {round(distance_m)} metres from the zone centre."
-            elif not is_restricted and inside and previous.get("state") == "breach":
+            elif not is_restricted and inside and previous_state == "breach":
                 alert_kind, alert_event = "geofence_recovery", "geofence_recovery"
                 alert_message = f"{name} returned to safe zone {zone.name}."
                 details = "The latest protected-device GPS fix is back inside the saved area."
@@ -563,7 +578,7 @@ async def evaluate_user_location(
                 alert_kind, alert_event = "geofence_breach", "geofence_breach"
                 alert_message = f"{name} entered restricted zone {zone.name}."
                 details = "The latest protected-device GPS fix is inside this restricted area."
-            elif is_restricted and not inside and previous.get("state") == "restricted_inside":
+            elif is_restricted and not inside and previous_state == "restricted_inside":
                 alert_kind, alert_event = "geofence_recovery", "geofence_recovery"
                 alert_message = f"{name} left restricted zone {zone.name}."
                 details = "The latest protected-device GPS fix is now outside this restricted area."
@@ -578,6 +593,7 @@ async def evaluate_user_location(
                         sse_payload_extras={**payload, "message": alert_message},
                         idempotency_key=f"{zone_id}:{state}", cooldown_s=BREACH_COOLDOWN_SEC,
                         suppress_co_located=False,
+                        track_incident=False,
                     )
                     any_alert = any_alert or result.dispatched
                 except Exception as exc:
@@ -589,7 +605,15 @@ async def evaluate_user_location(
         distance_m = _distance_to_route_m(lat, lng, route)
         state = "on_route" if distance_m <= route.corridor_width_m else "route_deviation"
         previous = get_json("geofence:route_state", state_key) or {}
-        transition = previous.get("state") != state
+        previous_state = previous.get("state")
+        if previous_lat is not None and previous_lng is not None:
+            previous_distance_m = _distance_to_route_m(previous_lat, previous_lng, route)
+            previous_state = (
+                "on_route"
+                if previous_distance_m <= route.corridor_width_m
+                else "route_deviation"
+            )
+        transition = previous_state is not None and previous_state != state
         payload = {
             "user_id": user_id, "child_id": user_id, "user_name": name,
             "state": state, "route_id": route_id, "route_name": route.name,
@@ -602,7 +626,7 @@ async def evaluate_user_location(
         any_transition = any_transition or transition
         if transition and (
             state == "route_deviation" or
-            (state == "on_route" and previous.get("state") == "route_deviation")
+            (state == "on_route" and previous_state == "route_deviation")
         ):
             is_recovery = state == "on_route"
             alert_kind = "route_recovery" if is_recovery else "route_deviation"
@@ -626,6 +650,7 @@ async def evaluate_user_location(
                     sse_payload_extras={**payload, "message": alert_message},
                     idempotency_key=f"{route_id}:{state}", cooldown_s=BREACH_COOLDOWN_SEC,
                     suppress_co_located=False,
+                    track_incident=False,
                 )
                 any_alert = any_alert or result.dispatched
             except Exception as exc:

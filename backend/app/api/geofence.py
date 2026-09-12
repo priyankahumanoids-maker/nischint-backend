@@ -379,6 +379,27 @@ async def location_update(
     if target_id != str(user.id) and not _is_admin(user):
         raise HTTPException(status_code=403, detail="You can only update your own location.")
 
+    # Capture the previous durable fix BEFORE record_protected_telemetry
+    # overwrites it. This keeps zone/route transitions deterministic across
+    # Cloud Run instances even if Redis falls back to process-local memory.
+    previous_location = (
+        await session.execute(
+            select(User.last_known_lat, User.last_known_lng).where(
+                User.id == uuid.UUID(target_id)
+            )
+        )
+    ).first()
+    previous_lat = (
+        float(previous_location[0])
+        if previous_location and previous_location[0] is not None
+        else None
+    )
+    previous_lng = (
+        float(previous_location[1])
+        if previous_location and previous_location[1] is not None
+        else None
+    )
+
     telemetry = await record_protected_telemetry(
         session,
         target_id,
@@ -412,7 +433,10 @@ async def location_update(
         source="protected_device",
     )
 
-    result = await evaluate_user_location(session, target_id, req.lat, req.lng)
+    result = await evaluate_user_location(
+        session, target_id, req.lat, req.lng,
+        previous_lat=previous_lat, previous_lng=previous_lng,
+    )
     environmental = await evaluate_environmental_hazard(
         session,
         target_id,

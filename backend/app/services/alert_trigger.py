@@ -241,6 +241,7 @@ async def trigger_alert(
     cooldown_s: int = _DEFAULT_COOLDOWN_S,
     persist_alert: bool = True,
     suppress_co_located: bool = True,
+    track_incident: bool = True,
 ) -> TriggerResult:
     """Single front door for every guardian-facing alert.
 
@@ -272,6 +273,10 @@ async def trigger_alert(
         persist_alert:      set False for transient signals that should
                             NOT create a GuardianAlert row (e.g. info-
                             level "child arrived safely"). Default True.
+        track_incident:     when False, skips supplementary SafetyIncident
+                            lifecycle metadata while preserving GuardianAlert,
+                            SSE and push delivery. Intended for informational
+                            zone/route/device-motion alerts.
         suppress_co_located: when True (default), guardians demonstrably
                             within 150m of the child get filtered out
                             of SSE fan-out for non-critical kinds. NEVER
@@ -310,7 +315,7 @@ async def trigger_alert(
     #     a hard 1.5s timeout per provider, so this stays inside the
     #     alert hot-path budget.
     incident = None
-    if persist_alert:
+    if persist_alert and track_incident:
         from app.services import safety_incident_engine as _sie
         incident = await _sie.open_incident_for_alert(
             session,
