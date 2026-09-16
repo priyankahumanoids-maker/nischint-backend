@@ -293,6 +293,17 @@ def _event_message(anchor: str, reason: str, semantic_label: str | None = None) 
     )
 
 
+def _confirmation_message(anchor: str | None) -> str:
+    messages = {
+        "MOTION_HUMAN_FALL": "Possible fall detected. Are you safe?",
+        "VOICE_SEMANTIC_DISTRESS": "Possible voice distress detected. Are you safe?",
+        "VOICE_GUNSHOT": "Possible gunshot detected. Are you safe?",
+        "VOICE_GLASS_BREAK": "Possible glass-break danger detected. Are you safe?",
+        "LOCATION_EXTERNAL_CONTEXT": "Possible location safety concern detected. Are you safe?",
+    }
+    return messages.get(str(anchor or "").upper(), "NISCHINT detected a possible safety concern. Are you safe?")
+
+
 def _confirmation_payload(
     event_id: str,
     *,
@@ -307,7 +318,7 @@ def _confirmation_payload(
         "ai_event_id": event_id,
         "eventType": "ai_safety_confirmation",
         "event_type": "ai_safety_confirmation",
-        "message": "NISCHINT detected a possible safety concern. Are you safe?",
+        "message": _confirmation_message(anchor),
         "expires_at": expires_at.astimezone(timezone.utc).isoformat(),
         "expires_in_seconds": max(0, int((expires_at - now).total_seconds())),
         "anchor": anchor,
@@ -335,7 +346,7 @@ async def _notify_protected_member_confirmation(
                 session,
                 uuid.UUID(member_id),
                 "NISCHINT Safety Check",
-                "We detected a possible safety concern. Are you safe?",
+                str(confirmation.get("message") or "NISCHINT detected a possible safety concern. Are you safe?"),
                 confirmation,
                 louder=False,
             ),
@@ -533,18 +544,33 @@ async def ingest_ai_safety_event(
     location = payload.get("location_fix") if isinstance(payload.get("location_fix"), dict) else None
     location_risk = _location_risk(payload)
     anchor = _authoritative_anchor(payload)
+    phone_motion = _informational_phone_motion(payload)
 
     # Location evidence can become a context candidate only after parity approval.
-    # Use its real risk as the backend base; it STILL needs strong external
-    # corroboration before it gets an anchor.
+    # PHONE_DROP/PHONE_THROW are explicitly informational device-motion events:
+    # do not delay their Guardian notification behind external providers and do
+    # not turn the phone-motion event itself into a blocking protected-member
+    # confirmation. A separate qualifying fall/voice anchor still retains its
+    # normal confirmation path.
     backend_base_score = max(score, location_risk if not anchor else 0.0)
-    adjusted_score, external_context = await _external_context(backend_base_score, location)
-    if (
-        not anchor
-        and location_risk >= 0.60
-        and _clamp01(external_context.get("max_effective_risk")) >= 0.60
-    ):
-        anchor = "LOCATION_EXTERNAL_CONTEXT"
+    if phone_motion is not None and not anchor:
+        adjusted_score = backend_base_score
+        external_context = {
+            "checked": False,
+            "reason": "informational_phone_motion",
+            "providers": [],
+            "max_effective_risk": 0.0,
+            "confidence_before": round(backend_base_score, 4),
+            "confidence_after": round(backend_base_score, 4),
+        }
+    else:
+        adjusted_score, external_context = await _external_context(backend_base_score, location)
+        if (
+            not anchor
+            and location_risk >= 0.60
+            and _clamp01(external_context.get("max_effective_risk")) >= 0.60
+        ):
+            anchor = "LOCATION_EXTERNAL_CONTEXT"
 
     actionable = bool(anchor and adjusted_score >= 0.70)
     status = "pending_confirmation" if actionable else "stored_not_actionable"
@@ -637,7 +663,6 @@ async def ingest_ai_safety_event(
         }
 
     if not actionable or expires_at is None:
-        phone_motion = _informational_phone_motion(payload)
         info_dispatch = None
         if phone_motion is not None:
             kind, label = phone_motion
