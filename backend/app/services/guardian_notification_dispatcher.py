@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.guardian import Guardian, GuardianAlert
 from app.models.user import User
 from app.services.notification_service import _send_twilio_sms
-from app.services.push_service import get_user_push_tokens, send_push_to_tokens
+from app.services.push_service import get_user_push_tokens, get_users_push_tokens, send_push_to_tokens
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -140,6 +140,8 @@ async def dispatch_guardian_alert(
     *,
     louder: bool = False,
     guardian_user_ids: list[str] | None = None,
+    fast_push_only: bool = False,
+    child_name_override: str | None = None,
 ) -> dict:
     """Dispatch a guardian alert to all guardians via their preferred channels.
 
@@ -153,19 +155,29 @@ async def dispatch_guardian_alert(
     if not rules["push"] and not rules["sms"]:
         return {"dispatched": False, "reason": "no_dispatch_needed"}
 
-    # Fetch all active guardians for this user
+    # Fetch legacy Guardian rows only when they are needed for SMS/preferences.
+    # Latency-sensitive phone-motion alerts are push-only and already receive a
+    # complete resolved Guardian User-ID set from alert_trigger.
     import uuid
-    result = await session.execute(
-        select(Guardian).where(
-            Guardian.user_id == uuid.UUID(user_id),
-            Guardian.is_active == True,  # noqa: E712
-        )
-    )
-    guardians = result.scalars().all()
     resolved_guardian_user_ids = {
         uuid.UUID(str(guardian_id))
         for guardian_id in (guardian_user_ids or [])
     }
+    guardians = []
+    use_fast_push_only = bool(
+        fast_push_only
+        and guardian_user_ids
+        and rules.get("push")
+        and not rules.get("sms")
+    )
+    if not use_fast_push_only:
+        result = await session.execute(
+            select(Guardian).where(
+                Guardian.user_id == uuid.UUID(user_id),
+                Guardian.is_active == True,  # noqa: E712
+            )
+        )
+        guardians = result.scalars().all()
 
     if not guardians and not resolved_guardian_user_ids:
         logger.info(f"No active guardians for user {user_id}")
@@ -184,15 +196,17 @@ async def dispatch_guardian_alert(
     body = f"{alert.message}"
     if alert.details:
         body += f" \u2014 {alert.details}"
-    child_result = await session.execute(
-        select(User).where(User.id == uuid.UUID(user_id))
-    )
-    child = child_result.scalar_one_or_none()
-    child_name = (
-        (child.full_name or child.email)
-        if child
-        else "Protected member"
-    )
+    child_name = str(child_name_override or "").strip()
+    if not child_name:
+        child_result = await session.execute(
+            select(User).where(User.id == uuid.UUID(user_id))
+        )
+        child = child_result.scalar_one_or_none()
+        child_name = (
+            (child.full_name or child.email)
+            if child
+            else "Protected member"
+        )
     payload_data = {
         "type": "SAFETY_ALERT",
         "alert_id": str(alert.id),
@@ -262,12 +276,17 @@ async def dispatch_guardian_alert(
             # Resolve tokens with the request session, then make one concurrent
             # FCM fan-out. A stale/offline guardian device can no longer hold
             # up delivery to the other family devices.
-            token_lists = []
-            for target_user_id in push_target_ids:
-                token_lists.append(
-                    await get_user_push_tokens(session, target_user_id)
+            if use_fast_push_only:
+                all_tokens = await get_users_push_tokens(
+                    session, list(push_target_ids)
                 )
-            all_tokens = [token for tokens in token_lists for token in tokens]
+            else:
+                token_lists = []
+                for target_user_id in push_target_ids:
+                    token_lists.append(
+                        await get_user_push_tokens(session, target_user_id)
+                    )
+                all_tokens = [token for tokens in token_lists for token in tokens]
             push_sent = await send_push_to_tokens(
                 all_tokens,
                 title,
@@ -275,6 +294,7 @@ async def dispatch_guardian_alert(
                 data=payload_data,
                 channel_id="safety-alerts",
                 louder=louder,
+                record_token_health=not use_fast_push_only,
             )
             sent_push_user_ids.update(push_target_ids)
             logger.info(

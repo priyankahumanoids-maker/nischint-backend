@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.guardian import Guardian, GuardianAlert, GuardianSession
@@ -222,6 +222,100 @@ async def _resolve_guardian_ids(session: AsyncSession, child_user_id: str) -> tu
 
     return out, child_name
 
+async def _resolve_guardian_ids_fast(session: AsyncSession, child_user_id: str) -> tuple[list[str], Optional[str]]:
+    """Resolve all Guardian account IDs in one database round-trip.
+
+    This is used only by latency-sensitive push-only informational alerts. It
+    preserves the same four relationship sources as ``_resolve_guardian_ids``
+    (legacy Guardian contacts, Relationship links, Guardian Network links, and
+    the direct ``users.guardian_id`` family model). If the optimized query ever
+    fails, the caller falls back to the proven resolver instead of dropping an
+    alert.
+    """
+    try:
+        child_uuid = uuid.UUID(str(child_user_id))
+    except (ValueError, AttributeError, TypeError):
+        return [], None
+
+    try:
+        result = await session.execute(
+            text(
+                """
+                WITH child AS (
+                    SELECT id, full_name, email, guardian_id
+                      FROM users
+                     WHERE id = :child_id
+                ),
+                candidate_guardians AS (
+                    SELECT c.guardian_id AS guardian_id
+                      FROM child c
+                     WHERE c.guardian_id IS NOT NULL
+
+                    UNION
+
+                    SELECT u.id AS guardian_id
+                      FROM users u
+                      JOIN child c
+                        ON c.guardian_id IS NOT NULL
+                       AND u.guardian_id = c.guardian_id
+                     WHERE u.is_active IS TRUE
+                       AND LOWER(REPLACE(REPLACE(COALESCE(u.role, ''), '-', '_'), ' ', '_'))
+                           IN ('co_parent', 'coparent', 'co_guardian')
+
+                    UNION
+
+                    SELECT r.guardian_id
+                      FROM relationships r
+                     WHERE r.child_id = :child_id
+                       AND r.status = 'accepted'
+
+                    UNION
+
+                    SELECT gr.guardian_user_id
+                      FROM guardian_relationships gr
+                     WHERE gr.user_id = :child_id
+                       AND gr.guardian_user_id IS NOT NULL
+                       AND gr.is_active IS TRUE
+
+                    UNION
+
+                    SELECT gu.id
+                      FROM guardians g
+                      JOIN users gu
+                        ON LOWER(gu.email) = LOWER(g.email)
+                     WHERE g.user_id = :child_id
+                       AND g.is_active IS TRUE
+                       AND g.email IS NOT NULL
+                )
+                SELECT
+                    COALESCE(
+                        (SELECT COALESCE(full_name, email) FROM child LIMIT 1),
+                        'Protected member'
+                    ) AS child_name,
+                    COALESCE(
+                        ARRAY_AGG(DISTINCT guardian_id::text)
+                            FILTER (WHERE guardian_id IS NOT NULL),
+                        ARRAY[]::text[]
+                    ) AS guardian_ids
+                  FROM candidate_guardians
+                """
+            ),
+            {"child_id": child_uuid},
+        )
+        row = result.mappings().first()
+        if not row:
+            return [], None
+        guardian_ids = [str(item) for item in (row["guardian_ids"] or []) if item]
+        child_name = str(row["child_name"] or "").strip() or None
+        return guardian_ids, child_name
+    except Exception as exc:
+        logger.warning(
+            "[ALERT_TRIGGER] fast guardian resolution failed child=%s; falling back: %r",
+            child_user_id,
+            exc,
+        )
+        return await _resolve_guardian_ids(session, child_user_id)
+
 
 # ── Public entry point ──────────────────────────────────────────────
 async def trigger_alert(
@@ -242,6 +336,7 @@ async def trigger_alert(
     persist_alert: bool = True,
     suppress_co_located: bool = True,
     track_incident: bool = True,
+    fast_push_only: bool = False,
 ) -> TriggerResult:
     """Single front door for every guardian-facing alert.
 
@@ -277,6 +372,9 @@ async def trigger_alert(
                             lifecycle metadata while preserving GuardianAlert,
                             SSE and push delivery. Intended for informational
                             zone/route/device-motion alerts.
+        fast_push_only:      latency-sensitive push-only path. Uses the same
+                            guardian sources but resolves them in one query and
+                            skips non-critical token-health bookkeeping.
         suppress_co_located: when True (default), guardians demonstrably
                             within 150m of the child get filtered out
                             of SSE fan-out for non-critical kinds. NEVER
@@ -301,8 +399,12 @@ async def trigger_alert(
             dedup_skipped=True, reason="dedup_cooldown", ttfa_ms=ttfa_ms,
         )
 
-    # 2. Resolve guardians + child name
-    guardian_ids, child_name = await _resolve_guardian_ids(session, user_id)
+    # 2. Resolve guardians + child name. PHONE_DROP/PHONE_THROW can opt into
+    #    the one-query resolver so DB round-trips do not dominate TTFA.
+    if fast_push_only:
+        guardian_ids, child_name = await _resolve_guardian_ids_fast(session, user_id)
+    else:
+        guardian_ids, child_name = await _resolve_guardian_ids(session, user_id)
 
     # 2a. NISCH-006 — open SafetyIncident in DETECTED state. Best-effort:
     #     a failure here MUST NOT block alert delivery.
@@ -450,6 +552,8 @@ async def trigger_alert(
                 session, alert_obj, user_id, session_id or "",
                 louder=effective_louder,
                 guardian_user_ids=guardian_ids,
+                fast_push_only=fast_push_only,
+                child_name_override=child_name,
             )
             escalation_status = "ok"
         except Exception as e:

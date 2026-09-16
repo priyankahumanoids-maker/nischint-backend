@@ -690,7 +690,7 @@ async def ingest_ai_safety_event(
                 },
                 louder=False, idempotency_key=f"{kind}:model-event",
                 cooldown_s=60, persist_alert=True, suppress_co_located=False,
-                track_incident=False,
+                track_incident=False, fast_push_only=True,
             )
             await session.commit()
         return {
@@ -745,7 +745,10 @@ async def get_pending_ai_safety_confirmation(
             SELECT id, member_id, authoritative_anchor, adjusted_score,
                    external_context, confirmation_expires_at, status
               FROM ai_safety_events
-             WHERE member_id = :member_id AND status = 'pending_confirmation'
+             WHERE member_id = :member_id
+               AND status = 'pending_confirmation'
+               AND confirmation_expires_at IS NOT NULL
+               AND confirmation_expires_at > NOW()
              ORDER BY created_at DESC
              LIMIT 1
             """
@@ -755,14 +758,11 @@ async def get_pending_ai_safety_confirmation(
     row = result.mappings().first()
     if not row:
         return {"status": "none", "confirmation": None}
+    # Expired confirmations are intentionally excluded by the query above.
+    # Timeout escalation belongs to ``expire_stale_ai_safety_confirmations``;
+    # the protected-member read endpoint must never block on Guardian delivery
+    # or resurrect an old confirmation after SAFE/reopen/relogin.
     expires_at = row["confirmation_expires_at"]
-    if not expires_at:
-        return {"status": "none", "confirmation": None}
-    if expires_at <= datetime.now(timezone.utc):
-        locked = await _load_event_for_member(session, str(row["id"]), str(actor.id), for_update=True)
-        if locked and locked["status"] == "pending_confirmation":
-            await _dispatch_guardian_for_event(session, locked, reason="timeout")
-        return {"status": "expired", "confirmation": None}
     confirmation = _confirmation_payload(
         str(row["id"]),
         expires_at=expires_at,

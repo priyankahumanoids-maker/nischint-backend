@@ -8,7 +8,7 @@ import google.auth
 import google.auth.transport.requests
 from google.oauth2 import service_account
 import httpx
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -175,6 +175,18 @@ async def get_user_push_tokens(session: AsyncSession, user_id: UUID) -> list[str
     return [row[0] for row in result.fetchall()]
 
 
+async def get_users_push_tokens(session: AsyncSession, user_ids: list[UUID]) -> list[str]:
+    """Resolve push tokens for many users in one database round-trip."""
+    unique_ids = list(dict.fromkeys(user_id for user_id in user_ids if user_id))
+    if not unique_ids:
+        return []
+    statement = text(
+        "SELECT token FROM push_tokens WHERE user_id IN :uids"
+    ).bindparams(bindparam("uids", expanding=True))
+    result = await session.execute(statement, {"uids": unique_ids})
+    return [row[0] for row in result.fetchall()]
+
+
 async def send_push_to_tokens(
     tokens: list[str],
     title: str,
@@ -183,6 +195,7 @@ async def send_push_to_tokens(
     channel_id: str = GUARDIAN_ALERT_CHANNEL_ID,
     *,
     louder: bool = False,
+    record_token_health: bool = True,
 ) -> int:
     """Send HIGH priority push notification to a raw list of FCM tokens. Returns count sent.
 
@@ -284,14 +297,16 @@ async def send_push_to_tokens(
                         f"[FCM_PUSH_SENT]{' LOUDER' if louder else ''} "
                         f"to={mask_token(token)} title={title}"
                     )
-                    await _record_token_success(token)
+                    if record_token_health:
+                        await _record_token_success(token)
                     return 1
                 else:
                     logger.warning(f"[FCM_PUSH_FAIL] {resp.status_code}: {resp.text}")
-                    if _is_dead_token_response(resp.status_code, resp.text):
-                        await _purge_dead_token(token, reason=f"http={resp.status_code}")
-                    else:
-                        await _record_token_failure(token, reason=f"http={resp.status_code}")
+                    if record_token_health:
+                        if _is_dead_token_response(resp.status_code, resp.text):
+                            await _purge_dead_token(token, reason=f"http={resp.status_code}")
+                        else:
+                            await _record_token_failure(token, reason=f"http={resp.status_code}")
             except Exception as e:
                 logger.error(f"[FCM_PUSH_ERROR] {e}")
             return 0
