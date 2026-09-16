@@ -204,17 +204,24 @@ async def update_policy_for_actor(
     await session.commit()
     updated = await _load_policy(session, target_id)
 
-    # Existing SSE transport is only a best-effort wake-up hint. The protected
-    # mobile bridge also polls, so Redis/SSE failure cannot corrupt policy state.
+    # SSE is a best-effort wake-up hint only. Do not hold the Guardian PUT
+    # response open while Redis/SSE fan-out runs; the committed database row
+    # is authoritative and the protected runtime also polls as a fallback.
+    async def _broadcast_policy_change() -> None:
+        try:
+            from app.services.event_broadcaster import broadcaster
+            await broadcaster.broadcast_to_user(
+                target_id,
+                "monitoring_policy_changed",
+                updated,
+            )
+        except Exception as exc:
+            logger.warning("[MONITORING_POLICY] SSE wake-up deferred: %s", exc)
+
     try:
-        from app.services.event_broadcaster import broadcaster
-        await broadcaster.broadcast_to_user(
-            target_id,
-            "monitoring_policy_changed",
-            updated,
-        )
-    except Exception as exc:
-        logger.warning("[MONITORING_POLICY] SSE wake-up deferred: %s", exc)
+        asyncio.create_task(_broadcast_policy_change())
+    except RuntimeError:
+        pass
 
     # PHASE 2B — DATA-ONLY high-priority FCM wake for the protected member.
     # This is not an emergency/Guardian notification. It wakes the protected

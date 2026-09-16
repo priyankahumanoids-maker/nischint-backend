@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from typing import Literal
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -220,6 +220,52 @@ async def _can_manage_safety(session: AsyncSession, user: User, target_user_id: 
     return await _is_guardian_of(session, caller_id, target_user_id)
 
 
+async def _run_environmental_hazard_background(
+    user_id: str,
+    lat: float,
+    lng: float,
+) -> None:
+    """Evaluate external area context after the location response is sent.
+
+    Location/presence ingestion is a 10-second protected-device heartbeat and
+    must not wait on SACHET/Weather network calls. A one-minute Redis cooldown
+    keeps external-provider checks current without calling them on every fix.
+    """
+    from app.services.redis_service import get_json, set_json
+
+    try:
+        if get_json("geofence:hazard_check", user_id):
+            return
+        set_json(
+            "geofence:hazard_check",
+            user_id,
+            {
+                "lat": float(lat),
+                "lng": float(lng),
+                "started_at": datetime.utcnow().isoformat() + "Z",
+            },
+            ttl=60,
+        )
+    except Exception:
+        pass
+
+    try:
+        from app.db.session import async_session
+        from app.services.geofence_alerts import evaluate_environmental_hazard
+
+        async with async_session() as bg_session:
+            await evaluate_environmental_hazard(
+                bg_session,
+                user_id,
+                float(lat),
+                float(lng),
+            )
+            await bg_session.commit()
+    except Exception:
+        # External context must never block or break protected-device location.
+        return
+
+
 # ── Endpoints ──
 @router.post("/zone-for-user")
 async def create_zone_for_user(
@@ -360,6 +406,7 @@ async def deactivate_zone(
 @router.post("/location-update")
 async def location_update(
     req: LocationUpdateRequest,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
@@ -368,7 +415,6 @@ async def location_update(
     active safety zone and emits SSE events with emotional copy on transitions.
     """
     from app.services.geofence_alerts import (
-        evaluate_environmental_hazard,
         evaluate_user_location,
         record_protected_telemetry,
     )
@@ -437,13 +483,16 @@ async def location_update(
         session, target_id, req.lat, req.lng,
         previous_lat=previous_lat, previous_lng=previous_lng,
     )
-    environmental = await evaluate_environmental_hazard(
-        session,
+    # Commit authoritative location/zone/route state first. External hazard
+    # providers run after the HTTP response so a location heartbeat never waits
+    # on third-party network latency.
+    await session.commit()
+    background_tasks.add_task(
+        _run_environmental_hazard_background,
         target_id,
         req.lat,
         req.lng,
     )
-    await session.commit()
     return {
         "state": result.state,
         "message": result.message,
@@ -459,20 +508,11 @@ async def location_update(
             "source": telemetry.get("source"),
         },
         "environmental_hazard": {
-            "matched": bool(environmental.get("matched")),
-            "source": (
-                (environmental.get("strongest") or {}).get("source")
-                if environmental.get("matched")
-                else None
-            ),
-            "title": (
-                (environmental.get("strongest") or {}).get("title")
-                if environmental.get("matched")
-                else None
-            ),
-            "alert_dispatched": bool(
-                environmental.get("guardian_alert_dispatched")
-            ),
+            "matched": False,
+            "source": None,
+            "title": None,
+            "alert_dispatched": False,
+            "deferred": True,
         },
     }
 
