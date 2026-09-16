@@ -354,6 +354,9 @@ async def _compute_live_risk(session: AsyncSession, user: User):
             for session_id, count in recent_alert_result.all()
         }
 
+    from app.services.redis_service import get_user_pings
+    presence_pings = get_user_pings([str(child_id) for child_id in child_ids])
+
     results = []
     for child_id in child_ids:
         try:
@@ -363,18 +366,33 @@ async def _compute_live_risk(session: AsyncSession, user: User):
             active = active_by_user.get(child_id)
             if not active or not active.current_location:
                 last_known_at = child_user.last_known_at
+                ping_raw = presence_pings.get(str(child_id))
+                ping_dt = None
+                if ping_raw:
+                    try:
+                        ping_dt = datetime.fromisoformat(str(ping_raw).replace("Z", "+00:00"))
+                        if ping_dt.tzinfo is None:
+                            ping_dt = ping_dt.replace(tzinfo=timezone.utc)
+                        else:
+                            ping_dt = ping_dt.astimezone(timezone.utc)
+                    except (TypeError, ValueError):
+                        ping_dt = None
+                presence_online = bool(ping_dt and (now - ping_dt).total_seconds() <= 90)
                 results.append({
                     "child_id": str(child_id),
                     "child_name": child_user.full_name or "Unknown",
                     "risk": "GREEN",
                     "score": 0,
-                    "factors": ["Not currently tracking"],
-                    "status": "offline",
-                    "last_seen": last_known_at.isoformat() if last_known_at is not None else None,
+                    "factors": [] if presence_online else ["No recent protected-device heartbeat"],
+                    "status": "online" if presence_online else "offline",
+                    "presence_online": presence_online,
+                    "last_seen_online_at": ping_raw,
+                    "last_seen": last_known_at.isoformat() if last_known_at is not None else ping_raw,
+                    "last_updated": last_known_at.isoformat() if last_known_at is not None else ping_raw,
                     "lat": float(child_user.last_known_lat) if child_user.last_known_lat is not None else None,
                     "lng": float(child_user.last_known_lng) if child_user.last_known_lng is not None else None,
                     "session_id": None,
-                    "is_offline": True,
+                    "is_offline": not presence_online,
                 })
                 continue
 

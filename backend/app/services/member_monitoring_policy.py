@@ -221,9 +221,9 @@ async def update_policy_for_actor(
     # member's headless monitoring-policy task so AI/Mic/Location desired state
     # can be reconciled while the app UI is backgrounded/removed from Recents.
     try:
-        from app.services.monitoring_policy_push import send_monitoring_policy_wake
-        await send_monitoring_policy_wake(session, target_id, updated)
+        from app.services.monitoring_policy_push import schedule_monitoring_policy_wake
+        schedule_monitoring_policy_wake(target_id, updated)
     except Exception as exc:
-        logger.warning("[MONITORING_POLICY] FCM wake-up deferred: %s", exc)
+        logger.warning("[MONITORING_POLICY] FCM wake-up scheduling deferred: %s", exc)
 
     return updated

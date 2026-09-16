@@ -69,6 +69,21 @@ async def _filter_protected_scope_ids(
     return [row[0] for row in result.all() if row[0] is not None]
 
 
+
+
+def _presence_from_ping(raw: str | None, now: datetime, window_s: int = 90) -> bool:
+    if not raw:
+        return False
+    try:
+        ping_dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if ping_dt.tzinfo is None:
+            ping_dt = ping_dt.replace(tzinfo=timezone.utc)
+        else:
+            ping_dt = ping_dt.astimezone(timezone.utc)
+        return 0 <= (now - ping_dt).total_seconds() <= window_s
+    except (TypeError, ValueError):
+        return False
+
 def _fresh_device_telemetry(raw: object, now: datetime) -> tuple[dict | None, datetime | None]:
     """Return only recent, real protected-device telemetry."""
     if not isinstance(raw, dict):
@@ -382,6 +397,9 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
         user_role,
     )
     now = datetime.now(timezone.utc)
+    from app.services.redis_service import get_user_pings
+    presence_pings = get_user_pings([str(uid) for uid in user_ids])
+
     guardian_uuid = uuid.UUID(guardian_user_id)
 
     users_by_id: dict[uuid.UUID, User] = {}
@@ -687,6 +705,10 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                 else None
             ),
             "telemetry_fresh": device_telemetry is not None,
+            "presence_online": _presence_from_ping(
+                presence_pings.get(str(uid)), now
+            ),
+            "last_seen_online_at": presence_pings.get(str(uid)),
             "has_active_session": active_session is not None,
             "active_session": None,
         }

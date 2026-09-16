@@ -135,3 +135,29 @@ async def send_monitoring_policy_wake(
             exc,
         )
         return 0
+
+
+def schedule_monitoring_policy_wake(member_id: str, policy: dict[str, Any]) -> None:
+    """Fire-and-forget policy wake using its own DB session.
+
+    The authoritative monitoring policy is already committed before this is
+    called, so Guardian UI latency must not depend on Firebase/network latency.
+    """
+    async def _run() -> None:
+        try:
+            from app.db.session import async_session
+            async with async_session() as session:
+                await send_monitoring_policy_wake(session, member_id, policy)
+        except Exception as exc:
+            logger.warning(
+                "[MONITORING_POLICY_FCM] scheduled wake deferred member=%s error=%s",
+                member_id,
+                exc,
+            )
+
+    try:
+        asyncio.create_task(_run())
+    except RuntimeError:
+        # No active event loop should never occur in FastAPI request handling,
+        # but policy persistence remains authoritative if it does.
+        pass
