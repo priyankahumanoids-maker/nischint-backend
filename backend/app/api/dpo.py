@@ -13,6 +13,8 @@ instantly, works on every device, and can survive any frontend outage.
 """
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -22,6 +24,34 @@ router = APIRouter(tags=["privacy", "dpdp"])
 DPO_NAME = "Nischint Data Protection Officer"
 DPO_EMAIL = "privacy@nischint.care"
 DPO_RESPONSE_SLA_DAYS = 30
+
+# ── Settings Phase 3A2: remote legal content ─────────────────────────
+# Final legal text is intentionally NOT stored in the mobile binary.
+# Empty server-side values remain pending until client/legal approval.
+
+def _legal_item(prefix: str) -> dict:
+    url = (os.getenv(f"{prefix}_URL") or "").strip() or None
+    content = (os.getenv(f"{prefix}_CONTENT") or "").strip() or None
+    version = (os.getenv(f"{prefix}_VERSION") or "").strip() or None
+    updated_at = (os.getenv(f"{prefix}_UPDATED_AT") or "").strip() or None
+    return {
+        "status": "published" if (url or content) else "pending",
+        "url": url,
+        "content": content,
+        "version": version,
+        "updated_at": updated_at,
+    }
+
+
+@router.get("/public/legal-content", response_class=JSONResponse)
+async def public_legal_content():
+    """Return approved remote legal content, or pending when unpublished."""
+    return {
+        "schema_version": "1",
+        "privacy_policy": _legal_item("NISCHINT_PRIVACY_POLICY"),
+        "terms": _legal_item("NISCHINT_TERMS"),
+        "dpdp_consent": _legal_item("NISCHINT_DPDP_CONSENT"),
+    }
 
 
 @router.get("/dpo.json", response_class=JSONResponse)

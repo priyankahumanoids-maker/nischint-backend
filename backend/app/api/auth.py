@@ -467,6 +467,7 @@ async def _issue_local_session_response(
         "role": user.role,
         "email": user.email,
         "full_name": user.full_name,
+        "phone": user.phone,
         "sid": sid,
         "auth_provider": provider,
     }
@@ -664,6 +665,83 @@ async def update_my_phone(
     }
 
 
+class UpdateMyProfileRequest(BaseModel):
+    full_name: Optional[str] = Field(default=None, max_length=100)
+    phone: Optional[str] = Field(default=None, max_length=20)
+
+
+@router.patch("/me/profile")
+async def update_my_profile(
+    req: UpdateMyProfileRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Update the signed-in user's editable profile fields.
+
+    Email is intentionally excluded because it is an authentication identifier
+    and requires a separate verified email-change flow. This endpoint is only
+    for low-risk profile data used by the Settings Profile screen.
+    """
+    from sqlalchemy import select
+
+    requested_name = None
+    if req.full_name is not None:
+        requested_name = str(req.full_name).strip()
+        if not requested_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Full name cannot be empty.",
+            )
+
+    normalized_phone = None
+    if req.phone is not None:
+        normalized_phone = _require_normalized_phone(req.phone)
+        if await _phone_exists(
+            session,
+            normalized_phone,
+            exclude_user_id=user.id,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This mobile number is already registered. Please use another number.",
+            )
+
+    if requested_name is None and normalized_phone is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No editable profile fields were provided.",
+        )
+
+    result = await session.execute(
+        select(User).where(User.id == user.id).with_for_update()
+    )
+    db_user = result.scalar_one_or_none()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User account not found")
+
+    if requested_name is not None:
+        db_user.full_name = requested_name
+    if normalized_phone is not None:
+        db_user.phone = normalized_phone
+
+    await session.commit()
+    await session.refresh(db_user)
+
+    user_cache.invalidate_user_keys(
+        str(db_user.id),
+        str(db_user.cognito_sub or ""),
+    )
+
+    return {
+        "updated": True,
+        "id": str(db_user.id),
+        "email": db_user.email,
+        "full_name": db_user.full_name,
+        "phone": db_user.phone,
+        "role": db_user.role,
+    }
+
+
 @router.post("/session", response_model=TokenResponse)
 @limiter.limit("10/minute")
 async def upgrade_local_session(
@@ -770,6 +848,7 @@ async def refresh(
             "role": user.role,
             "email": user.email,
             "full_name": user.full_name,
+            "phone": user.phone,
             "sid": sid,
             "auth_provider": session_provider,
         }
@@ -870,6 +949,7 @@ async def refresh(
         "role": user.role,
         "email": user.email,
         "full_name": user.full_name,
+        "phone": user.phone,
         "sid": sid,
     })
     await session.commit()
@@ -1788,6 +1868,7 @@ async def _cognito_register(
         "role": user.role,
         "email": user.email,
         "full_name": user.full_name,
+        "phone": user.phone,
         "sid": sid,
     })
     await session.commit()
@@ -1904,6 +1985,7 @@ async def _cognito_login(
         "role": user.role,
         "email": user.email,
         "full_name": user.full_name,
+        "phone": user.phone,
         "cognito:groups": sorted(normalize_roles(cognito_groups)),
         "sid": sid,
     })
