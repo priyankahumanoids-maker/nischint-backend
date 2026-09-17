@@ -2,6 +2,7 @@
 # Manages guardian networks, live sharing sessions, and alert dispatching.
 # Persists to PostgreSQL via SQLAlchemy models.
 
+import asyncio
 import logging
 import math
 import uuid
@@ -266,6 +267,60 @@ async def get_user_sessions(session: AsyncSession, user_id: str, limit: int = 10
     } for gs in result.scalars().all()]
 
 
+async def _send_idle_checkin_to_protected_member(
+    guardian_user_id: str | None,
+    protected_user_id: str,
+) -> dict | None:
+    """Create the protected-member Safety Check in an isolated DB session.
+
+    Safe Walk location updates must keep their own transaction independent
+    from the Check-In service because Check-In intentionally commits before
+    FCM delivery. The isolated session lets the protected member receive the
+    existing durable Safety Check even when their app is backgrounded/closed
+    without committing or rolling back the journey location transaction.
+    """
+    if not guardian_user_id:
+        logger.warning(
+            "SAFE_WALK_IDLE_CHECK skipped: no linked guardian protected=%s",
+            protected_user_id,
+        )
+        return None
+
+    try:
+        from app.db.session import async_session
+        from app.services.checkin_service import create_checkin
+
+        async with async_session() as checkin_session:
+            result = await create_checkin(
+                checkin_session,
+                str(guardian_user_id),
+                str(protected_user_id),
+            )
+        if result.get("error"):
+            logger.warning(
+                "SAFE_WALK_IDLE_CHECK create failed protected=%s guardian=%s error=%s",
+                protected_user_id,
+                guardian_user_id,
+                result.get("error"),
+            )
+            return None
+        logger.info(
+            "SAFE_WALK_IDLE_CHECK sent protected=%s guardian=%s checkin=%s",
+            protected_user_id,
+            guardian_user_id,
+            result.get("check_in_id"),
+        )
+        return result
+    except Exception as exc:
+        logger.warning(
+            "SAFE_WALK_IDLE_CHECK dispatch failed protected=%s guardian=%s error=%s",
+            protected_user_id,
+            guardian_user_id,
+            exc,
+        )
+        return None
+
+
 # ── Location Updates ──
 
 async def update_location(
@@ -434,16 +489,48 @@ async def update_location(
             if idle_dur >= IDLE_DURATION_THRESHOLD_S and not live.get("safety_check_pending"):
                 live["safety_check_pending"] = True
                 live["safety_check_sent_at"] = now
-                alert = await _create_alert(session, session_id, "idle", "medium",
-                    f"Stopped for {round(idle_dur)}s — are you safe?",
-                    "Unexpected stop detected", "Tap to confirm you are safe",
-                    {"lat": lat, "lng": lng}, user_id=str(gs.user_id),
+                gs.safety_check_pending = True
+                gs.safety_check_sent_at = now
+
+                # The protected member is the person who must answer
+                # "Are you safe?". Guardians receive a separate informational
+                # stop alert with member-specific wording. The existing Check-In
+                # service owns the protected-member FCM + Safety Check prompt and
+                # its one-minute no-response escalation, so this works even when
+                # the protected app is backgrounded/closed.
+                guardian_ids, child_name, _ = await _resolve_guardian_ids(
+                    session,
+                    str(gs.user_id),
                 )
+                display_name = child_name or "Protected member"
+                primary_guardian_id = guardian_ids[0] if guardian_ids else None
+
+                alert_task = _create_alert(
+                    session,
+                    session_id,
+                    "idle",
+                    "medium",
+                    f"{display_name} has been stopped for {round(idle_dur)}s during Safe Walk.",
+                    "Unexpected stop detected during the active Safe Walk. "
+                    "NISCHINT sent a Safety Check to the protected member.",
+                    "Monitor their live location. If they do not respond, "
+                    "NISCHINT will escalate automatically.",
+                    {"lat": lat, "lng": lng},
+                    user_id=str(gs.user_id),
+                )
+                checkin_task = _send_idle_checkin_to_protected_member(
+                    primary_guardian_id,
+                    str(gs.user_id),
+                )
+                alert, _ = await asyncio.gather(alert_task, checkin_task)
                 alerts_generated.append(alert)
     else:
         gs.is_idle = False
         live["idle_since"] = None
         live["safety_check_pending"] = False
+        live["safety_check_sent_at"] = None
+        gs.safety_check_pending = False
+        gs.safety_check_sent_at = None
 
     # ETA
     # Keep the last valid ETA when GPS reports no meaningful movement. This
@@ -468,16 +555,41 @@ async def update_location(
 
     # No-response escalation
     if live.get("safety_check_pending") and live.get("safety_check_sent_at"):
-        elapsed = (now - live["safety_check_sent_at"]).total_seconds()
-        if elapsed > 300 and gs.escalation_level != "emergency":
-            gs.escalation_level = "emergency"
-            alert = await _create_alert(session, session_id, "emergency", "critical",
-                "No response — escalating to emergency",
-                f"Unresponsive for {round(elapsed)}s",
-                "Emergency services may be contacted",
-                {"lat": lat, "lng": lng}, user_id=str(gs.user_id),
+        # The Check-In service is the primary one-minute escalation owner for
+        # the protected-member Safety Check. Reconcile its durable response so
+        # a SAFE/HELP/EXPIRED check-in can never be followed five minutes later
+        # by a false duplicate Guardian Mode emergency. Keep the old five-minute
+        # branch only as a fallback if the Check-In row is still pending.
+        from app.models.checkin import CheckIn
+
+        checkin_result = await session.execute(
+            select(CheckIn)
+            .where(
+                CheckIn.child_id == gs.user_id,
+                CheckIn.created_at >= live["safety_check_sent_at"] - timedelta(seconds=5),
             )
-            alerts_generated.append(alert)
+            .order_by(CheckIn.created_at.desc())
+            .limit(1)
+        )
+        latest_checkin = checkin_result.scalar_one_or_none()
+        if latest_checkin is not None and latest_checkin.status in {"safe", "help", "expired"}:
+            live["safety_check_pending"] = False
+            live["safety_check_sent_at"] = None
+            gs.safety_check_pending = False
+            gs.safety_check_sent_at = None
+            if latest_checkin.status == "safe" and gs.escalation_level == "emergency":
+                gs.escalation_level = RISK_ESC_MAP.get(gs.risk_level, "none")
+        else:
+            elapsed = (now - live["safety_check_sent_at"]).total_seconds()
+            if elapsed > 300 and gs.escalation_level != "emergency":
+                gs.escalation_level = "emergency"
+                alert = await _create_alert(session, session_id, "emergency", "critical",
+                    "No response — escalating to emergency",
+                    f"Unresponsive for {round(elapsed)}s",
+                    "Emergency services may be contacted",
+                    {"lat": lat, "lng": lng}, user_id=str(gs.user_id),
+                )
+                alerts_generated.append(alert)
 
     # Update DB
     gs.current_location = {"lat": lat, "lng": lng}
