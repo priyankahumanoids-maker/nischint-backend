@@ -388,6 +388,18 @@ async def _dispatch_guardian_for_event(
     *,
     reason: str,
 ) -> dict[str, Any]:
+    """Dispatch a confirmed AI alert without holding the AI-event transaction open.
+
+    The protected-member response endpoint loads the event with ``FOR UPDATE``.
+    Guardian delivery can involve several DB reads plus FCM network I/O, so keeping
+    that row lock / request transaction open across delivery couples two independent
+    failure domains and can surface as HTTP 500 after an otherwise valid HELP.
+
+    Release the request transaction first, dispatch in its own short-lived session,
+    then persist the AI-event outcome in a fresh short transaction.  The alert itself
+    remains idempotent by event ID, and a legacy-resolver retry is available only if
+    the optimized dispatch path raises before returning a result.
+    """
     event_id = str(row["id"])
     member_id = str(row["member_id"])
     anchor = str(row["authoritative_anchor"] or "AI_SAFETY")
@@ -437,69 +449,117 @@ async def _dispatch_guardian_for_event(
         details.append("External context: " + ", ".join(provider_names))
     details.append("Protected-member response: NEED HELP" if reason == "help" else "Protected-member response: TIMEOUT")
 
+    # IMPORTANT: release the FOR UPDATE/request transaction before any Guardian
+    # DB fan-out or FCM network I/O.  This also prevents a best-effort alert
+    # sub-operation from poisoning the AI-event transaction.
+    await session.commit()
+
+    from app.db.session import async_session
     from app.services.alert_trigger import trigger_alert
-    result = await trigger_alert(
-        session,
-        kind="ai_safety",
-        user_id=member_id,
-        severity="critical",
-        message=f"{member_name}: {_event_message(anchor, reason, semantic_label)}",
-        details="; ".join(details),
-        location=row["location"] if isinstance(row["location"], dict) else None,
-        sse_event_type="ai_safety_alert",
-        sse_payload_extras={
-            "ai_event_id": event_id,
-            "client_event_id": row["client_event_id"],
-            "ai_anchor": anchor,
-            "ai_score": float(row["adjusted_score"] or row["score"] or 0),
-            "ai_sources": sources,
-            "ai_confirmation_result": reason,
-            "ai_voice_semantic_type": semantic_label or "",
-            "ai_external_context_providers": provider_names,
-        },
-        louder=False,
-        idempotency_key=f"ai-confirmed:{event_id}",
-        cooldown_s=120,
-        persist_alert=True,
-        suppress_co_located=False,
-        # Confirmation-gated AI safety alerts must not depend on the optional
-        # SafetyIncident/timeline subsystem. GuardianAlert + SSE + FCM remain
-        # authoritative; skipping supplementary incident tracking prevents an
-        # auxiliary schema/transaction failure from turning HELP into HTTP 500.
-        track_incident=False,
-        # AI-safety dispatch is push-only. Reuse resolved guardian user IDs and
-        # avoid legacy guardian/token lookups on this latency-sensitive path.
-        fast_push_only=True,
-    )
+
+    async def _run_dispatch(*, fast_push_only: bool, use_dedup: bool):
+        async with async_session() as dispatch_session:
+            try:
+                result = await trigger_alert(
+                    dispatch_session,
+                    kind="ai_safety",
+                    user_id=member_id,
+                    severity="critical",
+                    message=f"{member_name}: {_event_message(anchor, reason, semantic_label)}",
+                    details="; ".join(details),
+                    location=row["location"] if isinstance(row["location"], dict) else None,
+                    sse_event_type="ai_safety_alert",
+                    sse_payload_extras={
+                        "ai_event_id": event_id,
+                        "client_event_id": row["client_event_id"],
+                        "ai_anchor": anchor,
+                        "ai_score": float(row["adjusted_score"] or row["score"] or 0),
+                        "ai_sources": sources,
+                        "ai_confirmation_result": reason,
+                        "ai_voice_semantic_type": semantic_label or "",
+                        "ai_external_context_providers": provider_names,
+                    },
+                    louder=False,
+                    idempotency_key=(f"ai-confirmed:{event_id}" if use_dedup else None),
+                    cooldown_s=120,
+                    persist_alert=True,
+                    suppress_co_located=False,
+                    track_incident=False,
+                    fast_push_only=fast_push_only,
+                )
+                await dispatch_session.commit()
+                return result
+            except Exception:
+                await dispatch_session.rollback()
+                raise
+
+    try:
+        result = await _run_dispatch(fast_push_only=True, use_dedup=True)
+    except Exception as exc:
+        # The fallback uses the proven relationship resolver and disables the
+        # already-consumed dedup key.  It runs in a brand-new transaction so a
+        # failed optimized query cannot poison the retry.
+        logger.exception(
+            "[AI_SAFETY] optimized Guardian dispatch failed event=%s; retrying legacy resolver: %r",
+            event_id,
+            exc,
+        )
+        result = await _run_dispatch(fast_push_only=False, use_dedup=False)
 
     final_status = "escalated_help" if reason == "help" else "escalated_timeout"
-    await session.execute(
-        text(
-            """
-            UPDATE ai_safety_events
-               SET status = :status, response = :response, responded_at = NOW(),
-                   updated_at = NOW(), notification_gate_enabled = TRUE,
-                   guardian_alert_dispatched = :dispatched,
-                   guardian_alert_id = :alert_id,
-                   dispatch_result = CAST(:result AS JSONB)
-             WHERE id = :id
-            """
-        ),
-        {
-            "id": event_id,
-            "status": final_status,
-            "response": reason,
-            "dispatched": bool(result.dispatched),
-            "alert_id": result.alert_id,
-            "result": _json(result.to_dict(), {}),
-        },
-    )
-    await session.commit()
+    result_dict = result.to_dict()
+
+    async def _persist_dispatch_outcome(target_session: AsyncSession) -> None:
+        await target_session.execute(
+            text(
+                """
+                UPDATE ai_safety_events
+                   SET status = :status, response = :response, responded_at = NOW(),
+                       updated_at = NOW(), notification_gate_enabled = TRUE,
+                       guardian_alert_dispatched =
+                           (guardian_alert_dispatched OR :dispatched),
+                       guardian_alert_id =
+                           COALESCE(guardian_alert_id, :alert_id),
+                       dispatch_result = CASE
+                           WHEN :dispatched THEN CAST(:result AS JSONB)
+                           ELSE COALESCE(dispatch_result, CAST(:result AS JSONB))
+                       END
+                 WHERE id = :id
+                """
+            ),
+            {
+                "id": event_id,
+                "status": final_status,
+                "response": reason,
+                "dispatched": bool(result.dispatched),
+                "alert_id": result.alert_id,
+                "result": _json(result_dict, {}),
+            },
+        )
+
+    # Reuse the now-clean request session first.  If the pooler/session was
+    # invalidated during the earlier transaction, retry the tiny status write
+    # in a brand-new session instead of turning successful Guardian delivery
+    # into an HTTP 500.
+    try:
+        await _persist_dispatch_outcome(session)
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        logger.warning(
+            "[AI_SAFETY] request-session outcome write failed event=%s; retrying fresh session: %r",
+            event_id,
+            exc,
+        )
+        async with async_session() as status_session:
+            await _persist_dispatch_outcome(status_session)
+            await status_session.commit()
+
     return {
         "status": final_status,
         "event_id": event_id,
         "guardian_alert_dispatched": bool(result.dispatched),
-        "dispatch": result.to_dict(),
+        "dispatch": result_dict,
     }
 
 
