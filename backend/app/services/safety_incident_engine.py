@@ -134,18 +134,22 @@ async def open_incident_for_alert(
             try:
                 from app.services.risk_prediction.predictor import predict as _predict
                 import uuid as _uuid
-                pred = await _predict(
-                    session,
-                    subject_id=_uuid.uuid5(
-                        _uuid.NAMESPACE_DNS,
-                        f"latlng:{float(location['lat']):.4f},"
-                        f"{float(location['lng']):.4f}",
-                    ),
-                    subject_type="zone",
-                    zone_id=None,
-                    prediction_window_min=15,
-                    persist=False,                # don't pollute ledger from alert path
-                )
+                # This is advisory work. Keep any DB failure inside a SAVEPOINT
+                # so a missing/lagging auxiliary table cannot poison the caller's
+                # transaction and block the actual Guardian alert.
+                async with session.begin_nested():
+                    pred = await _predict(
+                        session,
+                        subject_id=_uuid.uuid5(
+                            _uuid.NAMESPACE_DNS,
+                            f"latlng:{float(location['lat']):.4f},"
+                            f"{float(location['lng']):.4f}",
+                        ),
+                        subject_type="zone",
+                        zone_id=None,
+                        prediction_window_min=15,
+                        persist=False,                # don't pollute ledger from alert path
+                    )
                 if (
                     pred.get("status") == "ok"
                     and float(pred.get("risk_probability") or 0.0) > 0.7
@@ -191,12 +195,15 @@ async def open_incident_for_alert(
                     zone_risk = float(
                         external_audit["predictive_risk"].get("probability") or 0.0,
                     )
-                behavioral = await assess_and_record(
-                    session,
-                    entity_id=cu,
-                    observation=observation,
-                    zone_risk=zone_risk,
-                )
+                # Behavioural enrichment is also advisory. Isolate it from
+                # the primary alert transaction for the same reason.
+                async with session.begin_nested():
+                    behavioral = await assess_and_record(
+                        session,
+                        entity_id=cu,
+                        observation=observation,
+                        zone_risk=zone_risk,
+                    )
                 if behavioral.get("status") in {"ok", "dlq_fallback"} \
                         and behavioral.get("dispatch_influence"):
                     # Critical shift AND corroborating zone risk —
@@ -221,74 +228,90 @@ async def open_incident_for_alert(
                     f"(non-fatal): {e!r}"
                 )
 
-        inc = SafetyIncident(
-            child_id=cu,
-            incident_type=kind,
-            severity=(severity or "info"),
-            state=IncidentState.DETECTED.value,
-            confidence=float(modified_confidence),
-            sla_incident_id=sla_id,
-            sla_degraded_at_dispatch=bool(sla_degraded),
-            extra=meta or None,
-            external_signals=external_audit,
-            confidence_pre_external=(
-                base_confidence if external_audit is not None else None
-            ),
-        )
-        session.add(inc)
-        await session.flush()
+        # SafetyIncident is supplementary metadata. Create it inside a
+        # SAVEPOINT so a schema problem in this optional subsystem can never
+        # leave the request session in PendingRollbackError and suppress FCM.
+        inc: Optional[SafetyIncident] = None
+        try:
+            async with session.begin_nested():
+                inc = SafetyIncident(
+                    child_id=cu,
+                    incident_type=kind,
+                    severity=(severity or "info"),
+                    state=IncidentState.DETECTED.value,
+                    confidence=float(modified_confidence),
+                    sla_incident_id=sla_id,
+                    sla_degraded_at_dispatch=bool(sla_degraded),
+                    extra=meta or None,
+                    external_signals=external_audit,
+                    confidence_pre_external=(
+                        base_confidence if external_audit is not None else None
+                    ),
+                )
+                session.add(inc)
+                await session.flush()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[SAFETY_INCIDENT] row create failed (non-fatal) "
+                f"child={child_id} kind={kind}: {e}"
+            )
+            return None
 
         # Day 3 — write the DETECTED creation event. `from_state=None`
         # marks this as the genesis row; the timeline endpoint uses the
         # NULL to render "X detected" rather than "Y → X".
         try:
-            from app.models.safety_incident_event import SafetyIncidentEvent
-            session.add(SafetyIncidentEvent(
-                incident_id=inc.id,
-                from_state=None,
-                to_state=IncidentState.DETECTED.value,
-                actor_id=None,
-                actor_type="system",
-                ttfa_tag=f"incident_state:{IncidentState.DETECTED.value}",
-                sla_degraded=bool(sla_degraded),
-                extra={
-                    "confidence": float(modified_confidence),
-                    "escalation_level": 0,
-                    "alert_id": alert_id,
-                    "kind": kind,
-                },
-            ))
-            # NISCH-012.0 — forensic row when an external signal moved
-            # the needle. We deliberately fire this AS A SEPARATE EVENT
-            # (not folded into the DETECTED row) so the timeline UI
-            # can render it as its own line: "weather bumped confidence
-            # from 0.78 to 0.93".
-            if external_audit is not None:
+            # `safety_incident_events` is timeline/audit metadata, not part of
+            # delivery. Use a nested transaction so even a missing table rolls
+            # back only this audit write and leaves GuardianAlert/FCM healthy.
+            async with session.begin_nested():
+                from app.models.safety_incident_event import SafetyIncidentEvent
                 session.add(SafetyIncidentEvent(
                     incident_id=inc.id,
-                    from_state=IncidentState.DETECTED.value,
+                    from_state=None,
                     to_state=IncidentState.DETECTED.value,
                     actor_id=None,
-                    actor_type="external_signal",
-                    ttfa_tag="confidence_modifier",
-                    sla_degraded=False,
+                    actor_type="system",
+                    ttfa_tag=f"incident_state:{IncidentState.DETECTED.value}",
+                    sla_degraded=bool(sla_degraded),
                     extra={
-                        "confidence_before": external_audit.get("confidence_before"),
-                        "confidence_after":  external_audit.get("confidence_after"),
-                        "modifier_applied":  external_audit.get("modifier_applied"),
-                        "modifier_capped":   external_audit.get("modifier_capped"),
-                        "providers": [
-                            {
-                                "provider":    p["provider"],
-                                "signal_type": p["signal_type"],
-                                "delta":       p.get("delta", 0.0),
-                                "applied":     p.get("applied", False),
-                            }
-                            for p in external_audit.get("providers", [])
-                        ],
+                        "confidence": float(modified_confidence),
+                        "escalation_level": 0,
+                        "alert_id": alert_id,
+                        "kind": kind,
                     },
                 ))
-            await session.flush()
+                # NISCH-012.0 — forensic row when an external signal moved
+                # the needle. We deliberately fire this AS A SEPARATE EVENT
+                # (not folded into the DETECTED row) so the timeline UI
+                # can render it as its own line: "weather bumped confidence
+                # from 0.78 to 0.93".
+                if external_audit is not None:
+                    session.add(SafetyIncidentEvent(
+                        incident_id=inc.id,
+                        from_state=IncidentState.DETECTED.value,
+                        to_state=IncidentState.DETECTED.value,
+                        actor_id=None,
+                        actor_type="external_signal",
+                        ttfa_tag="confidence_modifier",
+                        sla_degraded=False,
+                        extra={
+                            "confidence_before": external_audit.get("confidence_before"),
+                            "confidence_after":  external_audit.get("confidence_after"),
+                            "modifier_applied":  external_audit.get("modifier_applied"),
+                            "modifier_capped":   external_audit.get("modifier_capped"),
+                            "providers": [
+                                {
+                                    "provider":    p["provider"],
+                                    "signal_type": p["signal_type"],
+                                    "delta":       p.get("delta", 0.0),
+                                    "applied":     p.get("applied", False),
+                                }
+                                for p in external_audit.get("providers", [])
+                            ],
+                        },
+                    ))
+                await session.flush()
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[SAFETY_INCIDENT] DETECTED event write failed (non-fatal): {e}")
 
@@ -304,15 +327,18 @@ async def open_incident_for_alert(
         # chunks, so an orphan row is harmless.
         if (severity or "info").lower() in ("alert", "critical"):
             try:
-                from app.services import emergency_stream_service as _ess
-                await _ess.start_recording_session(
-                    session,
-                    child_id=cu,
-                    incident_id=inc.id,
-                    trigger=f"safety_brain:{(severity or 'alert').lower()}",
-                    risk_score=float(modified_confidence) if modified_confidence is not None else None,
-                )
-                await session.flush()
+                # Emergency-stream auto-open is supplementary. Its DB writes
+                # must not poison the alert request when its schema is behind.
+                async with session.begin_nested():
+                    from app.services import emergency_stream_service as _ess
+                    await _ess.start_recording_session(
+                        session,
+                        child_id=cu,
+                        incident_id=inc.id,
+                        trigger=f"safety_brain:{(severity or 'alert').lower()}",
+                        risk_score=float(modified_confidence) if modified_confidence is not None else None,
+                    )
+                    await session.flush()
                 logger.info(
                     f"[NISCH-008] auto-opened stream session for incident "
                     f"id={inc.id} severity={severity}"
@@ -340,7 +366,8 @@ async def advance_to_validating(
     if incident is None:
         return
     try:
-        await transition(session, incident, IncidentState.VALIDATING)
+        async with session.begin_nested():
+            await transition(session, incident, IncidentState.VALIDATING)
     except InvalidTransitionError:
         # Already past VALIDATING (concurrent path) — silent.
         pass
@@ -356,7 +383,8 @@ async def advance_to_escalated(
     if incident is None:
         return
     try:
-        await transition(session, incident, IncidentState.ESCALATED)
+        async with session.begin_nested():
+            await transition(session, incident, IncidentState.ESCALATED)
     except InvalidTransitionError:
         pass
     except Exception as e:  # noqa: BLE001
