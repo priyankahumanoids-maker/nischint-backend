@@ -479,14 +479,21 @@ async def update_location(
             gs.escalation_level = esc
 
     # Idle detection
+    # DB fields are authoritative so the timer survives Cloud Run instance
+    # changes/restarts as well as protected-phone background/Recents states.
+    # _live_state remains only a per-process acceleration/cache.
     if speed < IDLE_SPEED_THRESHOLD:
         if not gs.is_idle:
             gs.is_idle = True
+            gs.idle_since = now
             live["idle_since"] = now
         else:
-            idle_start = live.get("idle_since", now)
+            idle_start = gs.idle_since or live.get("idle_since") or now
+            if gs.idle_since is None:
+                gs.idle_since = idle_start
+            live["idle_since"] = idle_start
             idle_dur = (now - idle_start).total_seconds()
-            if idle_dur >= IDLE_DURATION_THRESHOLD_S and not live.get("safety_check_pending"):
+            if idle_dur >= IDLE_DURATION_THRESHOLD_S and not gs.safety_check_pending:
                 live["safety_check_pending"] = True
                 live["safety_check_sent_at"] = now
                 gs.safety_check_pending = True
@@ -526,6 +533,7 @@ async def update_location(
                 alerts_generated.append(alert)
     else:
         gs.is_idle = False
+        gs.idle_since = None
         live["idle_since"] = None
         live["safety_check_pending"] = False
         live["safety_check_sent_at"] = None
@@ -554,7 +562,13 @@ async def update_location(
             alerts_generated.append(alert)
 
     # No-response escalation
-    if live.get("safety_check_pending") and live.get("safety_check_sent_at"):
+    # Rehydrate from DB first: a new Cloud Run worker may have no _live_state.
+    safety_check_pending = bool(gs.safety_check_pending or live.get("safety_check_pending"))
+    safety_check_sent_at = gs.safety_check_sent_at or live.get("safety_check_sent_at")
+    if safety_check_pending and safety_check_sent_at:
+        live["safety_check_pending"] = True
+        live["safety_check_sent_at"] = safety_check_sent_at
+
         # The Check-In service is the primary one-minute escalation owner for
         # the protected-member Safety Check. Reconcile its durable response so
         # a SAFE/HELP/EXPIRED check-in can never be followed five minutes later
@@ -566,7 +580,7 @@ async def update_location(
             select(CheckIn)
             .where(
                 CheckIn.child_id == gs.user_id,
-                CheckIn.created_at >= live["safety_check_sent_at"] - timedelta(seconds=5),
+                CheckIn.created_at >= safety_check_sent_at - timedelta(seconds=5),
             )
             .order_by(CheckIn.created_at.desc())
             .limit(1)
@@ -580,7 +594,7 @@ async def update_location(
             if latest_checkin.status == "safe" and gs.escalation_level == "emergency":
                 gs.escalation_level = RISK_ESC_MAP.get(gs.risk_level, "none")
         else:
-            elapsed = (now - live["safety_check_sent_at"]).total_seconds()
+            elapsed = (now - safety_check_sent_at).total_seconds()
             if elapsed > 300 and gs.escalation_level != "emergency":
                 gs.escalation_level = "emergency"
                 alert = await _create_alert(session, session_id, "emergency", "critical",
