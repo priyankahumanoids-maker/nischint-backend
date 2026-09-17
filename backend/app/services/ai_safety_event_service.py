@@ -462,6 +462,14 @@ async def _dispatch_guardian_for_event(
         cooldown_s=120,
         persist_alert=True,
         suppress_co_located=False,
+        # Confirmation-gated AI safety alerts must not depend on the optional
+        # SafetyIncident/timeline subsystem. GuardianAlert + SSE + FCM remain
+        # authoritative; skipping supplementary incident tracking prevents an
+        # auxiliary schema/transaction failure from turning HELP into HTTP 500.
+        track_incident=False,
+        # AI-safety dispatch is push-only. Reuse resolved guardian user IDs and
+        # avoid legacy guardian/token lookups on this latency-sensitive path.
+        fast_push_only=True,
     )
 
     final_status = "escalated_help" if reason == "help" else "escalated_timeout"
