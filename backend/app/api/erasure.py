@@ -16,11 +16,13 @@ admin endpoints use `require_role("admin")`.
 """
 from __future__ import annotations
 
+import secrets
+
 import logging
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,9 +33,18 @@ from app.models.erasure_request import (
     STATUS_PENDING,
 )
 from app.models.user import User
-from app.services import erasure_service
+from app.services import erasure_service, sms_service
+from app.services.auth_otp_service import (
+    OTP_MAX_ATTEMPTS,
+    OTP_RESEND_COOLDOWN_SECONDS,
+    OTP_TTL_SECONDS,
+    consume_otp,
+    store_otp,
+)
 
 logger = logging.getLogger(__name__)
+
+ACCOUNT_ERASURE_OTP_PURPOSE = "account_erasure"
 
 # ── Schemas ──────────────────────────────────────────────────────────
 
@@ -104,6 +115,87 @@ admin_router = APIRouter(
 # ── User endpoints ───────────────────────────────────────────────────
 
 
+@router.post(
+    "/erasure-otp/request",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def request_self_erasure_otp(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Send a one-time SMS code to the authenticated user's registered phone.
+
+    The OTP is stored only as the existing HMAC digest in auth_otps. This
+    endpoint never returns or logs the code.
+    """
+    existing = await session.execute(
+        select(ErasureRequest)
+        .where(ErasureRequest.user_id == user.id)
+        .where(ErasureRequest.status == STATUS_PENDING)
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account-deletion request is already pending. Manage or cancel that request instead.",
+        )
+
+    phone = str(user.phone or "").strip()
+    digits = phone[1:] if phone.startswith("+") else ""
+    if not phone.startswith("+") or not digits.isdigit() or not (8 <= len(digits) <= 15):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A valid E.164 mobile number is required for SMS identity verification. "
+                "Update your registered phone number in Profile before deleting the account."
+            ),
+        )
+
+    if not sms_service.is_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SMS identity verification is temporarily unavailable.",
+        )
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    retry_after = await store_otp(
+        session,
+        email=user.email,
+        purpose=ACCOUNT_ERASURE_OTP_PURPOSE,
+        code=code,
+    )
+    if retry_after > 0:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"A verification code was requested recently. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    sent = sms_service.send_sms(
+        phone,
+        (
+            f"NISCHINT verification code: {code}. "
+            "Use it to confirm account deletion. "
+            "It expires in 10 minutes. Do not share this code."
+        ),
+    )
+    if not sent:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The SMS verification code could not be delivered. Please try again.",
+        )
+
+    await session.commit()
+    return {
+        "accepted": True,
+        "masked_phone": f"••••••{phone[-4:]}",
+        "expires_in_seconds": OTP_TTL_SECONDS,
+        "resend_cooldown_seconds": OTP_RESEND_COOLDOWN_SECONDS,
+        "max_attempts": OTP_MAX_ATTEMPTS,
+    }
+
+
 @router.delete(
     "/me",
     status_code=status.HTTP_202_ACCEPTED,
@@ -111,6 +203,7 @@ admin_router = APIRouter(
 )
 async def submit_self_erasure(
     request: Request,
+    otp_code: str | None = Header(default=None, alias="X-Erasure-OTP"),
     body: ErasureSubmitBody | None = None,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
@@ -141,6 +234,25 @@ async def submit_self_erasure(
         )
 
     try:
+        if not otp_code or len(otp_code) != 6 or not otp_code.isdigit():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A valid 6-digit SMS verification code is required.",
+            )
+
+        valid_otp = await consume_otp(
+            session,
+            email=user.email,
+            purpose=ACCOUNT_ERASURE_OTP_PURPOSE,
+            code=otp_code,
+        )
+        if not valid_otp:
+            await session.commit()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The verification code is invalid or expired.",
+            )
+
         req = await erasure_service.submit_request(
             session,
             user,
