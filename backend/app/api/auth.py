@@ -27,7 +27,7 @@ from app.core.security import (
 )
 from app.models.user import User
 from app.schemas.user import RegisterRequest
-from app.services import user_service, user_cache
+from app.services import user_service, user_cache, family_invite_history_service  # NISCHINT_SETTINGS_PHASE4A_INVITE_HISTORY_V4
 from app.services.auth_session_service import (
     bump_user_token_epoch,
     create_auth_session,
@@ -362,6 +362,37 @@ def _generate_invite_code() -> str:
     """Generate a random 6-character alphanumeric invite code (uppercase, no ambiguous chars)."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no O,0,I,1
     return "".join(random.choices(alphabet, k=6))
+
+
+async def _sync_family_invite_history_best_effort(
+    session: AsyncSession,
+    *,
+    action: str,
+    guardian_user_id,
+    expires_at=None,
+    accepted_by_user_id=None,
+    accepted_role: str | None = None,
+) -> None:
+    """Persist invite history without ever blocking the existing invite flow."""
+    try:
+        if action == "generated":
+            await family_invite_history_service.record_generated(
+                session,
+                guardian_user_id=guardian_user_id,
+                expires_at=expires_at,
+            )
+        else:
+            await family_invite_history_service.resolve_latest(
+                session,
+                guardian_user_id=guardian_user_id,
+                status=action,
+                accepted_by_user_id=accepted_by_user_id,
+                accepted_role=accepted_role,
+            )
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        logger.warning("[INVITE_HISTORY] %s sync skipped guardian=%s: %s", action, guardian_user_id, exc)
 
 
 # â”€â”€ Family Circle Invite schemas â”€â”€
@@ -1439,6 +1470,12 @@ async def generate_invite_code(
         await session.rollback()
         raise HTTPException(status_code=401, detail="Guardian account not found")
     await session.commit()
+    await _sync_family_invite_history_best_effort(
+        session,
+        action="generated",
+        guardian_user_id=user.id,
+        expires_at=expires_at,
+    )
 
     logger.info(f"[INVITE] Guardian {user.email} generated invite code (expires {expires_at.isoformat()})")
     return GenerateInviteResponse(code=code, expires_at=expires_at.isoformat())
@@ -1485,12 +1522,41 @@ async def cancel_invite_code(
         return {"cancelled": False, "already_inactive": True}
 
     await session.commit()
+    await _sync_family_invite_history_best_effort(
+        session,
+        action="revoked",
+        guardian_user_id=guardian.id,
+    )
 
     logger.info(f"[INVITE] Guardian {user.email} manually cancelled active invite")
     return {
         "cancelled": True,
         "already_inactive": False,
     }
+
+@router.get("/family/invite-history")
+async def get_family_invite_history(
+    limit: int = 20,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Return durable QR/invite-code lifecycle history for the current guardian."""
+    if user.role not in ("guardian", "parent", "admin"):
+        raise HTTPException(status_code=403, detail="Only guardian accounts can view invite history")
+    try:
+        items = await family_invite_history_service.list_for_guardian(
+            session,
+            guardian_user_id=user.id,
+            limit=limit,
+        )
+        # ensure_table() may create the isolated history table on first use.
+        await session.commit()
+        return {"items": items, "count": len(items)}
+    except Exception as exc:
+        await session.rollback()
+        logger.warning("[INVITE_HISTORY] list failed guardian=%s: %s", user.id, exc)
+        raise HTTPException(status_code=503, detail="Invite history is temporarily unavailable") from exc
+
 
 @router.post("/family/validate-invite-code")
 @limiter.limit("20/minute")
@@ -1516,6 +1582,11 @@ async def validate_invite_code(
         guardian.invite_code = None
         guardian.invite_code_expires_at = None
         await session.commit()
+        await _sync_family_invite_history_best_effort(
+            session,
+            action="expired",
+            guardian_user_id=guardian.id,
+        )
         raise HTTPException(status_code=400, detail="Invite code has expired")
 
     return {
@@ -1559,6 +1630,11 @@ async def verify_invite_code(
         guardian.invite_code = None
         guardian.invite_code_expires_at = None
         await session.commit()
+        await _sync_family_invite_history_best_effort(
+            session,
+            action="expired",
+            guardian_user_id=guardian.id,
+        )
         raise HTTPException(status_code=400, detail="Invite code has expired")
 
     # 3. Prevent duplicate email / phone and never create a family member
@@ -1594,6 +1670,13 @@ async def verify_invite_code(
 
     await session.commit()
     await session.refresh(new_user)
+    await _sync_family_invite_history_best_effort(
+        session,
+        action="accepted",
+        guardian_user_id=guardian.id,
+        accepted_by_user_id=new_user.id,
+        accepted_role=new_user.role,
+    )
 
     logger.info(
         f"[INVITE] New user {new_user.email} (role={new_user.role}) "
