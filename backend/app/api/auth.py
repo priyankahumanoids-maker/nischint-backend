@@ -27,7 +27,7 @@ from app.core.security import (
 )
 from app.models.user import User
 from app.schemas.user import RegisterRequest
-from app.services import user_service, user_cache, family_invite_history_service  # NISCHINT_SETTINGS_PHASE4A_INVITE_HISTORY_V4
+from app.services import user_service, user_cache, family_invite_history_service, sms_service, auth_two_factor_service  # NISCHINT_SETTINGS_PHASE4F_SMS_2FA
 from app.services.auth_session_service import (
     bump_user_token_epoch,
     create_auth_session,
@@ -431,6 +431,26 @@ class TokenResponse(BaseModel):
     auth_provider: str = "local"
 
 
+class TwoFactorChallengeResponse(BaseModel):
+    two_factor_required: bool = True
+    method: str = "sms"
+    challenge_token: str
+    masked_phone: str
+    retry_after_seconds: int = 0
+
+
+class TwoFactorCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class TwoFactorLoginVerifyRequest(TwoFactorCodeRequest):
+    challenge_token: str = Field(min_length=20)
+
+
+class TwoFactorLoginResendRequest(BaseModel):
+    challenge_token: str = Field(min_length=20)
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str
     session_id: Optional[str] = None
@@ -539,6 +559,118 @@ async def _send_email_verification_email(email: str, code: str) -> bool:
     )
 
 
+# NISCHINT_SETTINGS_PHASE4F_SMS_2FA
+async def _send_sms_two_factor_code(
+    session: AsyncSession,
+    *,
+    user: User,
+    purpose: str,
+    action_label: str,
+) -> int:
+    phone = auth_two_factor_service.normalize_phone(user.phone)
+    if not phone:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A valid mobile number is required for SMS verification. "
+                "Update your registered phone number in Profile first."
+            ),
+        )
+    if not sms_service.is_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SMS verification is temporarily unavailable.",
+        )
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    retry_after = await store_otp(
+        session,
+        email=user.email,
+        purpose=purpose,
+        code=code,
+    )
+    if retry_after > 0:
+        await session.rollback()
+        return retry_after
+
+    sent = sms_service.send_sms(
+        phone,
+        (
+            f"NISCHINT verification code: {code}. "
+            f"Use it to {action_label}. "
+            "It expires in 10 minutes. Do not share this code."
+        ),
+    )
+    if not sent:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SMS verification could not be delivered. Please try again later.",
+        )
+    await session.commit()
+    return 0
+
+
+async def _maybe_begin_login_two_factor(
+    session: AsyncSession,
+    *,
+    user: User,
+    provider: str,
+) -> Optional[TwoFactorChallengeResponse]:
+    two_factor = await auth_two_factor_service.get_sms_two_factor_state(
+        session,
+        user_id=user.id,
+        phone=user.phone,
+    )
+    if not two_factor["configured"]:
+        return None
+    if not two_factor["phone_matches"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Two-factor authentication is bound to a different mobile number. "
+                "Use an existing signed-in session or contact support to recover access."
+            ),
+        )
+
+    challenge = auth_two_factor_service.create_login_challenge(
+        user_id=user.id,
+        email=user.email,
+        provider=provider,
+    )
+    retry_after = await _send_sms_two_factor_code(
+        session,
+        user=user,
+        purpose=auth_two_factor_service.TWO_FACTOR_LOGIN_PURPOSE,
+        action_label="finish signing in",
+    )
+    return TwoFactorChallengeResponse(
+        challenge_token=challenge,
+        masked_phone=auth_two_factor_service.mask_phone(user.phone),
+        retry_after_seconds=retry_after,
+    )
+
+
+def _assert_two_factor_phone_change_allowed(
+    two_factor: dict,
+    current_phone: Optional[str],
+    requested_phone: str,
+) -> None:
+    if not two_factor.get("configured"):
+        return
+    current_hash = auth_two_factor_service.phone_hash(current_phone)
+    requested_hash = auth_two_factor_service.phone_hash(requested_phone)
+    if current_hash and requested_hash == current_hash:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            "Disable SMS two-factor authentication before changing the registered "
+            "mobile number, then enable it again on the new number."
+        ),
+    )
+
+
 # â”€â”€ Registration â”€â”€
 
 def _normalize_phone(phone: Optional[str]) -> str:
@@ -613,7 +745,7 @@ async def register(
     return await _local_register(req, session, request)
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=None)
 @limiter.limit("5/minute")
 async def login(
     request: Request,
@@ -664,6 +796,10 @@ async def update_my_phone(
     """
     from sqlalchemy import select
     normalized_phone = _require_normalized_phone(req.phone)
+    two_factor = await auth_two_factor_service.get_sms_two_factor_state(
+        session, user_id=user.id, phone=user.phone
+    )
+    _assert_two_factor_phone_change_allowed(two_factor, user.phone, normalized_phone)
 
     if await _phone_exists(
         session,
@@ -727,6 +863,10 @@ async def update_my_profile(
     normalized_phone = None
     if req.phone is not None:
         normalized_phone = _require_normalized_phone(req.phone)
+        two_factor = await auth_two_factor_service.get_sms_two_factor_state(
+            session, user_id=user.id, phone=user.phone
+        )
+        _assert_two_factor_phone_change_allowed(two_factor, user.phone, normalized_phone)
         if await _phone_exists(
             session,
             normalized_phone,
@@ -771,6 +911,223 @@ async def update_my_profile(
         "phone": db_user.phone,
         "role": db_user.role,
     }
+
+
+@router.get("/two-factor/status")
+async def get_two_factor_status(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    state = await auth_two_factor_service.get_sms_two_factor_state(
+        session, user_id=user.id, phone=user.phone
+    )
+    return {
+        "method": "sms",
+        "enabled": bool(state["enabled"]),
+        "configured": bool(state["configured"]),
+        "phone_valid": bool(state["phone_valid"]),
+        "masked_phone": state["masked_phone"],
+        "sms_available": sms_service.is_available(),
+    }
+
+
+@router.post("/two-factor/enable/request", status_code=status.HTTP_202_ACCEPTED)
+async def request_two_factor_enable(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    phone = auth_two_factor_service.normalize_phone(user.phone)
+    if not phone:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Add a valid mobile number in Profile before enabling SMS two-factor authentication.",
+        )
+    await auth_two_factor_service.ensure_two_factor_schema()
+    retry_after = await _send_sms_two_factor_code(
+        session,
+        user=user,
+        purpose=auth_two_factor_service.TWO_FACTOR_ENABLE_PURPOSE,
+        action_label="enable two-factor authentication",
+    )
+    if retry_after > 0:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"A verification code was requested recently. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    return {"sent": True, "method": "sms", "masked_phone": auth_two_factor_service.mask_phone(phone)}
+
+
+@router.post("/two-factor/enable/confirm")
+async def confirm_two_factor_enable(
+    req: TwoFactorCodeRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    valid = await consume_otp(
+        session,
+        email=user.email,
+        purpose=auth_two_factor_service.TWO_FACTOR_ENABLE_PURPOSE,
+        code=req.code,
+    )
+    if not valid:
+        await session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The verification code is invalid or expired.",
+        )
+    await auth_two_factor_service.set_sms_two_factor_enabled(
+        session, user_id=user.id, phone=str(user.phone or ""), enabled=True
+    )
+    await session.commit()
+    return {"enabled": True, "method": "sms"}
+
+
+@router.post("/two-factor/disable/request", status_code=status.HTTP_202_ACCEPTED)
+async def request_two_factor_disable(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    state = await auth_two_factor_service.get_sms_two_factor_state(
+        session, user_id=user.id, phone=user.phone
+    )
+    if not state["configured"]:
+        return {"sent": False, "enabled": False, "method": "sms"}
+    retry_after = await _send_sms_two_factor_code(
+        session,
+        user=user,
+        purpose=auth_two_factor_service.TWO_FACTOR_DISABLE_PURPOSE,
+        action_label="disable two-factor authentication",
+    )
+    if retry_after > 0:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"A verification code was requested recently. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    return {"sent": True, "method": "sms", "masked_phone": auth_two_factor_service.mask_phone(user.phone)}
+
+
+@router.post("/two-factor/disable/confirm")
+async def confirm_two_factor_disable(
+    req: TwoFactorCodeRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    valid = await consume_otp(
+        session,
+        email=user.email,
+        purpose=auth_two_factor_service.TWO_FACTOR_DISABLE_PURPOSE,
+        code=req.code,
+    )
+    if not valid:
+        await session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The verification code is invalid or expired.",
+        )
+    await auth_two_factor_service.set_sms_two_factor_enabled(
+        session, user_id=user.id, phone=str(user.phone or ""), enabled=False
+    )
+    await session.commit()
+    return {"enabled": False, "method": "sms"}
+
+
+@router.post("/two-factor/login/verify", response_model=TokenResponse)
+async def verify_two_factor_login(
+    request: Request,
+    req: TwoFactorLoginVerifyRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    challenge = auth_two_factor_service.decode_login_challenge(req.challenge_token)
+    if not challenge:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="The two-factor sign-in challenge is invalid or expired.",
+        )
+    from sqlalchemy import select
+    try:
+        user_id = uuid.UUID(str(challenge["sub"]))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid sign-in challenge")
+    result = await session.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active or user.email.casefold() != str(challenge["email"]).casefold():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid sign-in challenge")
+
+    state = await auth_two_factor_service.get_sms_two_factor_state(
+        session, user_id=user.id, phone=user.phone
+    )
+    if not state["enabled"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="SMS two-factor authentication is no longer active for this account.",
+        )
+
+    valid = await consume_otp(
+        session,
+        email=user.email,
+        purpose=auth_two_factor_service.TWO_FACTOR_LOGIN_PURPOSE,
+        code=req.code,
+    )
+    if not valid:
+        await session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The verification code is invalid or expired.",
+        )
+
+    provider = str(challenge.get("provider") or "local")
+    response = await _issue_local_session_response(
+        session,
+        user,
+        request,
+        provider=provider,
+        extra_claims={"two_factor_verified": True},
+    )
+    await session.commit()
+    user_cache.cache_user(str(user.id), user)
+    return response
+
+
+@router.post("/two-factor/login/resend", status_code=status.HTTP_202_ACCEPTED)
+async def resend_two_factor_login(
+    req: TwoFactorLoginResendRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    challenge = auth_two_factor_service.decode_login_challenge(req.challenge_token)
+    if not challenge:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="The two-factor sign-in challenge is invalid or expired.",
+        )
+    from sqlalchemy import select
+    try:
+        user_id = uuid.UUID(str(challenge["sub"]))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid sign-in challenge")
+    result = await session.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid sign-in challenge")
+    state = await auth_two_factor_service.get_sms_two_factor_state(
+        session, user_id=user.id, phone=user.phone
+    )
+    if not state["enabled"]:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="SMS two-factor authentication is not active")
+    retry_after = await _send_sms_two_factor_code(
+        session,
+        user=user,
+        purpose=auth_two_factor_service.TWO_FACTOR_LOGIN_PURPOSE,
+        action_label="finish signing in",
+    )
+    if retry_after > 0:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"A verification code was requested recently. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    return {"sent": True, "masked_phone": auth_two_factor_service.mask_phone(user.phone)}
 
 
 @router.post("/session", response_model=TokenResponse)
@@ -1849,6 +2206,12 @@ async def _local_login(
 
     reset(normalized_email)
 
+    two_factor_challenge = await _maybe_begin_login_two_factor(
+        session, user=user, provider="local"
+    )
+    if two_factor_challenge is not None:
+        return two_factor_challenge
+
     response = await _issue_local_session_response(
         session,
         user,
@@ -2056,6 +2419,12 @@ async def _cognito_login(
             email=user.email,
             source="cognito",
         )
+
+    two_factor_challenge = await _maybe_begin_login_two_factor(
+        session, user=user, provider="cognito"
+    )
+    if two_factor_challenge is not None:
+        return two_factor_challenge
 
     sid = await create_auth_session(
         session,
