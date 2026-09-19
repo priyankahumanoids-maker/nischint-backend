@@ -6,7 +6,6 @@
 # Route Safety Score = 0.5 * segment_live_risk + 0.3 * forecast_risk + 0.2 * environmental
 # Night Guardian Mode: 80% safety / 20% travel time
 
-import math
 import logging
 from datetime import datetime, timezone
 
@@ -98,7 +97,7 @@ async def generate_safe_routes(
     Generate safety-aware routes between two points.
 
     mode: fastest | safest | balanced | night_guardian
-    Returns 3 route options with per-segment risk + color coding.
+    Returns up to 3 genuine route options with per-segment risk + color coding.
     """
     now = timestamp or datetime.now(timezone.utc)
     hour = now.hour
@@ -208,22 +207,24 @@ def _rank_routes(scored: list[dict], mode: str) -> list[dict]:
     routes.append(_format_route(primary, primary_type, recommended=True))
     used_indices.add(primary["index"])
 
-    # Fastest (if not already picked)
-    if "fastest" not in {r["type"] for r in routes}:
-        fastest = next((r for r in by_time if r["index"] not in used_indices), by_time[0])
-        routes.append(_format_route(fastest, "fastest"))
-        used_indices.add(fastest["index"])
-
-    # Safest (if not already picked)
-    if "safest" not in {r["type"] for r in routes}:
-        safest = next((r for r in by_risk if r["index"] not in used_indices), by_risk[0])
-        routes.append(_format_route(safest, "safest"))
-        used_indices.add(safest["index"])
-
-    # Balanced (if not already picked)
-    if "balanced" not in {r["type"] for r in routes}:
-        balanced = next((r for r in by_weighted if r["index"] not in used_indices), by_weighted[0])
-        routes.append(_format_route(balanced, "balanced"))
+    # Additional labels are assigned only to distinct real provider routes.
+    # If OSRM gives us one route, return one route; do not alias the same
+    # geometry three times under different names.
+    for route_type, ranked in (
+        ("fastest", by_time),
+        ("safest", by_risk),
+        ("balanced", by_weighted),
+    ):
+        if route_type in {route["type"] for route in routes}:
+            continue
+        candidate = next(
+            (item for item in ranked if item["index"] not in used_indices),
+            None,
+        )
+        if candidate is None:
+            continue
+        routes.append(_format_route(candidate, route_type))
+        used_indices.add(candidate["index"])
 
     return routes
 
@@ -402,34 +403,41 @@ async def _fetch_osrm_routes(start_lat, start_lng, end_lat, end_lng) -> list:
 
 
 def _ensure_three_candidates(raw_routes: list) -> list:
-    """If OSRM returns fewer than 3 routes, create synthetic variants."""
-    routes = list(raw_routes)
-    if len(routes) >= 3:
-        return routes[:3]
+    """Return up to three *real* routing-provider candidates.
 
-    base = routes[0]
-    while len(routes) < 3:
-        variant = _create_variant(base, len(routes))
-        routes.append(variant)
-    return routes
+    Never manufacture route geometry.  The previous implementation created
+    sinusoidally-offset copies when OSRM returned fewer than three routes.
+    Those fabricated coordinates could draw loops/zig-zags on Safe Walk and
+    ETA maps and could even be ranked as the "safest" candidate.
 
+    A single genuine road route is better than three fake alternatives.
+    """
+    unique: list[dict] = []
+    seen: set[tuple] = set()
 
-def _create_variant(base: dict, variant_num: int) -> dict:
-    """Create a synthetic route variant by offsetting coordinates."""
-    coords = base["geometry"]["coordinates"]
-    offset = 0.0012 * variant_num
-    new_coords = []
-    for i, (lng, lat) in enumerate(coords):
-        if variant_num == 1:
-            nlat = lat + offset * math.sin(i * 0.4)
-            nlng = lng + offset * math.cos(i * 0.4)
-        else:
-            nlat = lat - offset * math.sin(i * 0.6)
-            nlng = lng - offset * math.cos(i * 0.6)
-        new_coords.append([nlng, nlat])
+    for route in raw_routes or []:
+        geometry = route.get("geometry") if isinstance(route, dict) else None
+        coords = geometry.get("coordinates") if isinstance(geometry, dict) else None
+        if not isinstance(coords, list) or len(coords) < 2:
+            continue
 
-    return {
-        "distance": base["distance"] * (1.0 + 0.1 * variant_num),
-        "duration": base["duration"] * (1.0 + 0.15 * variant_num),
-        "geometry": {"type": "LineString", "coordinates": new_coords},
-    }
+        # Exact-enough geometry identity for provider alternatives.  Rounding
+        # removes insignificant float noise without modifying what we return.
+        try:
+            key = tuple(
+                (round(float(point[0]), 6), round(float(point[1]), 6))
+                for point in coords
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if len(key) < 2 or key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(route)
+        if len(unique) >= 3:
+            break
+
+    return unique
