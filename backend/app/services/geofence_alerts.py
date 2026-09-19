@@ -243,7 +243,7 @@ async def record_protected_telemetry(
             previous_at = previous_at.astimezone(timezone.utc)
         accepted_as_latest = observed_at >= previous_at
 
-    is_current = observation_age_s <= 120 and accepted_as_latest
+    # Android may batch stationary fixes in Doze. A fix can be older than\n    # the server receipt time even though the protected-device pipeline is alive.\n    # Keep GPS observation freshness truthful, but allow a five-minute current\n    # window before classifying the coordinate as stale.\n    is_current = observation_age_s <= 300 and accepted_as_latest
     normalized_battery = (
         int(battery_pct)
         if battery_pct is not None and 0 <= int(battery_pct) <= 100
@@ -274,7 +274,7 @@ async def record_protected_telemetry(
         user_row.last_known_at = observed_at
 
     set_json("protected_telemetry", user_id, snapshot, ttl=24 * 60 * 60)
-    mark_user_ping(user_id, observed_at.isoformat())
+    # Presence means "the backend heard from this authenticated phone", not\n    # "the GPS observation timestamp was fresh". Android can legitimately batch\n    # stationary fixes while screen-off, so use server receipt time for presence.\n    mark_user_ping(user_id, now.isoformat())
 
     active_result = await session.execute(
         select(GuardianSession)

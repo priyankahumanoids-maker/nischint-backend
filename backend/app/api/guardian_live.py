@@ -377,7 +377,7 @@ async def _compute_live_risk(session: AsyncSession, user: User):
                             ping_dt = ping_dt.astimezone(timezone.utc)
                     except (TypeError, ValueError):
                         ping_dt = None
-                presence_online = bool(ping_dt and (now - ping_dt).total_seconds() <= 90)
+                presence_online = bool(ping_dt and (now - ping_dt).total_seconds() <= 300)
                 results.append({
                     "child_id": str(child_id),
                     "child_name": child_user.full_name or "Unknown",

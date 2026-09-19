@@ -1607,6 +1607,9 @@ async def reset_password(
 
 class LogoutRequest(BaseModel):
     refresh_token: Optional[str] = None
+    # Installation-specific FCM token. When supplied by the authenticated
+    # client, logout atomically detaches only this phone from this account.
+    device_token: Optional[str] = None
 
 
 @router.get("/sessions")
@@ -1662,6 +1665,12 @@ async def logout_all(
         reason="logout_all",
     )
     await bump_user_token_epoch(session, user.id)
+    # "Logout all devices" must also revoke notification destinations owned by
+    # those sessions; otherwise signed-out phones can keep receiving alerts.
+    await session.execute(
+        text("DELETE FROM push_tokens WHERE user_id = :uid"),
+        {"uid": user.id},
+    )
 
     provider_revoked = False
     if is_cognito_enabled() and getattr(user, "cognito_sub", None):
@@ -1722,6 +1731,18 @@ async def logout(
                 user.email,
                 exc,
             )
+
+    # Security: logging out a shared/borrowed phone must also revoke that
+    # installation's push destination. Scope the delete to BOTH user and token
+    # so one account can never unregister another account's device.
+    if req.device_token:
+        await session.execute(
+            text(
+                "DELETE FROM push_tokens "
+                "WHERE user_id = :uid AND token = :token"
+            ),
+            {"uid": user.id, "token": str(req.device_token)},
+        )
 
     if req.refresh_token:
         local_claims = decode_refresh_token(req.refresh_token)

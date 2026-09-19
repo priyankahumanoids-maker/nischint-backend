@@ -71,7 +71,7 @@ async def _filter_protected_scope_ids(
 
 
 
-def _presence_from_ping(raw: str | None, now: datetime, window_s: int = 90) -> bool:
+def _presence_from_ping(raw: str | None, now: datetime, window_s: int = 300) -> bool:
     if not raw:
         return False
     try:
