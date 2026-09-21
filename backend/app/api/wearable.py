@@ -25,6 +25,7 @@ from app.api.deps import get_db_session, get_current_user
 from app.models.user import User
 from app.core.product_roles import is_primary_guardian, normalize_role
 from app.services.event_broadcaster import broadcaster
+from app.services import subscription_service
 from app.core.rate_limiter import limiter
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,7 @@ async def register_device(
 ):
     """Register a BLE peripheral device. Returns device_id for subsequent calls."""
     await _ensure_schema(db)
+    await subscription_service.require_member_entitlement(db, user.id, 'wearable')
 
     if not req.device_uid.strip():
         raise HTTPException(status_code=422, detail="A Bluetooth device identifier is required")
@@ -350,6 +352,7 @@ async def bind_device(
     wearable.  This prevents one account from claiming another user's device.
     """
     await _ensure_schema(db)
+    await subscription_service.require_member_entitlement(db, user.id, 'wearable')
 
     if str(user.id) != str(req.user_id):
         raise HTTPException(
@@ -566,6 +569,7 @@ async def ingest_event(
     logs audit trail, broadcasts SSE, and triggers escalation for emergencies.
     """
     await _ensure_schema(db)
+    await subscription_service.require_member_entitlement(db, user.id, 'wearable')
 
     # Idempotency: skip if event_id already processed
     if req.event_id:
@@ -706,6 +710,7 @@ async def device_heartbeat(
 ):
     """Device health telemetry — battery, signal strength, connectivity check."""
     await _ensure_schema(db)
+    await subscription_service.require_member_entitlement(db, user.id, 'wearable')
 
     now = datetime.now(timezone.utc)
 

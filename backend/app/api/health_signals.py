@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db_session
 from app.models.user import User
 from app.services import redis_service
+from app.services import subscription_service
 from app.services.safety_brain_service import evaluate_risk
 
 logger = logging.getLogger(__name__)
@@ -172,6 +173,7 @@ async def ingest_wearable_signals(
     pre-HC-02 don't send them; their rows will have NULL device_id
     and 'unknown' device_model.
     """
+    await subscription_service.require_member_entitlement(session, user.id, 'advanced_sensor_monitoring')
     user_id = str(user.id)
     client = redis_service._get_client()
 

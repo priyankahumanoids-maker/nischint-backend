@@ -27,7 +27,7 @@ from app.core.security import (
 )
 from app.models.user import User
 from app.schemas.user import RegisterRequest
-from app.services import user_service, user_cache, family_invite_history_service, sms_service, auth_two_factor_service  # NISCHINT_SETTINGS_PHASE4F_SMS_2FA
+from app.services import user_service, user_cache, family_invite_history_service, subscription_service, sms_service, auth_two_factor_service  # NISCHINT_SETTINGS_PHASE4F_SMS_2FA
 from app.services.auth_session_service import (
     bump_user_token_epoch,
     create_auth_session,
@@ -395,7 +395,34 @@ async def _sync_family_invite_history_best_effort(
         logger.warning("[INVITE_HISTORY] %s sync skipped guardian=%s: %s", action, guardian_user_id, exc)
 
 
+def _schedule_family_invite_history(
+    *,
+    action: str,
+    guardian_user_id,
+    expires_at=None,
+    accepted_by_user_id=None,
+    accepted_role: str | None = None,
+) -> None:
+    """Write non-critical invite history off the request hot path."""
+    async def _run() -> None:
+        from app.db.session import async_session
+        async with async_session() as history_session:
+            await _sync_family_invite_history_best_effort(
+                history_session,
+                action=action,
+                guardian_user_id=guardian_user_id,
+                expires_at=expires_at,
+                accepted_by_user_id=accepted_by_user_id,
+                accepted_role=accepted_role,
+            )
+    asyncio.create_task(_run())
+
+
 # â”€â”€ Family Circle Invite schemas â”€â”€
+
+class GenerateInviteRequest(BaseModel):
+    purpose: str = Field("protected_member", pattern="^(protected_member|co_parent)$")
+
 
 class GenerateInviteResponse(BaseModel):
     code: str
@@ -1815,25 +1842,54 @@ async def cognito_status():
 
 @router.post("/family/generate-invite-code", response_model=GenerateInviteResponse)
 async def generate_invite_code(
+    req: GenerateInviteRequest | None = None,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """
-    Guardian generates a 6-character invite code.
-    Stores it in users.invite_code + users.invite_code_expires_at for the
-    short server-controlled invite window. Calling again overwrites the
-    previous code.
+    """Generate/reopen one server-authoritative family invite.
+
+    Protected-member invites require one unassigned ACTIVE subscription slot.
+    Reopening an existing active invite is a read-only fast path.
     """
     from datetime import datetime, timezone
-    from sqlalchemy import select
 
-    if user.role not in ("guardian", "parent", "admin"):
-        raise HTTPException(status_code=403, detail="Only guardian accounts can generate invite codes")
+    if normalize_roles(user.role).isdisjoint({"guardian", "admin"}):
+        raise HTTPException(status_code=403, detail="Only the Primary Parent can generate family invite codes")
+
+    purpose = (req.purpose if req else "protected_member").strip().lower()
+    await subscription_service.ensure_existing_members_premium(session, user.id)
+
+    # FAST PATH: return the still-active invite instead of regenerating it.
+    existing = (
+        await session.execute(
+            text("SELECT invite_code, invite_code_expires_at FROM users WHERE id = :uid"),
+            {"uid": user.id},
+        )
+    ).mappings().first()
+    reservation = await subscription_service.active_reservation(session, user.id)
+    now = datetime.now(timezone.utc)
+    if (
+        existing
+        and existing.get("invite_code")
+        and existing.get("invite_code_expires_at")
+        and existing["invite_code_expires_at"] > now
+        and reservation
+        and str(reservation.get("invite_code") or "").upper() == str(existing["invite_code"]).upper()
+        and str(reservation.get("purpose") or "protected_member") == purpose
+    ):
+        return GenerateInviteResponse(
+            code=str(existing["invite_code"]),
+            expires_at=existing["invite_code_expires_at"].isoformat(),
+        )
 
     code = _generate_invite_code()
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=INVITE_CODE_TTL_MINUTES)
+    expires_at = now + timedelta(minutes=INVITE_CODE_TTL_MINUTES)
 
-    # Single atomic write avoids an extra database round-trip on staging.
+    # Reserve entitlement BEFORE exposing a protected-member invite.
+    await subscription_service.reserve_slot_for_invite(
+        session, user, code=code, expires_at=expires_at, purpose=purpose
+    )
+
     result = await session.execute(
         text("""
             UPDATE users
@@ -1848,14 +1904,15 @@ async def generate_invite_code(
         await session.rollback()
         raise HTTPException(status_code=401, detail="Guardian account not found")
     await session.commit()
-    await _sync_family_invite_history_best_effort(
-        session,
+
+    # History must never add QR-generation latency.
+    _schedule_family_invite_history(
         action="generated",
         guardian_user_id=user.id,
         expires_at=expires_at,
     )
 
-    logger.info(f"[INVITE] Guardian {user.email} generated invite code (expires {expires_at.isoformat()})")
+    logger.info("[INVITE] Guardian %s generated %s invite", user.email, purpose)
     return GenerateInviteResponse(code=code, expires_at=expires_at.isoformat())
 
 
@@ -1899,11 +1956,11 @@ async def cancel_invite_code(
         await session.rollback()
         return {"cancelled": False, "already_inactive": True}
 
+    await subscription_service.clear_invite_reservation(session, user.id, normalized_code)
     await session.commit()
-    await _sync_family_invite_history_best_effort(
-        session,
+    _schedule_family_invite_history(
         action="revoked",
-        guardian_user_id=guardian.id,
+        guardian_user_id=user.id,
     )
 
     logger.info(f"[INVITE] Guardian {user.email} manually cancelled active invite")
@@ -1959,6 +2016,7 @@ async def validate_invite_code(
     if not guardian.invite_code_expires_at or guardian.invite_code_expires_at < now:
         guardian.invite_code = None
         guardian.invite_code_expires_at = None
+        await subscription_service.clear_invite_reservation(session, guardian.id, normalized_code)
         await session.commit()
         await _sync_family_invite_history_best_effort(
             session,
@@ -2007,6 +2065,7 @@ async def verify_invite_code(
     if not guardian.invite_code_expires_at or guardian.invite_code_expires_at < now:
         guardian.invite_code = None
         guardian.invite_code_expires_at = None
+        await subscription_service.clear_invite_reservation(session, guardian.id, normalized_code)
         await session.commit()
         await _sync_family_invite_history_best_effort(
             session,
@@ -2014,6 +2073,18 @@ async def verify_invite_code(
             guardian_user_id=guardian.id,
         )
         raise HTTPException(status_code=400, detail="Invite code has expired")
+
+    # Subscription reservation defines whether this code is for a protected
+    # member or co-parent. The slot is consumed only after user creation.
+    reservation = await subscription_service.reservation_for_code(session, normalized_invite_code)
+    if not reservation:
+        raise HTTPException(status_code=409, detail="Invite reservation is no longer available")
+    normalized_requested_role = select_primary_role([req.role]) or str(req.role).strip().lower()
+    if normalized_requested_role == "co_parent":
+        if str(reservation.get("purpose") or "") != "co_parent":
+            raise HTTPException(status_code=403, detail="This invite is for a protected member")
+    elif str(reservation.get("purpose") or "") != "protected_member":
+        raise HTTPException(status_code=403, detail="This invite is for a co-parent")
 
     # 3. Prevent duplicate email / phone and never create a family member
     # with a missing phone number.
@@ -2042,7 +2113,13 @@ async def verify_invite_code(
     )
     session.add(new_user)
 
-    # 5. Clear the used invite code so it cannot be reused
+    # 5. Bind the reserved subscription only after this account exists.
+    await session.flush()
+    await subscription_service.bind_reserved_subscription(
+        session, code=normalized_invite_code, new_user=new_user
+    )
+
+    # 6. Clear the used invite code so it cannot be reused.
     guardian.invite_code = None
     guardian.invite_code_expires_at = None
 
