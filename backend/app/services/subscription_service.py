@@ -62,6 +62,12 @@ _DDL = [
 _table_ready = False
 _table_lock = asyncio.Lock()
 
+# Legacy-member grandfathering is migration/bootstrap work, not normal
+# request-path work. Once a guardian has been reconciled successfully in
+# this process, subsequent subscription reads and invite checks skip it.
+_premium_ready_guardians: set[str] = set()
+_premium_ready_lock = asyncio.Lock()
+
 
 async def ensure_tables() -> None:
     global _table_ready
@@ -128,34 +134,115 @@ async def _linked_protected_members(session: AsyncSession, guardian_id) -> list[
 
 
 async def ensure_existing_members_premium(session: AsyncSession, guardian_id) -> None:
-    """Grandfather already-linked test/current members as Premium ACTIVE.
+    """Grandfather legacy linked protected members exactly when needed.
 
-    This is identity-agnostic: it never hardcodes Sanjay/Kavita/Rakesh. It is
-    safe to run repeatedly and only inserts when a linked member has no live
-    member subscription yet.
+    Existing subscription-backed families must not pay the cost of repeatedly
+    scanning and re-inserting every protected member on each summary/invite
+    request. New protected members are bound authoritatively through the
+    subscription invite flow, so this remains only a legacy reconciliation
+    safeguard.
     """
     await ensure_tables()
-    members = await _linked_protected_members(session, guardian_id)
-    for member in members:
-        await session.execute(
-            text(
-                """
-                INSERT INTO member_subscriptions (
-                    id, guardian_user_id, protected_member_user_id,
-                    plan, status, price_monthly, starts_at, created_at, updated_at
+
+    guardian_key = str(guardian_id)
+
+    if guardian_key in _premium_ready_guardians:
+        return
+
+    async with _premium_ready_lock:
+        if guardian_key in _premium_ready_guardians:
+            return
+
+        # Query ONLY linked protected members that genuinely have no live
+        # subscription. For an already-migrated family this is one read and
+        # zero writes/commits instead of N no-op INSERTs plus COMMIT.
+        members = (
+            await session.execute(
+                text(
+                    """
+                    SELECT DISTINCT u.id, u.full_name, u.email, u.role
+                    FROM users u
+                    LEFT JOIN guardian_relationships gr
+                      ON gr.user_id = u.id
+                     AND gr.guardian_user_id = :guardian_id
+                     AND gr.is_active = TRUE
+                    WHERE u.is_active = TRUE
+                      AND LOWER(COALESCE(u.role, '')) IN (
+                          'child',
+                          'woman',
+                          'women',
+                          'senior',
+                          'elderly',
+                          'family',
+                          'family_member',
+                          'family-member',
+                          'member',
+                          'protected_member'
+                      )
+                      AND (
+                          u.guardian_id = :guardian_id
+                          OR gr.id IS NOT NULL
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM member_subscriptions s
+                          WHERE s.protected_member_user_id = u.id
+                            AND s.status IN ('active', 'pending')
+                      )
+                    ORDER BY u.full_name NULLS LAST, u.email
+                    """
+                ),
+                {"guardian_id": guardian_id},
+            )
+        ).mappings().all()
+
+        if members:
+            for member in members:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO member_subscriptions (
+                            id,
+                            guardian_user_id,
+                            protected_member_user_id,
+                            plan,
+                            status,
+                            price_monthly,
+                            starts_at,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (
+                            :id,
+                            :guardian_id,
+                            :member_id,
+                            'premium',
+                            'active',
+                            499,
+                            NOW(),
+                            NOW(),
+                            NOW()
+                        )
+                        ON CONFLICT (protected_member_user_id)
+                        WHERE protected_member_user_id IS NOT NULL
+                          AND status IN ('active', 'pending')
+                        DO NOTHING
+                        """
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "guardian_id": guardian_id,
+                        "member_id": member["id"],
+                    },
                 )
-                SELECT :id, :guardian_id, :member_id,
-                       'premium', 'active', 499, NOW(), NOW(), NOW()
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM member_subscriptions
-                    WHERE protected_member_user_id = :member_id
-                      AND status IN ('active','pending')
-                )
-                """
-            ),
-            {"id": uuid.uuid4(), "guardian_id": guardian_id, "member_id": member["id"]},
-        )
-    await session.commit()
+
+            await session.commit()
+
+        # Safe because:
+        #   * all currently linked legacy members were checked above;
+        #   * new protected members are subscription-bound by invite acceptance;
+        #   * a failed reconciliation never reaches this line.
+        _premium_ready_guardians.add(guardian_key)
 
 
 async def summary_for_guardian(session: AsyncSession, actor: User) -> dict[str, Any]:
