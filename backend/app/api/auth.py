@@ -44,6 +44,7 @@ from app.services.auth_otp_service import (
     OTP_RESEND_COOLDOWN_SECONDS,
     OTP_TTL_SECONDS,
     consume_otp,
+    email_hash,
     is_email_verified,
     mark_email_verified,
     store_otp,
@@ -63,6 +64,13 @@ INVITE_CODE_TTL_MINUTES = 15
 # enabled; local fallback accounts use SendGrid + durable PostgreSQL state.
 PASSWORD_RESET_TTL_SECONDS = 15 * 60
 PASSWORD_RESET_MAX_ATTEMPTS = 5
+
+# Signup mobile verification reuses the existing durable hashed-OTP store.
+# A successful OTP exchange creates a second short-lived, high-entropy ticket
+# which is stored only as an HMAC digest and is consumed atomically by the
+# eventual account-creation request. No user row exists before verification.
+SIGNUP_PHONE_OTP_PURPOSE = "signup_phone"
+SIGNUP_PHONE_VERIFIED_PURPOSE = "signup_phone_verified"
 
 
 async def _claim_local_refresh_once(
@@ -504,6 +512,14 @@ class CheckPhoneRequest(BaseModel):
     phone: str = Field(min_length=10, max_length=20)
 
 
+class SignupPhoneOtpRequest(BaseModel):
+    phone: str = Field(min_length=10, max_length=20)
+
+
+class SignupPhoneOtpVerifyRequest(SignupPhoneOtpRequest):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
 class EmailVerificationConfirmRequest(BaseModel):
     code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
@@ -749,12 +765,192 @@ async def _phone_exists(
     return result.scalar_one_or_none() is not None
 
 
+def _signup_phone_otp_identity(normalized_phone: str) -> str:
+    # auth_otps historically names this identity column email_hash, but the
+    # service hashes any opaque identity string. Prefixing keeps phone tickets
+    # cryptographically separated from email OTP purposes.
+    return f"signup-phone:{normalized_phone}"
+
+
+def _mask_signup_phone(normalized_phone: str) -> str:
+    digits = normalized_phone.lstrip("+")
+    country = digits[: max(0, len(digits) - 10)]
+    visible = digits[-4:]
+    hidden = "•" * max(4, len(digits) - len(country) - len(visible))
+    return f"+{country}{hidden}{visible}" if country else f"+{hidden}{visible}"
+
+
+async def _delete_signup_verified_ticket(
+    session: AsyncSession,
+    normalized_phone: str,
+) -> None:
+    await session.execute(
+        text(
+            """
+            DELETE FROM auth_otps
+            WHERE email_hash = :identity_hash
+              AND purpose = :purpose
+            """
+        ),
+        {
+            "identity_hash": email_hash(_signup_phone_otp_identity(normalized_phone)),
+            "purpose": SIGNUP_PHONE_VERIFIED_PURPOSE,
+        },
+    )
+
+
+async def _consume_signup_phone_verification(
+    session: AsyncSession,
+    request: Request,
+    normalized_phone: str,
+) -> None:
+    verification_token = str(
+        request.headers.get("X-Signup-Phone-Verification") or ""
+    ).strip()
+    if not (32 <= len(verification_token) <= 160):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Mobile number verification is required before registration.",
+        )
+
+    verified = await consume_otp(
+        session,
+        email=_signup_phone_otp_identity(normalized_phone),
+        purpose=SIGNUP_PHONE_VERIFIED_PURPOSE,
+        code=verification_token,
+    )
+    if not verified:
+        # Invalid-token attempts are persisted so the existing attempt bound
+        # remains meaningful even though this request is rejected.
+        await session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Mobile verification expired or is no longer valid. "
+                "Please verify the number again."
+            ),
+        )
+
+
 @router.post("/check-phone")
 async def check_phone(
     req: CheckPhoneRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
     return {"exists": await _phone_exists(session, req.phone)}
+
+
+@router.post("/signup-phone/request", status_code=status.HTTP_202_ACCEPTED)
+@limiter.limit("5/minute")
+async def request_signup_phone_otp(
+    request: Request,
+    req: SignupPhoneOtpRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    normalized_phone = _require_normalized_phone(req.phone)
+    if await _phone_exists(session, normalized_phone):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mobile number is already registered. Please sign in instead.",
+        )
+    if not sms_service.is_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SMS verification is temporarily unavailable. Please try again shortly.",
+        )
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    identity = _signup_phone_otp_identity(normalized_phone)
+    retry_after = await store_otp(
+        session,
+        email=identity,
+        purpose=SIGNUP_PHONE_OTP_PURPOSE,
+        code=code,
+    )
+    if retry_after > 0:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"A verification code was requested recently. Try again in {retry_after} seconds.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # Starting a new OTP challenge invalidates any older successful signup
+    # ticket for the same phone, so a stale verification cannot be replayed.
+    await _delete_signup_verified_ticket(session, normalized_phone)
+
+    sent = await asyncio.to_thread(
+        sms_service.send_sms,
+        normalized_phone,
+        (
+            f"NISCHINT verification code: {code}. "
+            "Use it to verify your mobile number for signup. "
+            "It expires in 10 minutes. Do not share this code."
+        ),
+    )
+    if not sent:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The SMS verification code could not be delivered. Please try again.",
+        )
+
+    await session.commit()
+    return {
+        "sent": True,
+        "masked_phone": _mask_signup_phone(normalized_phone),
+        "expires_in_seconds": OTP_TTL_SECONDS,
+        "resend_cooldown_seconds": OTP_RESEND_COOLDOWN_SECONDS,
+        "max_attempts": OTP_MAX_ATTEMPTS,
+    }
+
+
+@router.post("/signup-phone/verify")
+@limiter.limit("10/minute")
+async def verify_signup_phone_otp(
+    request: Request,
+    req: SignupPhoneOtpVerifyRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    normalized_phone = _require_normalized_phone(req.phone)
+    if await _phone_exists(session, normalized_phone):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mobile number is already registered. Please sign in instead.",
+        )
+
+    identity = _signup_phone_otp_identity(normalized_phone)
+    valid = await consume_otp(
+        session,
+        email=identity,
+        purpose=SIGNUP_PHONE_OTP_PURPOSE,
+        code=req.code,
+    )
+    if not valid:
+        await session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The verification code is invalid or expired.",
+        )
+
+    # The OTP itself is never carried into later screens. Exchange it for a
+    # random one-time registration ticket; only its HMAC digest is persisted.
+    verification_token = secrets.token_urlsafe(32)
+    await _delete_signup_verified_ticket(session, normalized_phone)
+    await store_otp(
+        session,
+        email=identity,
+        purpose=SIGNUP_PHONE_VERIFIED_PURPOSE,
+        code=verification_token,
+    )
+    await session.commit()
+    return {
+        "verified": True,
+        "verification_token": verification_token,
+        "masked_phone": _mask_signup_phone(normalized_phone),
+        "expires_in_seconds": OTP_TTL_SECONDS,
+    }
+
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
@@ -767,6 +963,14 @@ async def register(
     Register a new guardian account.
     Uses Cognito when enabled, falls back to local auth.
     """
+    normalized_phone = _require_normalized_phone(req.phone)
+    if await _phone_exists(session, normalized_phone):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mobile number is already registered. Please sign in instead.",
+        )
+    await _consume_signup_phone_verification(session, request, normalized_phone)
+
     if is_cognito_enabled():
         return await _cognito_register(req, session, request)
     return await _local_register(req, session, request)
@@ -2101,6 +2305,11 @@ async def verify_invite_code(
             status_code=status.HTTP_409_CONFLICT,
             detail="This mobile number is already registered. Please sign in instead.",
         )
+
+    # The same verified-phone gate applies to invite-based protected-member
+    # and co-parent signup. The one-time ticket is consumed in this transaction
+    # and is restored automatically if later account creation rolls back.
+    await _consume_signup_phone_verification(session, request, normalized_phone)
 
     # 4. Create the new family member account linked to the guardian
     new_user = User(
