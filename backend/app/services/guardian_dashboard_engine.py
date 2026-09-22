@@ -84,6 +84,27 @@ def _presence_from_ping(raw: str | None, now: datetime, window_s: int = 300) -> 
     except (TypeError, ValueError):
         return False
 
+
+def _presence_from_datetime(raw: datetime | None, now: datetime, window_s: int = 300) -> bool:
+    """Durable presence fallback when shared Redis is unavailable.
+
+    A current authenticated GPS write is also proof that the protected phone was
+    online. This fallback is intentionally separate from the map's location
+    freshness label; it only prevents process-local cache boundaries from
+    incorrectly showing a just-reporting device as Offline.
+    """
+    if raw is None:
+        return False
+    try:
+        value = raw
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return 0 <= (now - value).total_seconds() <= window_s
+    except (TypeError, ValueError, OverflowError):
+        return False
+
 def _fresh_device_telemetry(raw: object, now: datetime) -> tuple[dict | None, datetime | None]:
     """Return only recent, real protected-device telemetry."""
     if not isinstance(raw, dict):
@@ -684,6 +705,26 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
             ts = latest_checkin.responded_at or latest_checkin.created_at
             last_updated = ts.isoformat()
 
+        ping_last_seen = presence_pings.get(str(uid))
+        presence_online = _presence_from_ping(ping_last_seen, now)
+        durable_last_seen = None
+
+        # REDIS_URL is optional in this deployment. Process-local cache cannot
+        # be authoritative across Cloud Run instances, so fall back to durable
+        # server-observed state without changing location freshness semantics.
+        if active_session and _presence_from_datetime(
+            active_session.last_seen_online_at, now
+        ):
+            presence_online = True
+            durable_last_seen = active_session.last_seen_online_at
+        elif _presence_from_datetime(user.last_known_at, now):
+            presence_online = True
+            durable_last_seen = user.last_known_at
+
+        last_seen_online_at = ping_last_seen
+        if not last_seen_online_at and durable_last_seen is not None:
+            last_seen_online_at = durable_last_seen.isoformat()
+
         item = {
             "id": str(uid),
             "user_id": str(uid),
@@ -705,10 +746,8 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                 else None
             ),
             "telemetry_fresh": device_telemetry is not None,
-            "presence_online": _presence_from_ping(
-                presence_pings.get(str(uid)), now
-            ),
-            "last_seen_online_at": presence_pings.get(str(uid)),
+            "presence_online": presence_online,
+            "last_seen_online_at": last_seen_online_at,
             "has_active_session": active_session is not None,
             "active_session": None,
         }

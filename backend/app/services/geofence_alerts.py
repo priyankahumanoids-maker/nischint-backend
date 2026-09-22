@@ -295,6 +295,10 @@ async def record_protected_telemetry(
         current.update(snapshot)
         active_session.current_location = current
         active_session.previous_update_at = observed_at
+        # Session liveness is based on server receipt time, not the potentially
+        # batched GPS observation timestamp.
+        active_session.last_seen_online_at = now
+        active_session.is_offline = False
         if speed_mps is not None:
             active_session.speed_mps = max(0.0, float(speed_mps))
 
@@ -476,8 +480,13 @@ async def evaluate_user_location(
     previous_lat: float | None = None,
     previous_lng: float | None = None,
 ) -> GeofenceEvaluation:
-    """Evaluate every active zone and route assigned to this protected user."""
-    from app.services.redis_service import get_json, set_json, delete_key
+    """Evaluate every active zone and route assigned to this protected user.
+
+    A malformed legacy assignment must never take down the protected-device
+    telemetry endpoint. Invalid rows are logged and skipped while every valid
+    zone/route keeps its existing transition + alert behaviour.
+    """
+    from app.services.redis_service import get_json, set_json
     from app.services.event_broadcaster import broadcaster
     from app.services.alert_trigger import trigger_alert
 
@@ -522,156 +531,277 @@ async def evaluate_user_location(
     any_transition = False
     any_alert = False
 
+    def finite(value, label: str) -> float:
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"{label} is not finite")
+        return number
+
     for zone in zones:
-        zone_id = str(zone.id)
-        state_key = f"{user_id}:{zone_id}"
-        distance_m = haversine_m(lat, lng, zone.lat, zone.lng)
-        is_restricted = zone.zone_type == "restricted"
-        inside = distance_m <= zone.radius_m
-        state = (
-            "restricted_inside" if is_restricted and inside
-            else "restricted_clear" if is_restricted
-            else "safe" if inside
-            else "breach"
-        )
-        previous = get_json(_NS_STATE, state_key) or {}
-        previous_state = previous.get("state")
-        if previous_lat is not None and previous_lng is not None:
-            previous_distance_m = haversine_m(previous_lat, previous_lng, zone.lat, zone.lng)
-            previous_inside = previous_distance_m <= zone.radius_m
-            previous_state = (
-                "restricted_inside" if is_restricted and previous_inside
+        zone_id = str(getattr(zone, "id", "unknown"))
+        try:
+            zone_lat = finite(zone.lat, "zone.lat")
+            zone_lng = finite(zone.lng, "zone.lng")
+            radius_m = finite(zone.radius_m, "zone.radius_m")
+            if radius_m <= 0:
+                raise ValueError("zone.radius_m must be positive")
+
+            state_key = f"{user_id}:{zone_id}"
+            distance_m = haversine_m(lat, lng, zone_lat, zone_lng)
+            is_restricted = str(zone.zone_type or "").lower() == "restricted"
+            inside = distance_m <= radius_m
+            state = (
+                "restricted_inside" if is_restricted and inside
                 else "restricted_clear" if is_restricted
-                else "safe" if previous_inside
+                else "safe" if inside
                 else "breach"
             )
-        # Never fabricate an exit/entry just because runtime cache is empty.
-        # A true transition requires a known previous state.
-        transition = previous_state is not None and previous_state != state
-        payload = {
-            "user_id": user_id, "child_id": user_id, "user_name": name,
-            "state": state, "zone_id": zone_id, "zone_name": zone.name,
-            "zone_category": "restricted" if is_restricted else "safe",
-            "distance_m": round(distance_m, 1), "radius_m": zone.radius_m,
-            "center_lat": zone.lat, "center_lng": zone.lng,
-            "lat": lat, "lng": lng, "updated_at": now_iso,
-        }
-        set_json(_NS_STATE, state_key, payload, ttl=None)
-        assignment_states.append(payload)
-        any_transition = any_transition or transition
+            previous = get_json(_NS_STATE, state_key) or {}
+            previous_state = previous.get("state")
+            if previous_lat is not None and previous_lng is not None:
+                previous_distance_m = haversine_m(
+                    finite(previous_lat, "previous_lat"),
+                    finite(previous_lng, "previous_lng"),
+                    zone_lat,
+                    zone_lng,
+                )
+                previous_inside = previous_distance_m <= radius_m
+                previous_state = (
+                    "restricted_inside" if is_restricted and previous_inside
+                    else "restricted_clear" if is_restricted
+                    else "safe" if previous_inside
+                    else "breach"
+                )
 
-        if transition:
-            await broadcaster.broadcast_to_user(user_id, "geofence_status", payload)
-            alert_kind = None
-            alert_event = None
-            alert_message = None
-            details = None
-            if not is_restricted and not inside:
-                alert_kind, alert_event = "geofence_breach", "geofence_breach"
-                alert_message = f"{name} left safe zone {zone.name}."
-                details = f"Currently {round(distance_m)} metres from the zone centre."
-            elif not is_restricted and inside and previous_state == "breach":
-                alert_kind, alert_event = "geofence_recovery", "geofence_recovery"
-                alert_message = f"{name} returned to safe zone {zone.name}."
-                details = "The latest protected-device GPS fix is back inside the saved area."
-            elif is_restricted and inside:
-                alert_kind, alert_event = "geofence_breach", "geofence_breach"
-                alert_message = f"{name} entered restricted zone {zone.name}."
-                details = "The latest protected-device GPS fix is inside this restricted area."
-            elif is_restricted and not inside and previous_state == "restricted_inside":
-                alert_kind, alert_event = "geofence_recovery", "geofence_recovery"
-                alert_message = f"{name} left restricted zone {zone.name}."
-                details = "The latest protected-device GPS fix is now outside this restricted area."
-            if alert_kind and alert_message:
+            # Never fabricate an exit/entry just because runtime cache is empty.
+            transition = previous_state is not None and previous_state != state
+            payload = {
+                "user_id": user_id,
+                "child_id": user_id,
+                "user_name": name,
+                "state": state,
+                "zone_id": zone_id,
+                "zone_name": zone.name,
+                "zone_category": "restricted" if is_restricted else "safe",
+                "distance_m": round(distance_m, 1),
+                "radius_m": radius_m,
+                "center_lat": zone_lat,
+                "center_lng": zone_lng,
+                "lat": lat,
+                "lng": lng,
+                "updated_at": now_iso,
+            }
+            set_json(_NS_STATE, state_key, payload, ttl=None)
+            assignment_states.append(payload)
+            any_transition = any_transition or transition
+
+            if transition:
+                try:
+                    await broadcaster.broadcast_to_user(
+                        user_id,
+                        "geofence_status",
+                        payload,
+                    )
+                except Exception as exc:
+                    # SSE is supplementary. Persisted state and FCM must continue.
+                    logger.warning(
+                        "[GEOFENCE] zone SSE skipped zone=%s: %s",
+                        zone_id,
+                        exc,
+                    )
+
+                alert_kind = None
+                alert_event = None
+                alert_message = None
+                details = None
+                if not is_restricted and not inside:
+                    alert_kind, alert_event = "geofence_breach", "geofence_breach"
+                    alert_message = f"{name} left safe zone {zone.name}."
+                    details = f"Currently {round(distance_m)} metres from the zone centre."
+                elif not is_restricted and inside and previous_state == "breach":
+                    alert_kind, alert_event = "geofence_recovery", "geofence_recovery"
+                    alert_message = f"{name} returned to safe zone {zone.name}."
+                    details = "The latest protected-device GPS fix is back inside the saved area."
+                elif is_restricted and inside:
+                    alert_kind, alert_event = "geofence_breach", "geofence_breach"
+                    alert_message = f"{name} entered restricted zone {zone.name}."
+                    details = "The latest protected-device GPS fix is inside this restricted area."
+                elif is_restricted and not inside and previous_state == "restricted_inside":
+                    alert_kind, alert_event = "geofence_recovery", "geofence_recovery"
+                    alert_message = f"{name} left restricted zone {zone.name}."
+                    details = "The latest protected-device GPS fix is now outside this restricted area."
+
+                if alert_kind and alert_message:
+                    try:
+                        result = await trigger_alert(
+                            session,
+                            kind=alert_kind,
+                            user_id=user_id,
+                            severity="high" if alert_kind == "geofence_breach" else "low",
+                            message=alert_message,
+                            details=details,
+                            location={"lat": lat, "lng": lng},
+                            sse_event_type=alert_event,
+                            sse_payload_extras={**payload, "message": alert_message},
+                            idempotency_key=f"{zone_id}:{state}",
+                            cooldown_s=BREACH_COOLDOWN_SEC,
+                            suppress_co_located=False,
+                            track_incident=False,
+                        )
+                        any_alert = any_alert or result.dispatched
+                    except Exception as exc:
+                        logger.warning(
+                            "[GEOFENCE] zone alert failed zone=%s: %s",
+                            zone_id,
+                            exc,
+                        )
+        except Exception as exc:
+            logger.warning(
+                "[GEOFENCE] invalid zone skipped user=%s zone=%s: %s",
+                user_id,
+                zone_id,
+                exc,
+            )
+            continue
+
+    for route in routes:
+        route_id = str(getattr(route, "id", "unknown"))
+        try:
+            origin_lat = finite(route.origin_lat, "route.origin_lat")
+            origin_lng = finite(route.origin_lng, "route.origin_lng")
+            dest_lat = finite(route.dest_lat, "route.dest_lat")
+            dest_lng = finite(route.dest_lng, "route.dest_lng")
+            corridor_width_m = finite(route.corridor_width_m, "route.corridor_width_m")
+            if corridor_width_m <= 0:
+                raise ValueError("route.corridor_width_m must be positive")
+
+            # The model is guaranteed to expose these values, but validate them
+            # before using the historical route object in arithmetic.
+            _ = (origin_lat, origin_lng, dest_lat, dest_lng)
+
+            state_key = f"{user_id}:{route_id}"
+            distance_m = _distance_to_route_m(lat, lng, route)
+            state = "on_route" if distance_m <= corridor_width_m else "route_deviation"
+            previous = get_json("geofence:route_state", state_key) or {}
+            previous_state = previous.get("state")
+            if previous_lat is not None and previous_lng is not None:
+                previous_distance_m = _distance_to_route_m(
+                    finite(previous_lat, "previous_lat"),
+                    finite(previous_lng, "previous_lng"),
+                    route,
+                )
+                previous_state = (
+                    "on_route"
+                    if previous_distance_m <= corridor_width_m
+                    else "route_deviation"
+                )
+
+            transition = previous_state is not None and previous_state != state
+            payload = {
+                "user_id": user_id,
+                "child_id": user_id,
+                "user_name": name,
+                "state": state,
+                "route_id": route_id,
+                "route_name": route.name,
+                "distance_m": round(distance_m, 1),
+                "corridor_width_m": corridor_width_m,
+                "lat": lat,
+                "lng": lng,
+                "updated_at": now_iso,
+            }
+            set_json("geofence:route_state", state_key, payload, ttl=None)
+            assignment_states.append(payload)
+            any_transition = any_transition or transition
+
+            if transition and (
+                state == "route_deviation"
+                or (state == "on_route" and previous_state == "route_deviation")
+            ):
+                is_recovery = state == "on_route"
+                alert_kind = "route_recovery" if is_recovery else "route_deviation"
+                alert_message = (
+                    f"{name} returned to monitored route {route.name}."
+                    if is_recovery
+                    else f"{name} moved outside monitored route {route.name}."
+                )
                 try:
                     result = await trigger_alert(
-                        session, kind=alert_kind, user_id=user_id,
-                        severity="high" if alert_kind == "geofence_breach" else "low",
-                        message=alert_message, details=details,
+                        session,
+                        kind=alert_kind,
+                        user_id=user_id,
+                        severity="low" if is_recovery else "high",
+                        message=alert_message,
+                        details=(
+                            "The latest protected-device GPS fix is back inside the saved route corridor."
+                            if is_recovery
+                            else f"Latest GPS fix is {round(distance_m)} metres from the saved route corridor."
+                        ),
                         location={"lat": lat, "lng": lng},
-                        sse_event_type=alert_event,
+                        sse_event_type=alert_kind,
                         sse_payload_extras={**payload, "message": alert_message},
-                        idempotency_key=f"{zone_id}:{state}", cooldown_s=BREACH_COOLDOWN_SEC,
+                        idempotency_key=f"{route_id}:{state}",
+                        cooldown_s=BREACH_COOLDOWN_SEC,
                         suppress_co_located=False,
                         track_incident=False,
                     )
                     any_alert = any_alert or result.dispatched
                 except Exception as exc:
-                    logger.warning("[GEOFENCE] zone alert failed zone=%s: %s", zone_id, exc)
+                    logger.warning(
+                        "[GEOFENCE] route alert failed route=%s: %s",
+                        route_id,
+                        exc,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "[GEOFENCE] invalid route skipped user=%s route=%s: %s",
+                user_id,
+                route_id,
+                exc,
+            )
+            continue
 
-    for route in routes:
-        route_id = str(route.id)
-        state_key = f"{user_id}:{route_id}"
-        distance_m = _distance_to_route_m(lat, lng, route)
-        state = "on_route" if distance_m <= route.corridor_width_m else "route_deviation"
-        previous = get_json("geofence:route_state", state_key) or {}
-        previous_state = previous.get("state")
-        if previous_lat is not None and previous_lng is not None:
-            previous_distance_m = _distance_to_route_m(previous_lat, previous_lng, route)
-            previous_state = (
-                "on_route"
-                if previous_distance_m <= route.corridor_width_m
-                else "route_deviation"
-            )
-        transition = previous_state is not None and previous_state != state
-        payload = {
-            "user_id": user_id, "child_id": user_id, "user_name": name,
-            "state": state, "route_id": route_id, "route_name": route.name,
-            "distance_m": round(distance_m, 1),
-            "corridor_width_m": route.corridor_width_m,
-            "lat": lat, "lng": lng, "updated_at": now_iso,
-        }
-        set_json("geofence:route_state", state_key, payload, ttl=None)
-        assignment_states.append(payload)
-        any_transition = any_transition or transition
-        if transition and (
-            state == "route_deviation" or
-            (state == "on_route" and previous_state == "route_deviation")
-        ):
-            is_recovery = state == "on_route"
-            alert_kind = "route_recovery" if is_recovery else "route_deviation"
-            alert_message = (
-                f"{name} returned to monitored route {route.name}."
-                if is_recovery
-                else f"{name} moved outside monitored route {route.name}."
-            )
-            try:
-                result = await trigger_alert(
-                    session, kind=alert_kind, user_id=user_id,
-                    severity="low" if is_recovery else "high",
-                    message=alert_message,
-                    details=(
-                        "The latest protected-device GPS fix is back inside the saved route corridor."
-                        if is_recovery
-                        else f"Latest GPS fix is {round(distance_m)} metres from the saved route corridor."
-                    ),
-                    location={"lat": lat, "lng": lng},
-                    sse_event_type=alert_kind,
-                    sse_payload_extras={**payload, "message": alert_message},
-                    idempotency_key=f"{route_id}:{state}", cooldown_s=BREACH_COOLDOWN_SEC,
-                    suppress_co_located=False,
-                    track_incident=False,
-                )
-                any_alert = any_alert or result.dispatched
-            except Exception as exc:
-                logger.warning("[GEOFENCE] route alert failed route=%s: %s", route_id, exc)
+    if not assignment_states:
+        # All active assignments were malformed. Core GPS ingestion remains
+        # healthy; the next valid assignment/update can recover automatically.
+        return GeofenceEvaluation(
+            state="safe",
+            message="",
+            distance_m=0.0,
+            radius_m=0.0,
+            zone_id=None,
+            zone_name=None,
+            center_lat=None,
+            center_lng=None,
+            transition=False,
+            breach_alert_fired=False,
+        )
 
     priority = next(
-        (item for item in assignment_states if item["state"] in ("restricted_inside", "route_deviation", "breach")),
+        (
+            item
+            for item in assignment_states
+            if item["state"] in ("restricted_inside", "route_deviation", "breach")
+        ),
         assignment_states[0],
     )
     set_json(_NS_STATE, user_id, {**priority, "assignments": assignment_states}, ttl=3600)
     return GeofenceEvaluation(
-        state="breach" if priority["state"] in ("restricted_inside", "route_deviation", "breach") else "safe",
+        state=(
+            "breach"
+            if priority["state"] in ("restricted_inside", "route_deviation", "breach")
+            else "safe"
+        ),
         message=str(priority.get("message") or ""),
         distance_m=float(priority.get("distance_m") or 0),
         radius_m=float(priority.get("radius_m") or priority.get("corridor_width_m") or 0),
         zone_id=priority.get("zone_id") or priority.get("route_id"),
         zone_name=priority.get("zone_name") or priority.get("route_name"),
-        center_lat=priority.get("center_lat"), center_lng=priority.get("center_lng"),
-        transition=any_transition, breach_alert_fired=any_alert,
+        center_lat=priority.get("center_lat"),
+        center_lng=priority.get("center_lng"),
+        transition=any_transition,
+        breach_alert_fired=any_alert,
     )
-
 
 async def evaluate_environmental_hazard(
     session: AsyncSession,

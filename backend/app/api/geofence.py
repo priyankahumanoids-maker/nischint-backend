@@ -10,8 +10,9 @@ Endpoints:
 """
 from __future__ import annotations
 
+import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -24,6 +25,7 @@ from app.models.safe_zone import SafeZone
 from app.models.monitored_route import MonitoredRoute
 
 router = APIRouter(prefix="/geofence", tags=["geofence"])
+logger = logging.getLogger(__name__)
 
 DEFAULT_RADIUS_M = 3000
 MIN_RADIUS_M = 100
@@ -470,23 +472,48 @@ async def location_update(
             "environmental": [],
         }
 
-    from app.services.location_availability import record_location_availability
-    await record_location_availability(
-        session,
-        target_id,
-        available=True,
-        reason="current_location_fix",
-        source="protected_device",
-    )
-
-    result = await evaluate_user_location(
-        session, target_id, req.lat, req.lng,
-        previous_lat=previous_lat, previous_lng=previous_lng,
-    )
-    # Commit authoritative location/zone/route state first. External hazard
-    # providers run after the HTTP response so a location heartbeat never waits
-    # on third-party network latency.
+    # The latest authenticated GPS fix and presence heartbeat are core safety
+    # state. Commit them BEFORE availability alerts or zone/route evaluation so
+    # any supplementary pipeline failure can never roll back tracking.
     await session.commit()
+
+    from app.services.location_availability import record_location_availability
+    try:
+        await record_location_availability(
+            session,
+            target_id,
+            available=True,
+            reason="current_location_fix",
+            source="protected_device",
+        )
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        logger.warning(
+            "[GEOFENCE] location-availability recovery deferred user=%s: %s",
+            target_id,
+            exc,
+        )
+
+    result = None
+    evaluation_deferred = False
+    try:
+        result = await evaluate_user_location(
+            session, target_id, req.lat, req.lng,
+            previous_lat=previous_lat, previous_lng=previous_lng,
+        )
+        await session.commit()
+    except Exception as exc:
+        evaluation_deferred = True
+        await session.rollback()
+        logger.exception(
+            "[GEOFENCE] evaluation deferred after durable telemetry user=%s: %s",
+            target_id,
+            exc,
+        )
+
+    # External hazard providers run after the HTTP response so a location
+    # heartbeat never waits on third-party network latency.
     background_tasks.add_task(
         _run_environmental_hazard_background,
         target_id,
@@ -494,14 +521,19 @@ async def location_update(
         req.lng,
     )
     return {
-        "state": result.state,
-        "message": result.message,
-        "distance_m": round(result.distance_m, 1),
-        "radius_m": result.radius_m,
-        "zone_id": result.zone_id,
-        "zone_name": result.zone_name,
-        "transition": result.transition,
-        "breach_alert_fired": result.breach_alert_fired,
+        "state": result.state if result is not None else "unknown",
+        "message": (
+            result.message
+            if result is not None
+            else "Location recorded; safety-boundary evaluation will retry on the next fix."
+        ),
+        "distance_m": round(result.distance_m, 1) if result is not None else None,
+        "radius_m": result.radius_m if result is not None else None,
+        "zone_id": result.zone_id if result is not None else None,
+        "zone_name": result.zone_name if result is not None else None,
+        "transition": result.transition if result is not None else False,
+        "breach_alert_fired": result.breach_alert_fired if result is not None else False,
+        "evaluation_deferred": evaluation_deferred,
         "telemetry": {
             "battery_pct": telemetry.get("battery_pct"),
             "updated_at": telemetry.get("updated_at"),
@@ -523,13 +555,33 @@ async def location_availability(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    """Receive the protected phone's real permission/services state."""
+    """Receive protected-phone capability state and a lightweight presence heartbeat.
+
+    ``available=True`` proves the authenticated app/device is alive and has the
+    required location capability; it does NOT claim that a fresh GPS fix exists.
+    GPS recovery remains authoritative only through ``/location-update``.
+    """
+    if req.available:
+        from app.services.redis_service import mark_user_ping
+
+        now = datetime.now(timezone.utc).isoformat()
+        mark_user_ping(str(user.id), now)
+        return {
+            "user_id": str(user.id),
+            "available": True,
+            "reason": req.reason,
+            "source": "protected_device_status",
+            "checked_at": now,
+            "presence_heartbeat": True,
+            "transition": False,
+        }
+
     from app.services.location_availability import record_location_availability
 
     state = await record_location_availability(
         session,
         str(user.id),
-        available=req.available,
+        available=False,
         reason=req.reason,
         source="protected_device_status",
     )
