@@ -427,27 +427,6 @@ async def location_update(
     if target_id != str(user.id) and not _is_admin(user):
         raise HTTPException(status_code=403, detail="You can only update your own location.")
 
-    # Capture the previous durable fix BEFORE record_protected_telemetry
-    # overwrites it. This keeps zone/route transitions deterministic across
-    # Cloud Run instances even if Redis falls back to process-local memory.
-    previous_location = (
-        await session.execute(
-            select(User.last_known_lat, User.last_known_lng).where(
-                User.id == uuid.UUID(target_id)
-            )
-        )
-    ).first()
-    previous_lat = (
-        float(previous_location[0])
-        if previous_location and previous_location[0] is not None
-        else None
-    )
-    previous_lng = (
-        float(previous_location[1])
-        if previous_location and previous_location[1] is not None
-        else None
-    )
-
     telemetry = await record_protected_telemetry(
         session,
         target_id,
@@ -458,6 +437,8 @@ async def location_update(
         speed_mps=req.speed_mps,
         captured_at=req.captured_at,
     )
+    previous_lat = telemetry.get("previous_lat")
+    previous_lng = telemetry.get("previous_lng")
     # A delayed offline fix is useful as truthful last-known state, but must not
     # replay historical safe-zone/environmental alerts when the phone reconnects.
     if not telemetry["is_current"]:
@@ -538,6 +519,7 @@ async def location_update(
             "battery_pct": telemetry.get("battery_pct"),
             "updated_at": telemetry.get("updated_at"),
             "source": telemetry.get("source"),
+            "core_persisted": bool(telemetry.get("core_persisted")),
         },
         "environmental_hazard": {
             "matched": False,
@@ -574,6 +556,7 @@ async def location_availability(
             "checked_at": now,
             "presence_heartbeat": True,
             "transition": False,
+            "location_core_version": "v2",
         }
 
     from app.services.location_availability import record_location_availability

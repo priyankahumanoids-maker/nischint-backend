@@ -204,13 +204,15 @@ async def record_protected_telemetry(
     speed_mps: float | None = None,
     captured_at: datetime | None = None,
 ) -> dict:
-    """Record a real protected-device snapshot for guardian dashboards.
+    """Durably record one authenticated protected-device location snapshot.
 
-    The snapshot is never synthesized: battery remains ``None`` when the
-    native battery API has no reading. Redis keeps the latest passive value,
-    while an existing active GuardianSession receives the same snapshot so
-    current staging dashboards continue to work if Redis is unavailable.
+    The users.last_known_* write is deliberately isolated from every optional
+    cache/session/SSE side effect.  One PostgreSQL CTE atomically captures the
+    previous durable point and performs a monotonic update, then COMMIT happens
+    immediately.  Anything after that point is best-effort and cannot turn a
+    successfully persisted GPS fix into HTTP 500.
     """
+    from sqlalchemy import text
     from app.services.redis_service import mark_user_ping, set_json
 
     now = datetime.now(timezone.utc)
@@ -219,36 +221,89 @@ async def record_protected_telemetry(
         observed_at = observed_at.replace(tzinfo=timezone.utc)
     else:
         observed_at = observed_at.astimezone(timezone.utc)
-    # A device clock too far in the future must not make an offline member look
-    # perpetually live. Server receipt time is the safe upper bound.
     if observed_at > now:
         observed_at = now
+
     observation_age_s = max(0.0, (now - observed_at).total_seconds())
-
-    # Persist one authoritative latest-known coordinate on the User row. This
-    # survives Redis expiry/restarts and is the source Guardian screens can use
-    # when a protected phone is temporarily offline. Delayed queue replay must
-    # never replace a newer point.
-    user_row = (
-        await session.execute(
-            select(User).where(User.id == uuid.UUID(user_id))
-        )
-    ).scalar_one_or_none()
-    accepted_as_latest = True
-    if user_row is not None and user_row.last_known_at is not None:
-        previous_at = user_row.last_known_at
-        if previous_at.tzinfo is None:
-            previous_at = previous_at.replace(tzinfo=timezone.utc)
-        else:
-            previous_at = previous_at.astimezone(timezone.utc)
-        accepted_as_latest = observed_at >= previous_at
-
-    # Android may batch stationary fixes in Doze. A fix can be older than\n    # the server receipt time even though the protected-device pipeline is alive.\n    # Keep GPS observation freshness truthful, but allow a five-minute current\n    # window before classifying the coordinate as stale.\n    is_current = observation_age_s <= 300 and accepted_as_latest
     normalized_battery = (
         int(battery_pct)
         if battery_pct is not None and 0 <= int(battery_pct) <= 100
         else None
     )
+
+    # IMPORTANT: Do not ORM-load User here.  Production location ingestion is a
+    # hot path and must not depend on unrelated User mapper state.  This CTE uses
+    # only the three durable columns needed by location tracking and returns the
+    # pre-update point for deterministic zone/route transitions.
+    try:
+        durable = (
+            await session.execute(
+                text(
+                    """
+                    WITH previous AS (
+                        SELECT last_known_lat, last_known_lng, last_known_at
+                          FROM users
+                         WHERE id = CAST(:user_id AS uuid)
+                    ),
+                    updated AS (
+                        UPDATE users
+                           SET last_known_lat = :lat,
+                               last_known_lng = :lng,
+                               last_known_at  = :observed_at
+                         WHERE id = CAST(:user_id AS uuid)
+                           AND (
+                                last_known_at IS NULL
+                                OR last_known_at <= :observed_at
+                           )
+                        RETURNING id
+                    )
+                    SELECT previous.last_known_lat AS previous_lat,
+                           previous.last_known_lng AS previous_lng,
+                           previous.last_known_at  AS previous_at,
+                           EXISTS(SELECT 1 FROM updated) AS accepted_as_latest
+                      FROM previous
+                    """
+                ),
+                {
+                    "user_id": str(user_id),
+                    "lat": float(lat),
+                    "lng": float(lng),
+                    "observed_at": observed_at,
+                },
+            )
+        ).mappings().first()
+
+        if durable is None:
+            await session.rollback()
+            raise ValueError("authenticated user row not found for location update")
+
+        accepted_as_latest = bool(durable["accepted_as_latest"])
+        previous_lat = (
+            float(durable["previous_lat"])
+            if durable["previous_lat"] is not None
+            else None
+        )
+        previous_lng = (
+            float(durable["previous_lng"])
+            if durable["previous_lng"] is not None
+            else None
+        )
+
+        # Core location truth is durable before Redis, GuardianSession, alerts,
+        # SSE or geofence evaluation are allowed to run.
+        await session.commit()
+    except Exception:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        logger.exception(
+            "[PROTECTED_TELEMETRY] durable core persist failed user=%s",
+            user_id,
+        )
+        raise
+
+    is_current = observation_age_s <= 300 and accepted_as_latest
     snapshot = {
         "lat": float(lat),
         "lng": float(lng),
@@ -260,47 +315,68 @@ async def record_protected_telemetry(
         "is_current": is_current,
         "accepted_as_latest": accepted_as_latest,
         "source": "protected_device",
+        "core_persisted": accepted_as_latest,
+        "previous_lat": previous_lat,
+        "previous_lng": previous_lng,
     }
 
     if not accepted_as_latest:
-        # Keep the newer Redis/DB/session/SSE state untouched. The caller marks
-        # this response stale and will not replay geofence transitions.
         snapshot["latest_preserved"] = True
         return snapshot
 
-    if user_row is not None:
-        user_row.last_known_lat = float(lat)
-        user_row.last_known_lng = float(lng)
-        user_row.last_known_at = observed_at
-
-    set_json("protected_telemetry", user_id, snapshot, ttl=24 * 60 * 60)
-    # Presence means "the backend heard from this authenticated phone", not\n    # "the GPS observation timestamp was fresh". Android can legitimately batch\n    # stationary fixes while screen-off, so use server receipt time for presence.\n    mark_user_ping(user_id, now.isoformat())
-
-    active_result = await session.execute(
-        select(GuardianSession)
-        .where(
-            GuardianSession.user_id == uuid.UUID(user_id),
-            GuardianSession.status == "active",
+    # Cache + presence are useful accelerators, never prerequisites for durable
+    # location truth.  redis_service already fails closed, and this extra guard
+    # ensures an unexpected cache implementation error cannot break ingestion.
+    try:
+        set_json("protected_telemetry", user_id, snapshot, ttl=24 * 60 * 60)
+        mark_user_ping(user_id, now.isoformat())
+    except Exception as exc:
+        logger.warning(
+            "[PROTECTED_TELEMETRY] cache/presence side effect skipped user=%s: %s",
+            user_id,
+            exc,
         )
-        .order_by(GuardianSession.started_at.desc())
-        .limit(1)
-    )
-    active_session = active_result.scalar_one_or_none()
-    if active_session:
-        current = (
-            dict(active_session.current_location)
-            if isinstance(active_session.current_location, dict)
-            else {}
+
+    # Active journey/session enrichment is secondary to durable User location.
+    # Run it in a fresh post-core transaction and contain any schema/runtime
+    # failure so it can never poison the GPS endpoint.
+    active_session = None
+    try:
+        active_result = await session.execute(
+            select(GuardianSession)
+            .where(
+                GuardianSession.user_id == uuid.UUID(user_id),
+                GuardianSession.status == "active",
+            )
+            .order_by(GuardianSession.started_at.desc())
+            .limit(1)
         )
-        current.update(snapshot)
-        active_session.current_location = current
-        active_session.previous_update_at = observed_at
-        # Session liveness is based on server receipt time, not the potentially
-        # batched GPS observation timestamp.
-        active_session.last_seen_online_at = now
-        active_session.is_offline = False
-        if speed_mps is not None:
-            active_session.speed_mps = max(0.0, float(speed_mps))
+        active_session = active_result.scalar_one_or_none()
+        if active_session:
+            current = (
+                dict(active_session.current_location)
+                if isinstance(active_session.current_location, dict)
+                else {}
+            )
+            current.update(snapshot)
+            active_session.current_location = current
+            active_session.previous_update_at = observed_at
+            active_session.last_seen_online_at = now
+            active_session.is_offline = False
+            if speed_mps is not None:
+                active_session.speed_mps = max(0.0, float(speed_mps))
+            await session.commit()
+    except Exception as exc:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        active_session = None
+        logger.warning(
+            "[PROTECTED_TELEMETRY] active-session enrichment skipped user=%s: %s",
+            user_id,
+            exc,
+        )
 
     if is_current and normalized_battery is not None and normalized_battery <= 20:
         try:
@@ -326,14 +402,15 @@ async def record_protected_telemetry(
                 idempotency_key="phone-battery-low",
                 cooldown_s=60 * 60,
             )
+            await session.commit()
         except Exception:
-            # Location/geofence ingestion must remain available even when the
-            # alert transport is temporarily degraded.
-            pass
+            try:
+                await session.rollback()
+            except Exception:
+                pass
 
-    # Fan the same real protected-device snapshot to every linked guardian
-    # and co-guardian. This is an SSE state update, not a noisy system push;
-    # system notifications remain reserved for safety transitions.
+    # Guardian SSE fan-out is supplementary.  It may fail independently without
+    # invalidating the already-committed protected-device location.
     try:
         from app.services.event_broadcaster import broadcaster
 
@@ -364,6 +441,10 @@ async def record_protected_telemetry(
                 live_payload,
             )
     except Exception as exc:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
         logger.warning(
             "[PROTECTED_TELEMETRY] live guardian fan-out skipped user=%s: %s",
             user_id,
