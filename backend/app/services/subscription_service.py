@@ -245,11 +245,15 @@ async def ensure_existing_members_premium(session: AsyncSession, guardian_id) ->
         _premium_ready_guardians.add(guardian_key)
 
 
-async def summary_for_guardian(session: AsyncSession, actor: User) -> dict[str, Any]:
-    _require_primary_guardian(actor)
-    await ensure_existing_members_premium(session, actor.id)
+async def _summary_rows_for_guardian(session: AsyncSession, guardian_id):
+    """Read subscription summary rows without schema/reconciliation side effects.
 
-    rows = (
+    This is the normal hot path. Production already has the subscription tables,
+    and current/future subscription-backed families should need only this single
+    SELECT. Legacy reconciliation is kept as a fallback only when a guardian has
+    no subscription rows yet.
+    """
+    return (
         await session.execute(
             text(
                 """
@@ -263,9 +267,43 @@ async def summary_for_guardian(session: AsyncSession, actor: User) -> dict[str, 
                 ORDER BY (s.protected_member_user_id IS NULL) DESC, s.created_at ASC
                 """
             ),
-            {"guardian_id": actor.id},
+            {"guardian_id": guardian_id},
         )
     ).mappings().all()
+
+
+async def summary_for_guardian(session: AsyncSession, actor: User) -> dict[str, Any]:
+    _require_primary_guardian(actor)
+
+    # Fast path: summary is a pure read. Do not run CREATE INDEX / legacy
+    # reconciliation before every first summary request on a fresh Cloud Run
+    # instance. That work caused the client-visible Settings/Subscription stall.
+    # Existing and future subscription-backed families normally return here
+    # after one SELECT.
+    try:
+        rows = await _summary_rows_for_guardian(session, actor.id)
+    except Exception as exc:
+        # Fresh/local environments may not have created the Day-6/7 table yet.
+        # Preserve the original self-bootstrap behavior only for that specific
+        # missing-table case; do not swallow unrelated database errors.
+        message = str(exc).lower()
+        if "member_subscriptions" not in message or not (
+            "does not exist" in message
+            or "undefinedtable" in message
+            or "undefined table" in message
+        ):
+            raise
+        await session.rollback()
+        await ensure_tables()
+        rows = await _summary_rows_for_guardian(session, actor.id)
+
+    # Legacy-only fallback. Proper subscription flows create a row before a
+    # protected member is added, so current/future accounts do not pay this
+    # reconciliation cost. Old linked families with no subscription records are
+    # still grandfathered exactly as before.
+    if not rows:
+        await ensure_existing_members_premium(session, actor.id)
+        rows = await _summary_rows_for_guardian(session, actor.id)
 
     subscriptions: list[dict[str, Any]] = []
     free_slots = 0
@@ -299,6 +337,7 @@ async def summary_for_guardian(session: AsyncSession, actor: User) -> dict[str, 
         "protected_member_limit_per_subscription": 1,
         "co_parent_included_per_subscription": 1,
         "payment_mode": "deferred_test_state",
+        "summary_runtime_version": "client-ready-v1",
     }
 
 
