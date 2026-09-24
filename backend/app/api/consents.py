@@ -18,6 +18,7 @@ is code-only — no schema migration needed.
 from __future__ import annotations
 
 import logging
+import uuid as _uuid
 from datetime import datetime, timezone
 from typing import Final
 
@@ -42,6 +43,20 @@ CATEGORY_AUDIO:        Final = "audio_recording"
 CATEGORY_HEALTH:       Final = "health_vitals"
 CATEGORY_PUSH:         Final = "push_notifications"
 CATEGORY_BIOMETRIC:    Final = "biometric_sensors"
+CATEGORY_EMERGENCY_CONTACT_SHARING: Final = "emergency_contact_sharing"
+DEPENDENT_PROFILE_PREFIX: Final = "dependent_profile:"
+
+# Keep the original five categories locked for the existing operator consent
+# health metric. The client-facing DPDP settings surface adds emergency-contact
+# sharing separately so existing health dashboards are not reclassified.
+SETTINGS_CATEGORIES: tuple[str, ...] = (
+    CATEGORY_LOCATION,
+    CATEGORY_AUDIO,
+    CATEGORY_HEALTH,
+    CATEGORY_PUSH,
+    CATEGORY_BIOMETRIC,
+    CATEGORY_EMERGENCY_CONTACT_SHARING,
+)
 
 # Order matters — surfaces this order to clients (e.g. mobile settings
 # screen renders in declared order).
@@ -121,7 +136,51 @@ CATEGORY_METADATA: dict[str, dict[str, str]] = {
         ),
         "required_for": "fall_detection",
     },
+    CATEGORY_EMERGENCY_CONTACT_SHARING: {
+        "label_en": "Emergency contact sharing",
+        "label_hi": "आपातकालीन संपर्क साझा करना",
+        "purpose_en": (
+            "Share your name, location, and alert details with the emergency "
+            "contacts you added when an alert is triggered."
+        ),
+        "purpose_hi": (
+            "अलर्ट ट्रिगर होने पर आपके जोड़े गए आपातकालीन संपर्कों के साथ "
+            "आपका नाम, स्थान और अलर्ट विवरण साझा करें।"
+        ),
+        "required_for": "emergency_contact_delivery",
+    },
 }
+
+def _dependent_profile_id(category: str) -> str | None:
+    if not category.startswith(DEPENDENT_PROFILE_PREFIX):
+        return None
+    raw = category[len(DEPENDENT_PROFILE_PREFIX):].strip()
+    try:
+        return str(_uuid.UUID(raw))
+    except (ValueError, TypeError):
+        return None
+
+def _is_supported_category(category: str) -> bool:
+    return category in SETTINGS_CATEGORIES or _dependent_profile_id(category) is not None
+
+def _metadata_for_category(category: str) -> dict[str, str]:
+    if category in CATEGORY_METADATA:
+        return CATEGORY_METADATA[category]
+    if _dependent_profile_id(category) is not None:
+        return {
+            "label_en": "Dependant profile consent",
+            "label_hi": "आश्रित प्रोफ़ाइल सहमति",
+            "purpose_en": (
+                "Guardian consent to process the selected dependant's location "
+                "and safety-signal data as described in the Privacy Policy."
+            ),
+            "purpose_hi": (
+                "चयनित आश्रित के स्थान और सुरक्षा-सिग्नल डेटा को गोपनीयता "
+                "नीति के अनुसार संसाधित करने के लिए अभिभावक की सहमति।"
+            ),
+            "required_for": "dependent_profile",
+        }
+    raise KeyError(category)
 
 # Bump when consent text changes materially. Clients must re-prompt the
 # user when this changes (compare with the stored consent_text_version).
@@ -183,8 +242,8 @@ async def get_my_consents(
     by_cat = {c.category: c for c in q.scalars().all()}
 
     out: list[ConsentOut] = []
-    for cat in CATEGORIES:
-        meta = CATEGORY_METADATA[cat]
+    for cat in SETTINGS_CATEGORIES:
+        meta = _metadata_for_category(cat)
         row = by_cat.get(cat)
         if row is not None:
             granted = row.revoked_at is None
@@ -203,6 +262,27 @@ async def get_my_consents(
             consent_text_version=row.consent_text_version if row else None,
             app_version=row.app_version if row else None,
         ))
+
+    # Guardian dependant consent is member-specific. Reuse the existing audit
+    # table with a namespaced category so no schema migration or safety-flow
+    # change is required. Existing rows are surfaced after the fixed toggles.
+    for cat, row in sorted(by_cat.items()):
+        if not cat.startswith(DEPENDENT_PROFILE_PREFIX):
+            continue
+        meta = _metadata_for_category(cat)
+        out.append(ConsentOut(
+            category=cat,
+            label_en=meta["label_en"],
+            label_hi=meta["label_hi"],
+            purpose_en=meta["purpose_en"],
+            purpose_hi=meta["purpose_hi"],
+            required_for=meta["required_for"],
+            granted=row.revoked_at is None,
+            granted_at=row.granted_at,
+            revoked_at=row.revoked_at,
+            consent_text_version=row.consent_text_version,
+            app_version=row.app_version,
+        ))
     return out
 
 
@@ -215,10 +295,10 @@ async def grant_consent(
 ):
     """Grant consent for a category. Idempotent: re-granting refreshes
     `granted_at`, clears `revoked_at`, and updates the audit metadata."""
-    if body.category not in CATEGORIES:
+    if not _is_supported_category(body.category):
         raise HTTPException(
             status_code=400,
-            detail=f"unknown category '{body.category}'. supported: {list(CATEGORIES)}",
+            detail=f"unknown category '{body.category}'",
         )
 
     now = datetime.now(timezone.utc)
@@ -259,7 +339,7 @@ async def grant_consent(
         user.id, body.category, body.consent_text_version,
     )
 
-    meta = CATEGORY_METADATA[body.category]
+    meta = _metadata_for_category(body.category)
     return ConsentOut(
         category=row.category,
         label_en=meta["label_en"],
@@ -284,10 +364,10 @@ async def revoke_consent(
     """Revoke a previously-granted consent. Keeps the row for audit;
     only sets `revoked_at`. Idempotent for already-revoked categories.
     """
-    if category not in CATEGORIES:
+    if not _is_supported_category(category):
         raise HTTPException(
             status_code=400,
-            detail=f"unknown category '{category}'. supported: {list(CATEGORIES)}",
+            detail=f"unknown category '{category}'",
         )
 
     q = await session.execute(
@@ -311,7 +391,7 @@ async def revoke_consent(
             user.id, category,
         )
 
-    meta = CATEGORY_METADATA[category]
+    meta = _metadata_for_category(category)
     return ConsentOut(
         category=row.category,
         label_en=meta["label_en"],
@@ -522,14 +602,16 @@ async def compute_consent_health(session: AsyncSession) -> ConsentHealthBundle:
             func.count(Consent.id)
                 .filter(Consent.revoked_at.is_(None))
                 .label("granted"),
-        ).group_by(Consent.category)
+        ).where(Consent.category.in_(CATEGORIES)).group_by(Consent.category)
     )
     rows = {r.category: (r.decided, r.granted) for r in q.all()}
 
     # Distinct users who have been prompted for *any* category — used
     # as the global denominator for the "% of users engaging" summary.
     total_users_q = await session.execute(
-        select(func.count(func.distinct(Consent.user_id)))
+        select(func.count(func.distinct(Consent.user_id))).where(
+            Consent.category.in_(CATEGORIES)
+        )
     )
     total_users_prompted = total_users_q.scalar() or 0
 
