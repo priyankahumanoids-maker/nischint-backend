@@ -84,7 +84,7 @@ async def public_legal_content():
         "privacy_policy": _legal_item(
             "NISCHINT_PRIVACY_POLICY",
             default_content=CLIENT_PRIVACY_POLICY,
-            default_url="https://nischint.care/privacy",
+            default_url="https://nischint.care/privacy-policy",
             default_status="draft",
         ),
         "terms": _legal_item(
