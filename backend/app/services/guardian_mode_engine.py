@@ -50,6 +50,131 @@ ESC_ORDER = {"none": 0, "user": 1, "guardian": 2, "emergency": 3}
 RISK_ESC_MAP = {"SAFE": "none", "LOW": "none", "HIGH": "user", "CRITICAL": "guardian"}
 RISK_ORDER = {"SAFE": 0, "LOW": 1, "HIGH": 2, "CRITICAL": 3}
 
+
+
+def _clean_route_points(route_points) -> list[dict[str, float]]:
+    if isinstance(route_points, dict):
+        route_points = route_points.get("points")
+    if not isinstance(route_points, list):
+        return []
+    cleaned: list[dict[str, float]] = []
+    for point in route_points:
+        if not isinstance(point, dict):
+            continue
+        try:
+            lat = float(point.get("lat"))
+            lng = float(point.get("lng"))
+        except (TypeError, ValueError):
+            continue
+        if -90 <= lat <= 90 and -180 <= lng <= 180:
+            cleaned.append({"lat": lat, "lng": lng})
+    return cleaned
+
+
+def _remaining_route_distance_m(lat: float, lng: float, route_points) -> float | None:
+    """Distance from the current fix to the nearest route segment plus the
+    remaining polyline distance. Uses a local equirectangular projection, which
+    is stable for the city-scale Safe Walk routes NISCHINT serves.
+    """
+    points = _clean_route_points(route_points)
+    if len(points) < 2:
+        return None
+
+    mean_lat = math.radians(lat)
+    metres_per_lat = 111_320.0
+    metres_per_lng = max(1.0, 111_320.0 * math.cos(mean_lat))
+
+    def xy(point):
+        return (point["lng"] * metres_per_lng, point["lat"] * metres_per_lat)
+
+    px, py = lng * metres_per_lng, lat * metres_per_lat
+    best_distance = float("inf")
+    best_index = 0
+    best_t = 0.0
+
+    projected = [xy(point) for point in points]
+    segment_lengths: list[float] = []
+    for index in range(len(projected) - 1):
+        ax, ay = projected[index]
+        bx, by = projected[index + 1]
+        dx, dy = bx - ax, by - ay
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0:
+            segment_lengths.append(0.0)
+            continue
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_sq))
+        qx, qy = ax + t * dx, ay + t * dy
+        distance = math.hypot(px - qx, py - qy)
+        segment_length = math.sqrt(length_sq)
+        segment_lengths.append(segment_length)
+        if distance < best_distance:
+            best_distance = distance
+            best_index = index
+            best_t = t
+
+    if not segment_lengths:
+        return None
+
+    remaining = segment_lengths[best_index] * (1.0 - best_t)
+    remaining += sum(segment_lengths[best_index + 1:])
+
+    # If the member is off-route, include the distance required to rejoin the
+    # corridor instead of pretending they are already on it.
+    return max(0.0, remaining + best_distance)
+
+
+def _smooth_speed_mps(previous: float, computed: float, observed: float | None) -> float:
+    candidates: list[float] = []
+    if math.isfinite(computed) and 0 <= computed <= 70:
+        candidates.append(computed)
+    if observed is not None and math.isfinite(observed) and 0 <= observed <= 70:
+        candidates.append(observed)
+
+    if not candidates:
+        sample = 0.0
+    elif len(candidates) == 2:
+        # Native/OS speed is generally less noisy than one-segment displacement
+        # speed, but keep both so tunnels/temporary provider gaps degrade gently.
+        sample = candidates[0] * 0.35 + candidates[1] * 0.65
+    else:
+        sample = candidates[0]
+
+    previous = previous if math.isfinite(previous) and previous >= 0 else 0.0
+    alpha = 0.45 if sample > previous else 0.30
+    smoothed = previous * (1.0 - alpha) + sample * alpha
+    return max(0.0, min(70.0, smoothed))
+
+
+def _smooth_eta_minutes(previous: float | None, raw_eta: float) -> float:
+    raw_eta = max(0.0, min(1440.0, raw_eta))
+    if previous is None or not math.isfinite(previous) or previous <= 0:
+        return round(raw_eta, 1)
+    # Prevent one noisy speed sample from making ETA jump wildly while still
+    # converging quickly when the user genuinely switches from walking to a vehicle.
+    blended = previous * 0.55 + raw_eta * 0.45
+    lower = previous * 0.65
+    upper = previous * 1.45 + 0.5
+    return round(max(lower, min(upper, blended)), 1)
+
+
+async def set_route_context(session: AsyncSession, session_id: str, points: list[dict]) -> dict:
+    result = await session.execute(
+        select(GuardianSession).where(GuardianSession.id == uuid.UUID(session_id))
+    )
+    gs = result.scalar_one_or_none()
+    if not gs:
+        return {"error": "Session not found"}
+    cleaned = _clean_route_points(points)
+    if len(cleaned) < 2:
+        return {"error": "Route context requires at least two valid points"}
+    gs.route_points = {
+        "points": cleaned,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await session.flush()
+    return {"session_id": session_id, "route_points": len(cleaned), "updated": True}
+
+
 # ── In-memory state for real-time tracking (supplements DB) ──
 _live_state: dict[str, dict] = {}
 
@@ -207,6 +332,7 @@ async def get_session(session: AsyncSession, session_id: str) -> dict | None:
         "session_id": str(gs.id), "user_id": str(gs.user_id), "status": gs.status,
         "started_at": gs.started_at.isoformat(), "duration_minutes": duration,
         "current_location": gs.current_location, "destination": gs.destination,
+        "route_points": gs.route_points,
         "risk_level": gs.risk_level, "risk_score": gs.risk_score,
         "zone_name": gs.zone_name, "eta_minutes": gs.eta_minutes,
         "speed_mps": round(gs.speed_mps, 2), "total_distance_m": round(gs.total_distance_m, 1),
@@ -327,6 +453,7 @@ async def update_location(
     session: AsyncSession, session_id: str, lat: float, lng: float,
     timestamp: datetime | None = None,
     accuracy: float | None = None,
+    observed_speed_mps: float | None = None,
 ) -> dict:
     result = await session.execute(select(GuardianSession).where(GuardianSession.id == uuid.UUID(session_id)))
     gs = result.scalar_one_or_none()
@@ -453,10 +580,18 @@ async def update_location(
             "gap_seconds": int(gap_s), "auto": False,
         })
 
-    # Compute speed & distance
+    # Compute displacement speed, then blend/smooth it with the OS-reported
+    # speed when available. This lets ETA adapt from walking to vehicle travel
+    # without reacting violently to a single noisy GPS sample.
     dt = (now - prev_ts).total_seconds()
     dist = _haversine(prev_loc["lat"], prev_loc["lng"], lat, lng)
-    speed = dist / dt if dt > 0 else 0.0
+    noise_floor_m = max(3.0, float(accuracy or 0.0) * 0.35)
+    computed_speed = (dist / dt) if dt > 0 and dist >= noise_floor_m else 0.0
+    speed = _smooth_speed_mps(
+        float(gs.speed_mps or 0.0),
+        computed_speed,
+        observed_speed_mps,
+    )
 
     # Zone check
     zone = await check_zone(session, str(gs.user_id), lat, lng, now)
@@ -540,18 +675,24 @@ async def update_location(
         gs.safety_check_pending = False
         gs.safety_check_sent_at = None
 
-    # ETA
-    # Keep the last valid ETA when GPS reports no meaningful movement. This
-    # prevents a duplicate/stationary fix from erasing ETA on the Guardian
-    # dashboard. Once movement is measurable, refresh ETA from live speed.
+    # Dynamic route-aware ETA. Prefer the remaining planned Safe Walk
+    # polyline distance; fall back to direct destination distance only when the
+    # route provider has not hydrated the session yet. The smoothed speed reacts
+    # automatically when the member changes from walking to a vehicle or slows
+    # in traffic, while the ETA smoother rejects one-fix spikes.
     eta = gs.eta_minutes
     if gs.destination:
         dest_dist = _haversine(lat, lng, gs.destination["lat"], gs.destination["lng"])
-        if speed > 0.3:
-            eta = round(dest_dist / speed / 60, 1)
-        elif eta is None:
-            walking_speed_mps = 4.5 / 3.6
-            eta = round(dest_dist / walking_speed_mps / 60, 1)
+        remaining_m = _remaining_route_distance_m(lat, lng, gs.route_points)
+        if remaining_m is None:
+            remaining_m = dest_dist
+
+        # A stationary/very-slow sample should increase ETA rather than freeze it
+        # forever. Use a conservative floor (~2.9 km/h) only for ETA arithmetic;
+        # the reported speed itself remains truthful and can be 0.
+        eta_speed_mps = max(0.8, speed)
+        raw_eta = remaining_m / eta_speed_mps / 60.0
+        eta = _smooth_eta_minutes(gs.eta_minutes, raw_eta)
 
         if dest_dist < 200:
             alert = await _create_alert(session, session_id, "arrived", "low",
@@ -719,6 +860,7 @@ async def update_location(
         "session_id": session_id, "location": {"lat": lat, "lng": lng},
         "zone": {"risk_level": new_risk, "risk_score": zone["risk_score"], "zone_name": zone["zone_name"]},
         "speed_mps": round(speed, 2), "eta_minutes": eta,
+        "remaining_route_m": round(_remaining_route_distance_m(lat, lng, gs.route_points) or dest_dist, 1) if gs.destination else None,
         "is_idle": gs.is_idle, "escalation_level": gs.escalation_level,
         "alerts": [_alert_to_dict(a) for a in alerts_generated],
         "alert_count": len(alerts_generated),

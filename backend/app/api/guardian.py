@@ -19,6 +19,7 @@ class LocationInput(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
     lng: float = Field(..., ge=-180, le=180)
     accuracy: Optional[float] = None
+    speed_mps: Optional[float] = Field(None, ge=0, le=100)
     name: Optional[str] = Field(None, max_length=240)
 
 
@@ -41,6 +42,16 @@ class UpdateLocationRequest(BaseModel):
     session_id: str
     location: LocationInput
     timestamp: Optional[str] = None
+
+
+class RoutePointInput(BaseModel):
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+
+
+class RouteContextRequest(BaseModel):
+    session_id: str
+    points: list[RoutePointInput] = Field(..., min_length=2, max_length=2000)
 
 
 async def _load_journey_for_auth(
@@ -269,8 +280,15 @@ async def update_location(
             ts = datetime.fromisoformat(req.timestamp.replace("Z", "+00:00"))
         except ValueError:
             pass
-    result = await update_l(session, req.session_id, req.location.lat, req.location.lng, ts,
-                              accuracy=req.location.accuracy)
+    result = await update_l(
+        session,
+        req.session_id,
+        req.location.lat,
+        req.location.lng,
+        ts,
+        accuracy=req.location.accuracy,
+        observed_speed_mps=req.location.speed_mps,
+    )
 
     # NISCH-002B: piggyback the user's `last_known_*` so co-location
     # suppression has fresh data. Best-effort — never blocks the ping.
@@ -329,6 +347,22 @@ async def update_location(
             "source":      shadow_source,
             "next_action": next_action,
         }
+    return result
+
+
+@router.post("/route-context")
+async def set_route_context(
+    req: RouteContextRequest,
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    await _require_journey_owner(session, req.session_id, user)
+    from app.services.guardian_mode_engine import set_route_context as set_route
+
+    points = [{"lat": point.lat, "lng": point.lng} for point in req.points]
+    result = await set_route(session, req.session_id, points)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
     return result
 
 
