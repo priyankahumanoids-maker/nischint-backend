@@ -25,32 +25,83 @@ DPO_NAME = "Nischint Data Protection Officer"
 DPO_EMAIL = "privacy@nischint.care"
 DPO_RESPONSE_SLA_DAYS = 30
 
-# ── Settings Phase 3A2: remote legal content ─────────────────────────
-# Final legal text is intentionally NOT stored in the mobile binary.
-# Empty server-side values remain pending until client/legal approval.
+# ── Client legal/content pack received 2026-09-23 ───────────────────
+# These are server-side defaults so the mobile app can display the
+# client-provided text without duplicating it in the app binary.
+# Environment variables still override these defaults after counsel
+# approves/publishes a newer version.
 
-def _legal_item(prefix: str) -> dict:
-    url = (os.getenv(f"{prefix}_URL") or "").strip() or None
-    content = (os.getenv(f"{prefix}_CONTENT") or "").strip() or None
-    version = (os.getenv(f"{prefix}_VERSION") or "").strip() or None
-    updated_at = (os.getenv(f"{prefix}_UPDATED_AT") or "").strip() or None
+CLIENT_LEGAL_VERSION = "2026-09-23"
+CLIENT_LEGAL_UPDATED_AT = "2026-09-23"
+CLIENT_SUPPORT_EMAIL = "support@nischint.care"
+
+CLIENT_PRIVACY_POLICY = '1. Privacy Policy — NISCHINT\n\nEffective date: [TO BE SET ON PUBLISH]\n\nThis Privacy Policy explains how Skybyte Venture Private Limited ("Skybyte", "we", "us", "our"), the company behind NISCHINT ("the App", "the Service", available at nischint.care and through the NISCHINT mobile application), collects, uses, stores, shares, and protects personal data, in compliance with the Digital Personal Data Protection Act, 2023 ("DPDP Act") and applicable Indian law.\n\n1.1 Who we are\n\nSkybyte Venture Private Limited, CIN U66190MH2025PTC456397, registered office: [REGISTERED OFFICE ADDRESS — Feroz to confirm before publish]. Contact: connect@skybyteventures.com · +91 74001 79273.\n\n1.2 What NISCHINT does, in plain terms\n\nNISCHINT is an AI-powered urban safety platform for women, children, and senior citizens. It uses location, movement, and (where enabled) voice/audio signals to detect possible distress and route alerts to the user\'s chosen emergency contacts and, where applicable, escalation channels. NISCHINT is a risk-signal and alerting layer — it is not a guaranteed-prevention or emergency-response service, and does not replace police, ambulance, or other emergency services (see Terms & Conditions, Section 2.1, for the full disclaimer).\n\n1.3 Personal data we collect\n\n(a) Data you give us directly\n\n• Account information: name, phone number, email address, password (hashed, never stored in plain text)\n\n• Profile information: age band, relationship role (self / guardian / family member), emergency contact names and numbers\n\n• For a guardian setting up a profile for a child or senior dependant: the dependant\'s name, age, and relationship — collected from and consented to by the guardian, not the dependant, until the dependant is old enough to hold their own account\n\n(b) Data collected automatically through the App\n\n• Location data (GPS/network-based), continuously or on-demand depending on the safety feature enabled by the user\n\n• Movement and behavioral signal data used by NISCHINT\'s detection engine (e.g. sudden stops, deviation from usual routes, geofence exits) — processed to generate a risk signal, never sold or used for advertising\n\n• Voice/audio data, only when the user has explicitly enabled voice-distress detection — processed for distress-pattern detection and not stored as raw audio beyond the window needed to generate that signal, unless an alert is triggered (in which case a short clip may be retained as part of the incident record for the user\'s and responders\' review)\n\n• Device information: device model, OS version, app version, push-notification token, IP address\n\n• Usage data: feature usage, crash logs, session duration — used to improve the App, not to profile individual behavior for any purpose outside safety detection\n\n(c) Data we do not collect\n\n• We do not access your contacts, photos, or messages beyond the emergency contact numbers you explicitly add\n\n• We do not use location or behavioral data for advertising or sell it to any third party, under any circumstance\n\n1.4 Why we process this data (purpose limitation)\n\nEvery category of data above is collected for one or more of these purposes only, consistent with the DPDP Act\'s purpose-limitation principle:\n\n• Providing the core safety service — detecting possible distress and alerting the right people fast\n\n• Account creation, authentication, and customer support\n\n• Legal and safety compliance — retaining an incident record where an alert was actually triggered, for the user\'s own protection and for any subsequent police or family follow-up\n\n• Improving detection accuracy and app reliability (in de-identified/aggregated form wherever possible)\n\n1.5 Consent\n\nLocation, voice/audio, and behavioral-signal processing are enabled through explicit, purpose-specific consent at onboarding and remain toggleable in Settings at any time — see Section 5 of this pack for the exact consent screen copy. Withdrawing consent for a specific signal (e.g. voice detection) turns off that specific feature; it does not delete your account or other data.\n\n1.6 Children\'s data\n\nWhere NISCHINT is used to help protect a child, the child\'s profile is created and consented to by a parent or legal guardian, not by the child. We do not knowingly collect data directly from a child without verifiable parental/guardian consent, we do not use a child\'s data for behavioral advertising or tracking outside the safety purpose stated above, and a guardian may request deletion of a child\'s profile data at any time through the channel in Section 1.9.\n\n1.7 Who we share data with\n\nWe share data only with the service providers who help us run NISCHINT ("data processors"), each bound by contract to use the data solely to provide their service to us, and with emergency contacts/responders you have explicitly designated. Current processors include: cloud hosting and database infrastructure, authentication (AWS Cognito), SMS/voice/WhatsApp alerting (Twilio), transactional email (SendGrid), push notifications (Firebase Cloud Messaging), and content-delivery/security (Cloudflare). Some of these process data on servers located outside India; where that happens, transfer follows the DPDP Act\'s cross-border transfer provisions.\n\nWe do not share personal data with any third party for their own marketing purposes. We may disclose data where legally required — e.g. in response to a lawful request from Indian law enforcement, or where necessary to protect the safety of a user in an active distress event.\n\n1.8 Data retention\n\nAccount and profile data is retained for as long as the account is active. Location and behavioral-signal data used for real-time detection is retained only as long as needed to generate that signal, except where an alert was triggered, in which case the relevant incident record is retained for [RETENTION PERIOD TO BE CONFIRMED — recommend 12 months, aligned with typical safety-incident recordkeeping] to support any follow-up. Data is deleted or anonymized on account closure, subject to any legal retention obligation.\n\n1.9 Your rights under the DPDP Act\n\nAs a Data Principal, you have the right to: access a summary of the personal data we hold about you; correct or update inaccurate data; withdraw consent for any specific processing purpose; request erasure of your data (subject to legal retention requirements); and nominate another individual to exercise these rights on your behalf in case of death or incapacity. To exercise any of these rights, or to raise a grievance, contact our Grievance Officer at [GRIEVANCE OFFICER NAME & EMAIL — to be designated; connect@skybyteventures.com in the interim]. We will respond within the timeline prescribed under the DPDP Act.\n\n1.10 Security\n\nWe use industry-standard technical and organizational measures — encryption in transit and at rest, access controls, and the practices described in our internal Access Control Policy and Incident Response Plan — to protect your data. No system is 100% secure, and we will notify affected users and the relevant authority as required by law in the event of a significant data breach.\n\n1.11 Changes to this policy\n\nWe may update this Privacy Policy from time to time. Material changes will be notified in-app or by email before they take effect.\n\n1.12 Contact us\n\nQuestions about this policy: connect@skybyteventures.com · +91 74001 79273.'
+
+CLIENT_TERMS = '2. Terms & Conditions — NISCHINT\n\nEffective date: [TO BE SET ON PUBLISH]\n\nThese Terms & Conditions ("Terms") govern your use of NISCHINT, operated by Skybyte Venture Private Limited ("Skybyte", "we"). By creating an account or using the App, you agree to these Terms.\n\n2.1 What NISCHINT is — and is not\n\nThis is the single most important clause in this document. It must not be softened, buried, or removed under any circumstance.\n\nNISCHINT is a risk-detection and alerting service. It analyzes location, movement, and (where enabled) audio signals to identify a possible distress situation and to notify the emergency contacts and channels the user has configured, as fast as reasonably possible.\n\nNISCHINT is NOT: a guaranteed-prevention service; a substitute for calling police (100/112), an ambulance (108), or any other official emergency service; a monitored, staffed emergency-response center; or a guarantee that every distress event will be detected, or that every alert will reach its recipient in time. Detection can fail — due to network conditions, device settings, sensor limitations, or the nature of AI-based detection generally. Users must always treat calling official emergency services directly as their primary safety action in any genuine emergency.\n\n2.2 Eligibility and accounts\n\n• You must be at least 18 years old to create your own account. A profile for a minor or a senior dependant may only be created and managed by a parent, legal guardian, or authorized family member on their behalf.\n\n• You are responsible for keeping your login credentials confidential and for all activity under your account.\n\n• You must provide accurate emergency contact information and keep it up to date — alerts are only useful if they reach the right person.\n\n2.3 Subscription, fees, and refunds\n\nNISCHINT may offer both free and paid subscription tiers.\n\n[PRICING/TIER DETAILS TO BE INSERTED BY FEROZ — the clauses below are drafted to hold regardless of final pricing]\n\n• Paid subscriptions renew automatically for the same term unless cancelled before the renewal date, through the App or the relevant app-store subscription settings.\n\n• Refund Policy: a new paid subscriber may request a full refund within 7 days of first purchase if the Service has not been substantially used (i.e. no safety alert was generated in that window). Beyond 7 days, or for renewal charges, fees are non-refundable except where required by law or by Google Play / Apple App Store policy, whichever store processed the payment.\n\n• We reserve the right to change subscription pricing with at least 30 days\' notice before it applies to existing subscribers.\n\n2.4 Acceptable use\n\n• You agree not to: use the App to harass, stalk, or monitor another person without their knowledge or consent (except a guardian\'s consented monitoring of a minor or a dependant senior, as configured in the App); attempt to reverse-engineer, disrupt, or gain unauthorized access to the App or its infrastructure; or use the App for any unlawful purpose.\n\n2.5 Intellectual property\n\nNISCHINT, the NISCHINT name and logo, and the underlying detection technology (including the Hermes engine and its components) are the intellectual property of Skybyte Venture Private Limited and/or its licensors. Nothing in these Terms grants you any ownership right in the App or its technology.\n\n2.6 Limitation of liability\n\nTo the maximum extent permitted by law, Skybyte\'s total liability arising from your use of the App — including any missed, delayed, or failed detection or alert — is limited to the subscription fees you paid in the 12 months preceding the claim. Skybyte is not liable for indirect, incidental, or consequential damages, including any harm arising from reliance on the App in place of directly contacting emergency services.\n\n2.7 Termination\n\nYou may delete your account at any time from within the App. We may suspend or terminate an account for violation of these Terms, fraudulent activity, or misuse that endangers other users.\n\n2.8 Governing law\n\nThese Terms are governed by the laws of India. Courts in Mumbai, Maharashtra have exclusive jurisdiction over any dispute arising from these Terms.\n\n2.9 Contact us\n\nQuestions about these Terms: connect@skybyteventures.com · +91 74001 79273.'
+
+CLIENT_DPDP_CONSENT = '5. DPDP Consent — onboarding copy & architecture notes\n\n5.1 Principle\n\nConsent must be granular and purpose-specific, not one blanket "I agree" checkbox — this is both a DPDP Act requirement and the same pattern already built and shipped for the Foundation\'s volunteer system (separate consentShowActivity / consentToFeature fields). Each toggle below should be its own field in the user record, individually revocable in Settings, and logged with a timestamp whenever it changes (mirroring the consent-audit-trail pattern already proven in the Foundation build).\n\n5.2 Onboarding consent screen — exact copy\n\nScreen title: "Before we protect you, a few permissions"\n\nIntro line: "NISCHINT only uses what you allow it to. You can change any of these anytime in Settings."\n\n• Toggle 1 — Location: "Allow NISCHINT to use your location to detect unusual movement and to share your location with your emergency contacts during an alert." (Required to use core safety features; declining limits the App to manual SOS only.)\n\n• Toggle 2 — Voice distress detection: "Allow NISCHINT to listen for distress sounds (like a scream) to trigger an automatic alert. Off by default. Audio is analyzed for distress patterns only and is not stored unless an alert is triggered."\n\n• Toggle 3 — Emergency contact sharing: "Allow NISCHINT to share your name, location, and alert details with the emergency contacts you\'ve added, when an alert is triggered." (Required — this is how alerts reach anyone.)\n\n• Toggle 4 — Notifications: "Allow NISCHINT to send you push notifications for safety check-ins, alerts, and account updates."\n\n• Toggle 5 (guardian flow only) — Dependant profile consent: "I confirm I am the parent or legal guardian of [dependant name] and I consent to NISCHINT collecting and processing their location and safety-signal data as described in the Privacy Policy, on their behalf." (Required checkbox, not a toggle — must be affirmatively checked, cannot default to on.)\n\n• Footer link, always visible: "Read our full Privacy Policy" and "Read our Terms & Conditions" — both must be tappable, not just mentioned in text.\n\n5.3 Settings — consent management\n\n• Every toggle above must reappear in Settings > Privacy & Permissions, individually switchable, with the same wording used at onboarding (consistency matters — don\'t let the Settings copy drift from the onboarding copy over time). Withdrawing Toggle 1 or 3 should show a one-line warning that it will limit core safety functionality, without blocking the withdrawal — DPDP consent must be as easy to withdraw as it was to give.\n\n5.4 What to log\n\n• Every consent grant and withdrawal, with a timestamp and the specific toggle affected — this is the DPDP-dispute record, same purpose as the Foundation\'s consent-history export (P6-12).\n\n• The guardian consent checkbox (Toggle 5) specifically, since it\'s the record that proves lawful basis for processing a minor\'s or dependant\'s data.\n\nCross-reference: this mirrors, and should stay consistent with, the consent architecture already shipped for the Nischint Sewa Foundation\'s volunteer system — same discipline (granular fields, audit trail, revocable, logged), applied here to the consumer app\'s higher-stakes data (location + voice + a minor\'s data, vs. volunteer activity).'
+
+# ── Settings Phase 3A2: remote legal content ─────────────────────────
+# Environment values remain authoritative after counsel publishes a
+# newer version. Until then, the client-provided 2026-09-23 pack is
+# served as the default source for in-app legal/content surfaces.
+
+def _legal_item(
+    prefix: str,
+    *,
+    default_content: str,
+    default_url: str | None,
+    default_status: str,
+) -> dict:
+    env_url = (os.getenv(f"{prefix}_URL") or "").strip() or None
+    env_content = (os.getenv(f"{prefix}_CONTENT") or "").strip() or None
+    env_version = (os.getenv(f"{prefix}_VERSION") or "").strip() or None
+    env_updated_at = (os.getenv(f"{prefix}_UPDATED_AT") or "").strip() or None
+
+    content = env_content or default_content
+    url = env_url or default_url
+    has_env_override = bool(env_url or env_content or env_version or env_updated_at)
+
     return {
-        "status": "published" if (url or content) else "pending",
+        "status": "published" if has_env_override else default_status,
         "url": url,
         "content": content,
-        "version": version,
-        "updated_at": updated_at,
+        "version": env_version or CLIENT_LEGAL_VERSION,
+        "updated_at": env_updated_at or CLIENT_LEGAL_UPDATED_AT,
     }
 
 
 @router.get("/public/legal-content", response_class=JSONResponse)
 async def public_legal_content():
-    """Return approved remote legal content, or pending when unpublished."""
+    """Return the current client-provided legal/content pack.
+
+    Privacy Policy and Terms remain a working draft until counsel publishes
+    a final override. DPDP consent copy and support routing are
+    implementation-ready per the client's 2026-09-23 content pack.
+    """
     return {
         "schema_version": "1",
-        "privacy_policy": _legal_item("NISCHINT_PRIVACY_POLICY"),
-        "terms": _legal_item("NISCHINT_TERMS"),
-        "dpdp_consent": _legal_item("NISCHINT_DPDP_CONSENT"),
+        "privacy_policy": _legal_item(
+            "NISCHINT_PRIVACY_POLICY",
+            default_content=CLIENT_PRIVACY_POLICY,
+            default_url="https://nischint.care/privacy",
+            default_status="draft",
+        ),
+        "terms": _legal_item(
+            "NISCHINT_TERMS",
+            default_content=CLIENT_TERMS,
+            default_url="https://nischint.care/terms",
+            default_status="draft",
+        ),
+        "dpdp_consent": _legal_item(
+            "NISCHINT_DPDP_CONSENT",
+            default_content=CLIENT_DPDP_CONSENT,
+            default_url=None,
+            default_status="published",
+        ),
+        "support": {
+            "email": (os.getenv("NISCHINT_SUPPORT_EMAIL") or CLIENT_SUPPORT_EMAIL).strip(),
+        },
     }
 
 
