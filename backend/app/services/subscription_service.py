@@ -489,28 +489,35 @@ async def reserve_slot_for_invite(
 
     subscription_id = None
     if purpose == "protected_member":
-        row = (
-            await session.execute(
-                text(
-                    """
-                    SELECT id
-                    FROM member_subscriptions
-                    WHERE guardian_user_id = :guardian_id
-                      AND protected_member_user_id IS NULL
-                      AND status = 'active'
-                      AND (expires_at IS NULL OR expires_at > NOW())
-                    ORDER BY created_at ASC
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT 1
-                    """
-                ),
-                {"guardian_id": actor.id},
-            )
-        ).first()
+        async def _find_free_slot():
+            return (
+                await session.execute(
+                    text(
+                        """
+                        SELECT id
+                        FROM member_subscriptions
+                        WHERE guardian_user_id = :guardian_id
+                          AND protected_member_user_id IS NULL
+                          AND status = 'active'
+                          AND (expires_at IS NULL OR expires_at > NOW())
+                        ORDER BY created_at ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                        """
+                    ),
+                    {"guardian_id": actor.id},
+                )
+            ).first()
+
+        # QR/invite generation is entitlement-only: this path must never
+        # manufacture, migrate, or activate a subscription. The guardian must
+        # already own an unused ACTIVE slot before a protected-member invite
+        # can be exposed.
+        row = await _find_free_slot()
         if not row:
             raise HTTPException(
                 status_code=402,
-                detail="NEW_SUBSCRIPTION_REQUIRED: Purchase/activate a Standard or Premium subscription before inviting another protected member.",
+                detail="NEW_SUBSCRIPTION_REQUIRED: Purchase a Standard or Premium subscription before inviting another protected member.",
             )
         subscription_id = row.id
 

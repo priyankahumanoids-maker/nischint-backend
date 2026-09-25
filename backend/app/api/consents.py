@@ -334,6 +334,7 @@ async def grant_consent(
         row.user_agent = ua
 
     await session.flush()
+    await session.commit()
     logger.info(
         "[consent] GRANT user_id=%s category=%s text_version=%s",
         user.id, body.category, body.consent_text_version,
@@ -386,6 +387,8 @@ async def revoke_consent(
     if row.revoked_at is None:
         row.revoked_at = datetime.now(timezone.utc)
         await session.flush()
+    await session.commit()
+    if row.revoked_at is not None:
         logger.info(
             "[consent] REVOKE user_id=%s category=%s",
             user.id, category,

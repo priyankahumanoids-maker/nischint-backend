@@ -2061,9 +2061,11 @@ async def generate_invite_code(
         raise HTTPException(status_code=403, detail="Only the Primary Parent can generate family invite codes")
 
     purpose = (req.purpose if req else "protected_member").strip().lower()
-    await subscription_service.ensure_existing_members_premium(session, user.id)
 
     # FAST PATH: return the still-active invite instead of regenerating it.
+    # Legacy subscription reconciliation is intentionally deferred until a new
+    # protected-member slot is actually needed so opening/generating an already
+    # valid QR never waits on unrelated member migration work.
     existing = (
         await session.execute(
             text("SELECT invite_code, invite_code_expires_at FROM users WHERE id = :uid"),
