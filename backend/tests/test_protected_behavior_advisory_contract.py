@@ -38,7 +38,7 @@ def test_summary_is_authenticated_and_family_authorized() -> None:
 
 
 def test_service_is_protected_user_based_and_isolated() -> None:
-    for role in ("child", "women", "senior", "familymember"):
+    for role in ("child", "women", "senior", "familymember", "family"):
         require(f'"{role}"' in SERVICE, f"protected role missing: {role}")
     require("REFERENCES users(id) ON DELETE CASCADE" in SERVICE, "behavioral data must be user-owned and cascade on erasure")
     require("protected_behavior_observations" in SERVICE, "isolated observations table missing")

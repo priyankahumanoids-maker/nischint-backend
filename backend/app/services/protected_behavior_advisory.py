@@ -44,6 +44,7 @@ PROTECTED_ROLES = {
     "ward",
     "protectedmember",
     "familymember",
+    "family",
 }
 
 OBSERVATION_BUCKET_MINUTES = 5
