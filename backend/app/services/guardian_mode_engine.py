@@ -468,9 +468,54 @@ async def update_location(
     # ║ no SSE event.                                                ║
     # ║ See /app/memory/SYSTEM_INVARIANTS.md.                        ║
     # ╚══════════════════════════════════════════════════════════════╝
-    if (timestamp is not None
-            and gs.previous_update_at is not None
-            and timestamp <= gs.previous_update_at):
+    # Journey ordering must not use GuardianSession.previous_update_at as the
+    # duplicate/stale-packet marker. Passive geofence ingestion is allowed to
+    # advance previous_update_at for liveness before this endpoint receives the
+    # same native GPS fix, which previously made the journey packet reject its
+    # own timestamp and skipped ETA / JourneyPoint processing.
+    #
+    # Keep a durable journey-specific client timestamp inside current_location.
+    # Existing sessions are backfilled once from their latest JourneyPoint. This
+    # preserves strict duplicate/out-of-order rejection without coupling it to
+    # passive liveness updates and requires no schema migration.
+    last_journey_recorded_at = None
+    current_location_snapshot = (
+        dict(gs.current_location)
+        if isinstance(gs.current_location, dict)
+        else {}
+    )
+    raw_journey_recorded_at = current_location_snapshot.get("_journey_recorded_at")
+    if raw_journey_recorded_at:
+        try:
+            last_journey_recorded_at = datetime.fromisoformat(
+                str(raw_journey_recorded_at).replace("Z", "+00:00")
+            )
+            if last_journey_recorded_at.tzinfo is None:
+                last_journey_recorded_at = last_journey_recorded_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            last_journey_recorded_at = None
+
+    if last_journey_recorded_at is None and (gs.total_points or 0) > 0:
+        last_point_result = await session.execute(
+            select(JourneyPoint.gps_recorded_at)
+            .where(
+                JourneyPoint.session_id == gs.id,
+                JourneyPoint.gps_recorded_at.is_not(None),
+            )
+            .order_by(JourneyPoint.seq.desc())
+            .limit(1)
+        )
+        last_journey_recorded_at = last_point_result.scalar_one_or_none()
+        if last_journey_recorded_at is not None and last_journey_recorded_at.tzinfo is None:
+            last_journey_recorded_at = last_journey_recorded_at.replace(tzinfo=timezone.utc)
+
+    normalized_timestamp = timestamp
+    if normalized_timestamp is not None and normalized_timestamp.tzinfo is None:
+        normalized_timestamp = normalized_timestamp.replace(tzinfo=timezone.utc)
+
+    if (normalized_timestamp is not None
+            and last_journey_recorded_at is not None
+            and normalized_timestamp <= last_journey_recorded_at):
         return {"stale": True}
 
     # ── 24-hour zombie-session hard cap ───────────────────────────────
@@ -746,8 +791,16 @@ async def update_location(
                 )
                 alerts_generated.append(alert)
 
-    # Update DB
-    gs.current_location = {"lat": lat, "lng": lng}
+    # Update DB. Preserve passive telemetry fields (battery/accuracy/etc.) and
+    # record a journey-owned packet marker separately from previous_update_at.
+    next_current_location = (
+        dict(gs.current_location)
+        if isinstance(gs.current_location, dict)
+        else {}
+    )
+    next_current_location.update({"lat": lat, "lng": lng})
+    next_current_location["_journey_recorded_at"] = (timestamp or now).isoformat()
+    gs.current_location = next_current_location
     gs.previous_update_at = now
     gs.risk_level = new_risk
     gs.risk_score = zone["risk_score"]
@@ -786,6 +839,8 @@ async def update_location(
             location_event = {
                 "lat": lat,
                 "lng": lng,
+                "session_id": str(gs.id),
+                "eta_minutes": eta,
                 "child_id": str(gs.user_id),
                 "child_name": child_name or "Unknown",
                 "child_role": child_role or "child",
