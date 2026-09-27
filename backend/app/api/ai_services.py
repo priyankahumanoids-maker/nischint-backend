@@ -360,3 +360,34 @@ async def get_family_ai_summary(
         "members": members,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+# ── 9. Protected-member Behavioral Advisory V1 ──
+
+@router.get("/protected-behavior-summary")
+async def get_protected_behavior_summary_api(
+    user_id: str = Query(..., description="Protected-member user UUID"),
+    session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """
+    Return the advisory-only behavioral learning state for one protected member.
+
+    This route is user-ID based (not legacy Senior/Device based) and reuses the
+    existing Guardian/Co-Guardian safety-read authorization contract. It never
+    exposes raw behavioral location history.
+    """
+    try:
+        UUID(user_id)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=422, detail="Invalid protected-member user ID")
+
+    from app.api.geofence import _can_view_safety
+
+    if not await _can_view_safety(session, user, user_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this protected member")
+
+    from app.services.protected_behavior_advisory import (
+        get_protected_behavior_summary,
+    )
+
+    return await get_protected_behavior_summary(session, user_id)

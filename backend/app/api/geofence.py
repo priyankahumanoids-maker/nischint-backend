@@ -458,6 +458,32 @@ async def location_update(
     # any supplementary pipeline failure can never roll back tracking.
     await session.commit()
 
+    # Protected Behavioral Advisory V1 is deliberately post-response and
+    # best-effort. It observes the already-authenticated protected-phone fix
+    # without becoming an owner of GPS, location persistence, geofence state,
+    # Safe Walk, SOS, or emergency escalation. Import/scheduling failure is
+    # contained so existing location behavior remains authoritative.
+    try:
+        from app.services.protected_behavior_advisory import (
+            record_protected_behavior_observation,
+        )
+
+        background_tasks.add_task(
+            record_protected_behavior_observation,
+            target_id,
+            req.lat,
+            req.lng,
+            speed_mps=req.speed_mps,
+            accuracy_m=req.accuracy_m,
+            captured_at=telemetry.get("updated_at"),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[PROTECTED_BEHAVIOR] background learner scheduling skipped user=%s: %s",
+            target_id,
+            exc,
+        )
+
     from app.services.location_availability import record_location_availability
     try:
         await record_location_availability(
