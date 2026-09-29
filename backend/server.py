@@ -488,6 +488,20 @@ async def startup_db():
             )
             raise
 
+    # FC-03: canonical plan/seat/trial authority. This must follow FC-02
+    # because it extends only those new Family Circle tables.
+    if pool:
+        try:
+            from app.migrations.fc03_circle_plan_seat_trial import (
+                ensure_circle_plan_seat_trial_schema,
+            )
+            await ensure_circle_plan_seat_trial_schema()
+        except Exception as _e:
+            logger.error(
+                f"[FC-03] required startup DDL failed; refusing startup: {_e}"
+            )
+            raise
+
     if pool:
         try:
             from app.db.session import async_session
