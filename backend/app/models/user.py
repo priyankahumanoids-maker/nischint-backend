@@ -1,6 +1,6 @@
 # User Model
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from sqlalchemy import String, DateTime, Float, JSON, Text
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import UUID
@@ -51,6 +51,13 @@ class User(Base):
     )
     full_name: Mapped[str | None] = mapped_column(
         String(120),
+        nullable=True,
+    )
+    # Family Circle v1.0: persisted identity fact used to derive age.
+    # Existing accounts remain nullable and are handled as legacy/incomplete
+    # profiles until the later migration/onboarding phase collects DOB.
+    date_of_birth: Mapped[date | None] = mapped_column(
+        sa.Date(),
         nullable=True,
     )
     # User-managed profile photo. The mobile client sends a compressed,

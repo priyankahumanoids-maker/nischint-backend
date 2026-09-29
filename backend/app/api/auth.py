@@ -6,7 +6,7 @@ import logging
 import random
 import secrets
 import uuid
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
 from app.core.cognito import is_cognito_enabled
+from app.core.age_policy import ADULT_AGE_YEARS, calculate_age, is_minor
 from app.core.config import settings
 from app.core.rate_limiter import limiter
 from app.core.product_roles import normalize_roles, select_primary_role
@@ -443,6 +444,7 @@ class VerifyInviteRequest(BaseModel):
     password: str = Field(min_length=8)
     full_name: str = Field(min_length=1, max_length=100)
     phone: str = Field(min_length=10, max_length=20)
+    date_of_birth: date
     role: str = Field("child", pattern="^(child|woman|senior|family|co_parent)$")
 
 
@@ -562,6 +564,7 @@ async def _issue_local_session_response(
         "email": user.email,
         "full_name": user.full_name,
         "phone": user.phone,
+        "date_of_birth": user.date_of_birth.isoformat() if user.date_of_birth else None,
         "sid": sid,
         "auth_provider": provider,
     }
@@ -763,6 +766,30 @@ async def _phone_exists(
 
     result = await session.execute(query.limit(1))
     return result.scalar_one_or_none() is not None
+
+
+def _require_adult_self_registration(date_of_birth: date) -> int:
+    """Fail closed for the normal creator/joiner registration path.
+
+    Family Circle v1.0 requires under-18 people to be added by a parent or
+    lawful guardian through the dedicated minor flow. That flow is introduced
+    in a later controlled phase; this normal self-registration path must never
+    create a minor account directly.
+    """
+    try:
+        age = calculate_age(date_of_birth)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    if age < ADULT_AGE_YEARS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Ask a parent to add you to their circle.",
+        )
+    return age
 
 
 def _signup_phone_otp_identity(normalized_phone: str) -> str:
@@ -969,6 +996,7 @@ async def register(
             status_code=status.HTTP_409_CONFLICT,
             detail="This mobile number is already registered. Please sign in instead.",
         )
+    _require_adult_self_registration(req.date_of_birth)
     await _consume_signup_phone_verification(session, request, normalized_phone)
 
     if is_cognito_enabled():
@@ -998,11 +1026,16 @@ async def get_me(
 ):
     """Get current user info including roles."""
     roles = [user.role] if user.role else []
+    date_of_birth = user.date_of_birth
+    age = calculate_age(date_of_birth) if date_of_birth is not None else None
     return {
         "id": str(user.id),
         "email": user.email,
         "full_name": user.full_name,
         "phone": user.phone,
+        "date_of_birth": date_of_birth.isoformat() if date_of_birth else None,
+        "age": age,
+        "is_minor": is_minor(date_of_birth) if date_of_birth is not None else None,
         "role": user.role,
         "roles": roles,
         "facility_id": user.facility_id,
@@ -1468,6 +1501,7 @@ async def refresh(
             "email": user.email,
             "full_name": user.full_name,
             "phone": user.phone,
+            "date_of_birth": user.date_of_birth.isoformat() if user.date_of_birth else None,
             "sid": sid,
             "auth_provider": session_provider,
         }
@@ -1569,6 +1603,7 @@ async def refresh(
         "email": user.email,
         "full_name": user.full_name,
         "phone": user.phone,
+        "date_of_birth": user.date_of_birth.isoformat() if user.date_of_birth else None,
         "sid": sid,
     })
     await session.commit()
@@ -2292,6 +2327,10 @@ async def verify_invite_code(
     elif str(reservation.get("purpose") or "") != "protected_member":
         raise HTTPException(status_code=403, detail="This invite is for a co-parent")
 
+    # Normal invite/self-registration cannot create a minor. The dedicated
+    # parent-created minor flow will provide parental consent in Phase 3/4.
+    _require_adult_self_registration(req.date_of_birth)
+
     # 3. Prevent duplicate email / phone and never create a family member
     # with a missing phone number.
     existing = await user_service.get_user_by_email(session, req.email)
@@ -2320,6 +2359,7 @@ async def verify_invite_code(
         role=req.role,
         full_name=req.full_name,
         phone=normalized_phone,
+        date_of_birth=req.date_of_birth,
         guardian_id=guardian.id,
     )
     session.add(new_user)
@@ -2453,6 +2493,7 @@ async def _local_register(
         role="guardian",
         phone=normalized_phone,
         full_name=req.full_name,
+        date_of_birth=req.date_of_birth,
     )
     session.add(user)
     await session.commit()
@@ -2560,6 +2601,16 @@ async def _cognito_register(
             detail="This mobile number is already registered. Please sign in instead.",
         )
 
+    if (
+        existing
+        and existing.date_of_birth is not None
+        and existing.date_of_birth != req.date_of_birth
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The date of birth does not match the existing account.",
+        )
+
     try:
         result = sign_up(
             email=req.email,
@@ -2596,6 +2647,8 @@ async def _cognito_register(
         if req.full_name and not existing.full_name:
             existing.full_name = req.full_name
         existing.phone = normalized_phone
+        if existing.date_of_birth is None:
+            existing.date_of_birth = req.date_of_birth
         user = existing
     else:
         user = User(
@@ -2605,6 +2658,7 @@ async def _cognito_register(
             role="guardian",
             phone=normalized_phone,
             full_name=req.full_name,
+            date_of_birth=req.date_of_birth,
         )
         session.add(user)
 
@@ -2624,6 +2678,7 @@ async def _cognito_register(
         "email": user.email,
         "full_name": user.full_name,
         "phone": user.phone,
+        "date_of_birth": user.date_of_birth.isoformat() if user.date_of_birth else None,
         "sid": sid,
     })
     await session.commit()
@@ -2747,6 +2802,7 @@ async def _cognito_login(
         "email": user.email,
         "full_name": user.full_name,
         "phone": user.phone,
+        "date_of_birth": user.date_of_birth.isoformat() if user.date_of_birth else None,
         "cognito:groups": sorted(normalize_roles(cognito_groups)),
         "sid": sid,
     })

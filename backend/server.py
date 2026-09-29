@@ -460,6 +460,20 @@ async def startup_db():
     else:
         logger.warning("PostgreSQL unavailable — DB-dependent features degraded")
 
+    # FC-01: Phase 1A requires users.date_of_birth before any User ORM query.
+    # Keep this ahead of USER_SEED because User now maps the DOB column.
+    if pool:
+        try:
+            from app.migrations.fc01_user_date_of_birth import (
+                ensure_user_date_of_birth_column,
+            )
+            await ensure_user_date_of_birth_column()
+        except Exception as _e:
+            logger.error(
+                f"[FC-01] required startup DDL failed; refusing startup: {_e}"
+            )
+            raise
+
     if pool:
         try:
             from app.db.session import async_session
