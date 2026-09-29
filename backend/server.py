@@ -474,6 +474,20 @@ async def startup_db():
             )
             raise
 
+    # FC-02: additive Family Circle + membership authority. Run before any
+    # future Circle query; legacy guardian/relationship tables are untouched.
+    if pool:
+        try:
+            from app.migrations.fc02_family_circle_authority import (
+                ensure_family_circle_authority_tables,
+            )
+            await ensure_family_circle_authority_tables()
+        except Exception as _e:
+            logger.error(
+                f"[FC-02] required startup DDL failed; refusing startup: {_e}"
+            )
+            raise
+
     if pool:
         try:
             from app.db.session import async_session

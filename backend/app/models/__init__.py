@@ -26,5 +26,6 @@ from app.models.reroute_suggestion import RerouteSuggestion
 from app.models.voice_command import VoiceCommandConfig, VoiceTriggerLog
 from app.models.facility import Facility
 from app.models.guardian_ai_v2 import GuardianBaseline, GuardianRiskScore, GuardianPrediction, GuardianRiskEvent
+from app.models.family_circle import FamilyCircle, CircleMembership
 
-__all__ = ["User", "Senior", "Device", "Telemetry", "Incident", "Notification", "NotificationJob", "DeviceHealthRuleAuditLog", "DeviceBaseline", "DeviceAnomaly", "BehaviorBaseline", "BehaviorAnomaly", "Guardian", "GuardianSession", "GuardianAlert", "EmergencyEvent", "FallEvent", "SafeZone", "MonitoredRoute", "WanderingEvent", "PickupAuthorization", "PickupEvent", "VoiceDistressEvent", "SafetyEvent", "RerouteSuggestion", "VoiceCommandConfig", "VoiceTriggerLog", "Facility"]
+__all__ = ["User", "Senior", "Device", "Telemetry", "Incident", "Notification", "NotificationJob", "DeviceHealthRuleAuditLog", "DeviceBaseline", "DeviceAnomaly", "BehaviorBaseline", "BehaviorAnomaly", "Guardian", "GuardianSession", "GuardianAlert", "EmergencyEvent", "FallEvent", "SafeZone", "MonitoredRoute", "WanderingEvent", "PickupAuthorization", "PickupEvent", "VoiceDistressEvent", "SafetyEvent", "RerouteSuggestion", "VoiceCommandConfig", "VoiceTriggerLog", "Facility", "FamilyCircle", "CircleMembership"]
