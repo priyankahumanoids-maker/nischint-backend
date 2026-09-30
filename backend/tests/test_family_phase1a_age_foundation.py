@@ -92,11 +92,15 @@ def test_normal_self_registration_rejects_minors_before_consuming_phone_ticket()
     assert "HTTP_403_FORBIDDEN" in guard_source
 
 
-def test_normal_invite_join_is_also_fail_closed_for_under_18_until_parent_flow_exists():
+def test_legacy_invite_join_still_rejects_minors_while_parent_created_minor_invites_are_canonical():
     source = _function_source(AUTH_PATH, "verify_invite_code")
-    age_guard = source.index("_require_adult_self_registration(req.date_of_birth)")
-    user_create = source.index("new_user = User(")
+    legacy_start = source.index("# Lock the guardian row until commit")
+    legacy = source[legacy_start:]
+    age_guard = legacy.index("_require_adult_self_registration(req.date_of_birth)")
+    user_create = legacy.index("new_user = User(")
     assert age_guard < user_create
+    assert "accept_invite_for_user" in source
+    assert "canonical_preview.invitee_kind" in source
     assert "date_of_birth=req.date_of_birth" in source
 
 

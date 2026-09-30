@@ -1,0 +1,265 @@
+"""Family Circle Phase 4 onboarding and invite API."""
+from __future__ import annotations
+
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_current_user, get_db_session
+from app.core.family_consent_policy import (
+    CURRENT_FAMILY_NOTICE_VERSION,
+    FAMILY_CONSENT_PURPOSES,
+    SUPPORTED_LANGUAGES,
+    normalize_purpose,
+    purpose_allowed_for_subject,
+    subject_may_self_consent,
+)
+from app.models.family_circle import FamilyCircle
+from app.models.user import User
+from app.services.family_circle_invite_service import (
+    FamilyInviteError,
+    create_invite,
+    preview_invite,
+    revoke_invite,
+    seat_usage,
+)
+from app.services.family_circle_onboarding_service import (
+    FamilyOnboardingError,
+    create_creator_circle,
+    onboarding_state,
+)
+from app.services.family_circle_service import get_active_membership
+
+router = APIRouter(prefix="/family-circle", tags=["family-circle"])
+
+
+class CreateCircleRequest(BaseModel):
+    plan: Literal["trial", "individual", "family"] = "trial"
+    seat: Literal["protected", "guardian", "member"] | None = None
+    device_id: str | None = Field(default=None, min_length=8, max_length=512)
+    circle_name: str | None = Field(default=None, max_length=120)
+    legal_accepted: bool = False
+
+
+class CreateInviteRequest(BaseModel):
+    seat: Literal["protected", "guardian", "member"]
+    invitee_kind: Literal["adult", "minor"] = "adult"
+    parental_basis: Literal["parent", "lawful_guardian"] | None = None
+    parental_verification_ref: str | None = Field(default=None, max_length=160)
+
+
+class InviteCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6)
+
+
+class ConsentDecisionRequest(BaseModel):
+    decisions: dict[str, bool]
+    language: Literal["en", "hi"] = "en"
+    device_id: str | None = Field(default=None, max_length=160)
+    notice_version: str = CURRENT_FAMILY_NOTICE_VERSION
+
+
+def _http_error(exc: Exception, *, default_status: int = 400) -> HTTPException:
+    message = str(exc)
+    lowered = message.lower()
+    code = default_status
+    if "only the owner or co-admin" in lowered:
+        code = status.HTTP_403_FORBIDDEN
+    elif "already belongs" in lowered or "seat type is full" in lowered:
+        code = status.HTTP_409_CONFLICT
+    elif "trial" in lowered and "already" in lowered:
+        code = status.HTTP_409_CONFLICT
+    return HTTPException(status_code=code, detail=message)
+
+
+def _state_payload(state) -> dict:
+    return {
+        "has_circle": state.has_circle,
+        "circle_id": str(state.circle_id) if state.circle_id else None,
+        "circle_name": state.circle_name,
+        "role": state.role,
+        "plan": state.plan,
+        "seat": state.seat,
+        "tracked": state.tracked,
+        "payment_required": state.payment_required,
+        "trial_ends_at": state.trial_ends_at.isoformat() if state.trial_ends_at else None,
+    }
+
+
+@router.get("/onboarding/status")
+async def get_onboarding_status(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    return _state_payload(await onboarding_state(session, user.id))
+
+
+@router.post("/onboarding/create", status_code=status.HTTP_201_CREATED)
+async def create_circle_onboarding(
+    req: CreateCircleRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        state = await create_creator_circle(
+            session,
+            user=user,
+            plan=req.plan,
+            seat=req.seat,
+            device_id=req.device_id,
+            circle_name=req.circle_name,
+            legal_accepted=req.legal_accepted,
+        )
+        await session.commit()
+        return _state_payload(state)
+    except FamilyOnboardingError as exc:
+        await session.rollback()
+        raise _http_error(exc) from exc
+
+
+@router.post("/invites", status_code=status.HTTP_201_CREATED)
+async def create_family_circle_invite(
+    req: CreateInviteRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        code, expires_at, circle, seat, kind = await create_invite(
+            session,
+            actor=user,
+            requested_seat=req.seat,
+            invitee_kind=req.invitee_kind,
+            parental_basis=req.parental_basis,
+            parental_verification_ref=req.parental_verification_ref,
+        )
+        usage = await seat_usage(session, circle)
+        await session.commit()
+        return {
+            "code": code,
+            "join_url": f"nischint://join?code={code}",
+            "expires_at": expires_at.isoformat(),
+            "expires_in_hours": 48,
+            "seat": seat,
+            "invitee_kind": kind,
+            "single_use": True,
+            "seat_usage": usage,
+        }
+    except FamilyInviteError as exc:
+        await session.rollback()
+        raise _http_error(exc) from exc
+
+
+@router.post("/invites/preview")
+async def preview_family_circle_invite(
+    req: InviteCodeRequest,
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        preview = await preview_invite(session, req.code)
+        await session.commit()
+        return {
+            "valid": True,
+            "circle_name": preview.circle_name,
+            "owner_name": preview.owner_name,
+            "plan": preview.plan,
+            "seat": preview.seat,
+            "invitee_kind": preview.invitee_kind,
+            "tracked": preview.tracked,
+            "who_can_see": preview.who_can_see,
+            "data_shared": list(preview.data_shared),
+            "expires_at": preview.expires_at.isoformat(),
+        }
+    except FamilyInviteError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/invites/revoke")
+async def revoke_family_circle_invite(
+    req: InviteCodeRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        revoked = await revoke_invite(session, actor=user, code=req.code)
+        await session.commit()
+        return {"revoked": revoked}
+    except FamilyInviteError as exc:
+        await session.rollback()
+        raise _http_error(exc) from exc
+
+
+@router.get("/seat-usage")
+async def get_family_circle_seat_usage(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    membership = await get_active_membership(session, user.id)
+    if membership is None:
+        raise HTTPException(status_code=404, detail="No active Family Circle membership")
+    circle = await session.get(FamilyCircle, membership.circle_id)
+    if circle is None or circle.plan is None:
+        raise HTTPException(status_code=409, detail="Family Circle plan is not initialized")
+    usage = await seat_usage(session, circle)
+    await session.commit()
+    return {"plan": circle.plan, "seat_usage": usage}
+
+
+@router.post("/onboarding/consent")
+async def record_onboarding_consent(
+    req: ConsentDecisionRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    state = await onboarding_state(session, user.id)
+    if not state.has_circle or not state.tracked:
+        raise HTTPException(status_code=403, detail="This Family Circle seat is not tracked.")
+    if not subject_may_self_consent(user.date_of_birth):
+        raise HTTPException(status_code=403, detail="A Minor cannot self-administer Family Circle consent.")
+    if req.notice_version != CURRENT_FAMILY_NOTICE_VERSION:
+        raise HTTPException(status_code=409, detail="The current Family Circle consent notice must be reviewed.")
+    if req.language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(status_code=422, detail="Unsupported consent language.")
+    if not req.decisions:
+        raise HTTPException(status_code=422, detail="At least one consent decision is required.")
+
+    normalized: dict[str, bool] = {}
+    for raw_purpose, granted in req.decisions.items():
+        try:
+            purpose = normalize_purpose(raw_purpose)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if purpose not in FAMILY_CONSENT_PURPOSES or not purpose_allowed_for_subject(user.date_of_birth, purpose):
+            raise HTTPException(status_code=403, detail=f"Consent purpose is not allowed: {purpose}")
+        normalized[purpose] = bool(granted)
+
+    from sqlalchemy import text
+    import uuid
+    for purpose, granted in normalized.items():
+        await session.execute(
+            text(
+                """
+                INSERT INTO family_consent_events (
+                    id, subject_user_id, actor_user_id, purpose, state,
+                    notice_version, language, device_id, created_at
+                ) VALUES (
+                    :id, :subject_user_id, :actor_user_id, :purpose, :state,
+                    :notice_version, :language, :device_id, NOW()
+                )
+                """
+            ),
+            {
+                "id": uuid.uuid4(),
+                "subject_user_id": user.id,
+                "actor_user_id": user.id,
+                "purpose": purpose,
+                "state": "granted" if granted else "withdrawn",
+                "notice_version": req.notice_version,
+                "language": req.language,
+                "device_id": req.device_id,
+            },
+        )
+    await session.commit()
+    return {"saved": True, "notice_version": req.notice_version, "decisions": normalized}

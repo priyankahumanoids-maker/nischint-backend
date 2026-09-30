@@ -445,7 +445,12 @@ class VerifyInviteRequest(BaseModel):
     full_name: str = Field(min_length=1, max_length=100)
     phone: str = Field(min_length=10, max_length=20)
     date_of_birth: date
-    role: str = Field("child", pattern="^(child|woman|senior|family|co_parent)$")
+    # Legacy invite compatibility only. Canonical Phase 4 invites derive Circle
+    # role/seat from the signed server invite, never from this client field.
+    role: str = Field("family", pattern="^(child|woman|senior|family|co_parent)$")
+    legal_accepted: bool = False
+    terms_version: str = Field("2026-09", max_length=40)
+    privacy_version: str = Field("2026-09", max_length=40)
 
 
 class ValidateInviteRequest(BaseModel):
@@ -2246,6 +2251,36 @@ async def validate_invite_code(
     from sqlalchemy import select
 
     normalized_code = req.invite_code.strip().upper()
+
+    # Phase 4 canonical invite authority first. Legacy users.invite_code remains
+    # a compatibility fallback until old Settings callers are retired.
+    try:
+        from app.services.family_circle_invite_service import preview_invite as preview_circle_invite
+        canonical = await preview_circle_invite(session, normalized_code)
+        await session.commit()
+        return {
+            "valid": True,
+            "canonical": True,
+            "expires_at": canonical.expires_at.isoformat(),
+            "circle_name": canonical.circle_name,
+            "owner_name": canonical.owner_name,
+            "plan": canonical.plan,
+            "seat": canonical.seat,
+            "invitee_kind": canonical.invitee_kind,
+            "tracked": canonical.tracked,
+            "who_can_see": canonical.who_can_see,
+            "data_shared": list(canonical.data_shared),
+        }
+    except Exception as canonical_exc:
+        # Only a missing/non-canonical code falls back. A recognized canonical
+        # code that is expired/revoked must fail closed rather than accidentally
+        # matching an unrelated legacy code.
+        canonical_message = str(canonical_exc)
+        if "Invalid Family Circle invite code" not in canonical_message:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=canonical_message) from canonical_exc
+        await session.rollback()
+
     result = await session.execute(
         select(User).where(User.invite_code == normalized_code)
     )
@@ -2289,6 +2324,96 @@ async def verify_invite_code(
 
     # 1. Validate the code â€” look up guardian by invite_code
     normalized_invite_code = req.invite_code.strip().upper()
+
+    # FC-05 canonical single-use invite path. It is atomic with account
+    # creation, Circle membership, legal acceptance and invite consumption.
+    try:
+        from app.services.family_circle_invite_service import (
+            FamilyInviteError,
+            accept_invite_for_user,
+            preview_invite as preview_circle_invite,
+        )
+        from app.services.family_circle_onboarding_service import record_legal_acceptance
+
+        canonical_preview = await preview_circle_invite(session, normalized_invite_code)
+        if not req.legal_accepted:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Terms and Privacy Policy must be accepted before joining the Family Circle.",
+            )
+
+        existing = await user_service.get_user_by_email(session, req.email)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this email already exists. Please sign in instead.",
+            )
+        normalized_phone = _require_normalized_phone(req.phone)
+        if await _phone_exists(session, normalized_phone):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This mobile number is already registered. Please sign in instead.",
+            )
+        await _consume_signup_phone_verification(session, request, normalized_phone)
+
+        canonical_role = (
+            "child"
+            if canonical_preview.invitee_kind == "minor"
+            else "guardian"
+            if canonical_preview.seat == "guardian"
+            else "family"
+        )
+        new_user = User(
+            email=req.email,
+            password_hash=await user_service.hash_password_async(req.password),
+            role=canonical_role,
+            full_name=req.full_name,
+            phone=normalized_phone,
+            date_of_birth=req.date_of_birth,
+        )
+        session.add(new_user)
+        await session.flush()
+
+        await accept_invite_for_user(
+            session,
+            code=normalized_invite_code,
+            new_user=new_user,
+        )
+        await record_legal_acceptance(
+            session,
+            user_id=new_user.id,
+            terms_version=req.terms_version,
+            privacy_version=req.privacy_version,
+        )
+        await session.commit()
+        await session.refresh(new_user)
+
+        response = await _issue_local_session_response(
+            session, new_user, request, provider="local"
+        )
+        await session.commit()
+        return response
+    except HTTPException:
+        await session.rollback()
+        raise
+    except FamilyInviteError as canonical_exc:
+        # A syntactically valid canonical code that exists but cannot be used is
+        # authoritative and must not fall through to the legacy invite system.
+        message = str(canonical_exc)
+        await session.rollback()
+        if "Invalid Family Circle invite code" not in message:
+            raise HTTPException(status_code=400, detail=message) from canonical_exc
+    except Exception as canonical_exc:
+        await session.rollback()
+        # Canonical invite authority is security-sensitive. Infrastructure or
+        # schema errors must fail closed; only a genuine "not a canonical code"
+        # result above is allowed to fall through to the legacy invite path.
+        logger.error("[FC-05] canonical invite authority unavailable: %s", str(canonical_exc)[:160])
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Family Circle invite verification is temporarily unavailable.",
+        ) from canonical_exc
+
     # Lock the guardian row until commit. This makes the scanner truly
     # single-use even if two devices submit the same code at nearly once.
     result = await session.execute(

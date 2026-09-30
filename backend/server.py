@@ -515,6 +515,19 @@ async def startup_db():
             )
             raise
 
+    # FC-05: Phase 4 canonical onboarding/invite authority.
+    if pool:
+        try:
+            from app.migrations.fc05_family_onboarding_invites import (
+                ensure_family_phase4_invite_schema,
+            )
+            await ensure_family_phase4_invite_schema()
+        except Exception as _e:
+            logger.error(
+                f"[FC-05] required startup DDL failed; refusing startup: {_e}"
+            )
+            raise
+
     if pool:
         try:
             from app.db.session import async_session
