@@ -99,13 +99,22 @@ async def _canonical_protected_member(session: AsyncSession, member_id: str) -> 
         raise HTTPException(status_code=404, detail="Protected member not found") from exc
 
     result = await session.execute(
-        text("SELECT id, role, is_active FROM users WHERE id = :member_id"),
+        text("SELECT id, role, is_active, date_of_birth FROM users WHERE id = :member_id"),
         {"member_id": str(member_uuid)},
     )
     row = result.mappings().first()
     if not row or not row["is_active"] or not is_protected_member(row["role"]):
         raise HTTPException(status_code=404, detail="Protected member not found")
     return str(row["id"])
+
+
+async def _target_date_of_birth(session: AsyncSession, member_id: str):
+    result = await session.execute(
+        text("SELECT date_of_birth FROM users WHERE id = :member_id"),
+        {"member_id": str(member_id)},
+    )
+    row = result.mappings().first()
+    return row["date_of_birth"] if row else None
 
 
 async def require_policy_read_access(
@@ -127,6 +136,20 @@ async def require_policy_write_access(
     """Only primary Guardian / authorized co-parent writes."""
     target_id = await _canonical_protected_member(session, member_id)
     role = normalize_role(actor.role)
+
+    # Phase 3: every adult controls their own monitoring/sharing consent.
+    if str(actor.id) == target_id and is_protected_member(actor.role):
+        return target_id
+
+    # Legacy Guardian/co-parent control remains only for under-18 protected
+    # members. Adults can no longer be remotely toggled by another adult.
+    from app.core.age_policy import is_minor
+    target_dob = await _target_date_of_birth(session, target_id)
+    if target_dob is None or not is_minor(target_dob):
+        raise HTTPException(
+            status_code=403,
+            detail="Another adult cannot change this member's monitoring or sharing settings.",
+        )
 
     if is_primary_guardian(role) or is_co_guardian(role):
         from app.services.guardian_dashboard_engine import _get_linked_user_ids
@@ -167,6 +190,15 @@ async def update_policy_for_actor(
 ) -> dict[str, Any]:
     await ensure_member_monitoring_policy_table()
     target_id = await require_policy_write_access(session, actor, member_id)
+
+    from app.core.age_policy import is_minor
+    target_dob = await _target_date_of_birth(session, target_id)
+    if target_dob is not None and is_minor(target_dob):
+        if ai_enabled is True or microphone_enabled is True:
+            raise HTTPException(
+                status_code=403,
+                detail="Behavioral AI and voice distress are unavailable for minors.",
+            )
 
     # IMPORTANT: update only fields supplied by this request. Parent and
     # co-parent phones may toggle different controls at nearly the same time;

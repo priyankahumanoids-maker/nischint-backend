@@ -502,6 +502,19 @@ async def startup_db():
             )
             raise
 
+    # FC-04: additive Phase 3 consent evidence + sharing-pause authority.
+    if pool:
+        try:
+            from app.migrations.fc04_family_consent_authority import (
+                ensure_family_phase3_consent_schema,
+            )
+            await ensure_family_phase3_consent_schema()
+        except Exception as _e:
+            logger.error(
+                f"[FC-04] required startup DDL failed; refusing startup: {_e}"
+            )
+            raise
+
     if pool:
         try:
             from app.db.session import async_session
