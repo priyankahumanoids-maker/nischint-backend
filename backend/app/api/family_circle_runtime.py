@@ -1,4 +1,4 @@
-"""Phase 5 read-only runtime authority surface for the signed-in device."""
+"""Canonical runtime authority surface for the signed-in device."""
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,4 +14,9 @@ async def get_my_runtime_authority(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    return await runtime_snapshot(session, user.id)
+    # Snapshot reconciliation may perform the automatic 18th-birthday role
+    # transition and timed sharing resume. Persist those idempotent transitions
+    # before returning the authority used by native runtime producers.
+    snapshot = await runtime_snapshot(session, user.id)
+    await session.commit()
+    return snapshot

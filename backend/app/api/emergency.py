@@ -377,6 +377,15 @@ async def get_active(
     caller_role = normalize_role(getattr(user, "role", None))
     if caller_role in {"operator", "admin"}:
         events = await get_active_emergencies(session=session, user_id=None)
+        from app.services.family_circle_audit_service import record_location_disclosure
+        for event in events:
+            if event.get("lat") is None or event.get("lng") is None:
+                continue
+            await record_location_disclosure(
+                session, subject_user_id=event.get("user_id"), view_kind="live",
+                viewer_user_id=user.id, viewer_kind="staff",
+                viewer_label=getattr(user, "full_name", None) or getattr(user, "email", None) or "Staff",
+            )
         return {"events": events, "count": len(events)}
 
     # Guardian/co-parent Home must reconcile against the active SOS events of
@@ -411,6 +420,15 @@ async def get_active(
                 )
             )
         events.sort(key=lambda event: str(event.get("created_at") or ""), reverse=True)
+        from app.services.family_circle_audit_service import record_location_disclosure
+        for event in events:
+            if event.get("lat") is None or event.get("lng") is None:
+                continue
+            await record_location_disclosure(
+                session, subject_user_id=event.get("user_id"), view_kind="live",
+                viewer_user_id=user.id, viewer_kind="emergency",
+                viewer_label=getattr(user, "full_name", None) or "Emergency viewer",
+            )
         return {"events": events, "count": len(events)}
 
     events = await get_active_emergencies(session=session, user_id=str(user.id))
@@ -433,6 +451,16 @@ async def get_status(
     result = await get_emergency_details(session=session, event_id=event_id)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])
+    if str(event.user_id) != str(user.id) and (result.get("lat") is not None or result.get("location_trail")):
+        from app.services.family_circle_audit_service import record_location_disclosure
+        role = normalize_role(getattr(user, "role", None))
+        await record_location_disclosure(
+            session, subject_user_id=event.user_id,
+            view_kind="history" if result.get("location_trail") else "live",
+            viewer_user_id=user.id,
+            viewer_kind="staff" if role in {"operator", "admin"} else "emergency",
+            viewer_label=getattr(user, "full_name", None) or getattr(user, "email", None) or "Emergency viewer",
+        )
     return result
 
 

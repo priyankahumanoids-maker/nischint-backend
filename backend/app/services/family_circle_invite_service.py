@@ -28,6 +28,7 @@ from app.core.family_circle_roles import CIRCLE_ROLE_ADULT_MEMBER, CIRCLE_ROLE_M
 from app.core.family_consent_policy import CURRENT_FAMILY_NOTICE_VERSION
 from app.models.family_circle import CircleMembership, FamilyCircle
 from app.models.user import User
+from app.services.family_circle_audit_service import append_family_audit
 from app.services.family_circle_plan_service import (
     CirclePlanError,
     add_membership_with_seat,
@@ -228,14 +229,12 @@ async def create_invite(
         raise FamilyInviteError("A Minor cannot occupy a Guardian seat.")
 
     if kind == "minor":
-        basis = str(parental_basis or "").strip().lower().replace(" ", "_")
-        verification = str(parental_verification_ref or "").strip()
-        if basis not in {"parent", "lawful_guardian"}:
-            raise FamilyInviteError("Minor invites require parent or lawful-guardian authority.")
-        if len(verification) < 8 or len(verification) > 160:
-            raise FamilyInviteError("Verifiable parental-consent evidence is required before inviting a Minor.")
-        parental_basis = basis
-        parental_verification_ref = verification
+        # Fail closed until counsel-approved parental proof and high-risk
+        # step-up verification are both represented by server-verified
+        # artifacts. Caller-supplied strings must never grant parental authority.
+        raise FamilyInviteError(
+            "Minor invite creation requires verified parental consent and step-up verification; this path is not enabled yet."
+        )
     else:
         parental_basis = None
         parental_verification_ref = None
@@ -296,6 +295,23 @@ async def create_invite(
             "created_at": point,
         },
     )
+    await append_family_audit(
+        session,
+        circle_id=circle.id,
+        actor_user_id=actor.id,
+        subject_user_id=None,
+        event_type="invite_created",
+        details={"seat": seat, "invitee_kind": kind, "expires_at": expires_at.isoformat()},
+    )
+    if kind == "minor":
+        await append_family_audit(
+            session,
+            circle_id=circle.id,
+            actor_user_id=actor.id,
+            subject_user_id=None,
+            event_type="parental_consent_recorded",
+            details={"basis": parental_basis},
+        )
     await session.flush()
     return code, expires_at, circle, seat, kind
 
@@ -470,6 +486,14 @@ async def accept_invite_for_user(
     )
     if result.scalar_one_or_none() is None:
         raise FamilyInviteError("This Family Circle invite was already consumed.")
+    await append_family_audit(
+        session,
+        circle_id=circle.id,
+        actor_user_id=new_user.id,
+        subject_user_id=new_user.id,
+        event_type="member_joined",
+        details={"seat": str(row["seat"]), "role": role},
+    )
     await session.flush()
     return membership
 
@@ -499,8 +523,18 @@ async def revoke_invite(
         ),
         {"code_hash": digest, "circle_id": circle.id, "now": point},
     )
+    revoked = result.scalar_one_or_none() is not None
+    if revoked:
+        await append_family_audit(
+            session,
+            circle_id=circle.id,
+            actor_user_id=actor.id,
+            subject_user_id=None,
+            event_type="invite_revoked",
+            details={},
+        )
     await session.flush()
-    return result.scalar_one_or_none() is not None
+    return revoked
 
 
 async def seat_usage(session: AsyncSession, circle: FamilyCircle, *, now: datetime | None = None) -> dict[str, dict[str, int]]:

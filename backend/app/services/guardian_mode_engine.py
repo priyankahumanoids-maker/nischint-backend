@@ -822,16 +822,10 @@ async def update_location(
 
         logger.info(f"LOCATION_UPDATE_CALLED session={session_id} lat={lat} lng={lng}")
 
-        # Cache guardian user_ids + child name + role for this session (avoids repeated DB lookups)
-        guardian_ids = live.get("_guardian_user_ids")
-        child_name = live.get("_child_name")
-        child_role = live.get("_child_role")
-        if guardian_ids is None:
-            guardian_ids, child_name, child_role = await _resolve_guardian_ids(session, str(gs.user_id))
-            live["_guardian_user_ids"] = guardian_ids
-            live["_child_name"] = child_name
-            live["_child_role"] = child_role
-            _live_state[session_id] = live
+        # Re-resolve the ordinary location audience on every publish. Canonical
+        # Family Circle pause/leave/removal/consent/entitlement changes must take
+        # effect without waiting for a cached journey audience to expire.
+        guardian_ids, child_name, child_role = await _resolve_guardian_ids(session, str(gs.user_id))
 
         logger.info(f"LOCATION_UPDATE_GUARDIANS count={len(guardian_ids)} ids={guardian_ids}")
 
@@ -1017,6 +1011,18 @@ async def _resolve_guardian_ids(session: AsyncSession, child_user_id: str) -> tu
     child_name = child.full_name if child else None
     child_role = child.role if child else None
     logger.info(f"RESOLVE_GUARDIAN child={child_user_id} name={child_name} role={child_role}")
+
+    # Canonical Family Circle authority wins when the protected user has ever
+    # entered the canonical model. Former/inactive canonical members return an
+    # empty audience rather than falling back to preserved legacy relationships.
+    from app.services.family_circle_runtime_authority import location_recipient_ids
+    canonical, canonical_ids = await location_recipient_ids(session, child_uuid)
+    if canonical:
+        logger.info(
+            "RESOLVE_GUARDIAN canonical child=%s recipients=%s",
+            child_user_id, canonical_ids,
+        )
+        return list(canonical_ids), child_name, child_role
 
     guardian_user_ids: set[str] = set()
 

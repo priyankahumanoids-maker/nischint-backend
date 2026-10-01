@@ -173,7 +173,20 @@ async def ingest_wearable_signals(
     pre-HC-02 don't send them; their rows will have NULL device_id
     and 'unknown' device_model.
     """
-    await subscription_service.require_member_entitlement(session, user.id, 'advanced_sensor_monitoring')
+    # Canonical Family Circle authority wins for migrated accounts. Legacy
+    # subscription entitlement remains only for users that have never entered
+    # the canonical circle model. This closes a direct-API wearable bypass for
+    # minors, Individual/Trial Guardians, withdrawn consent and Lifeline mode.
+    from app.core.family_circle_permissions import ACTION_PRODUCE_WEARABLE
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family_authority = await runtime_decision(
+        session, actor_user_id=user.id, action=ACTION_PRODUCE_WEARABLE
+    )
+    if family_authority.canonical:
+        if not family_authority.allowed:
+            raise HTTPException(403, f"Family Circle wearable production denied: {family_authority.code}")
+    else:
+        await subscription_service.require_member_entitlement(session, user.id, 'advanced_sensor_monitoring')
     user_id = str(user.id)
     client = redis_service._get_client()
 

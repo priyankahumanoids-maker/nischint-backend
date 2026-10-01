@@ -103,18 +103,35 @@ async def _require_journey_viewer(
     session: AsyncSession,
     session_id: str,
     user: User,
+    *,
+    action: str | None = None,
+    record_disclosure: bool = False,
 ):
     """Read boundary: owner, operator/admin, or authorized family monitor."""
     journey = await _load_journey_for_auth(session, session_id)
     role = normalize_role(getattr(user, "role", None))
 
-    if str(journey.user_id) == str(user.id) or role in {"admin", "operator"}:
+    if str(journey.user_id) == str(user.id):
+        return journey
+    if role in {"admin", "operator"}:
+        if record_disclosure:
+            from app.core.family_circle_permissions import ACTION_VIEW_LOCATION, ACTION_VIEW_LOCATION_HISTORY
+            from app.services.family_circle_audit_service import record_location_disclosure
+            selected = action or ACTION_VIEW_LOCATION
+            await record_location_disclosure(
+                session, subject_user_id=journey.user_id,
+                view_kind="history" if selected == ACTION_VIEW_LOCATION_HISTORY else "live",
+                viewer_user_id=user.id, viewer_kind="staff",
+                viewer_label=user.full_name or user.email or "Staff",
+            )
         return journey
 
     from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
     from app.services.family_circle_runtime_authority import runtime_decision
+    selected_action = action or ACTION_VIEW_LOCATION
     family = await runtime_decision(
-        session, actor_user_id=user.id, target_user_id=journey.user_id, action=ACTION_VIEW_LOCATION
+        session, actor_user_id=user.id, target_user_id=journey.user_id, action=selected_action,
+        record_disclosure=record_disclosure,
     )
     if family.canonical:
         if family.allowed:
@@ -247,7 +264,7 @@ async def get_session(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    await _require_journey_viewer(session, session_id, user)
+    await _require_journey_viewer(session, session_id, user, record_disclosure=True)
 
     from app.services.guardian_mode_engine import get_session as get_s
     result = await get_s(session, session_id)
@@ -434,7 +451,10 @@ async def get_session_polyline(
     # Canonical AuthZ: owner / operator-admin / authorized family monitor.
     # This includes the current direct users.guardian_id family model and
     # co-parent read scope rather than relying only on the legacy Guardian table.
-    await _require_journey_viewer(session, session_id, user)
+    from app.core.family_circle_permissions import ACTION_VIEW_LOCATION_HISTORY
+    await _require_journey_viewer(
+        session, session_id, user, action=ACTION_VIEW_LOCATION_HISTORY, record_disclosure=True
+    )
 
     # Cap to keep payload sane. seq is monotonic per session.
     capped = max(1, min(int(limit or 1000), 5000))

@@ -387,6 +387,12 @@ async def revoke_consent(
     if row.revoked_at is None:
         row.revoked_at = datetime.now(timezone.utc)
         await session.flush()
+
+    # If this account is already governed by Family Circle, a visible legacy
+    # Privacy-screen withdrawal must also revoke the canonical purpose(s).
+    # Legacy grants never silently create canonical grants.
+    from app.services.family_circle_consent_service import sync_legacy_withdrawal
+    await sync_legacy_withdrawal(session, user=user, legacy_category=category)
     await session.commit()
     if row.revoked_at is not None:
         logger.info(

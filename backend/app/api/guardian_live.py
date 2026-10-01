@@ -341,10 +341,15 @@ async def _compute_live_risk(session: AsyncSession, user: User):
             include_checkin_recovery=False,
         )
     )
-    from app.core.family_circle_permissions import ACTION_VIEW_AI_PROFILE
-    from app.services.family_circle_runtime_authority import filter_targets_for_action
+    from app.core.family_circle_permissions import ACTION_VIEW_AI_PROFILE, ACTION_VIEW_LOCATION
+    from app.services.family_circle_runtime_authority import filter_targets_for_action, runtime_decision
+    # Risk access and location disclosure are distinct permissions. A caller
+    # must hold both before any coordinates can enter this response.
     child_ids = set(await filter_targets_for_action(
         session, user.id, list(child_ids), ACTION_VIEW_AI_PROFILE
+    ))
+    child_ids = set(await filter_targets_for_action(
+        session, user.id, list(child_ids), ACTION_VIEW_LOCATION
     ))
     if not child_ids:
         return []
@@ -507,6 +512,18 @@ async def _compute_live_risk(session: AsyncSession, user: User):
         except Exception as exc:
             logger.exception(f"[RISK_LIVE] child compute failed child={child_id} err={exc}")
             continue
+
+    # Record only actual coordinate disclosures, never mere permission probes.
+    for disclosed in results:
+        if disclosed.get("lat") is None or disclosed.get("lng") is None:
+            continue
+        try:
+            await runtime_decision(
+                session, actor_user_id=user.id, target_user_id=disclosed.get("child_id"),
+                action=ACTION_VIEW_LOCATION, record_disclosure=True,
+            )
+        except Exception:
+            logger.exception("[RISK_LIVE] location-view audit failed child=%s", disclosed.get("child_id"))
 
     logger.info(
         f"[RISK_LIVE] guardian={user.id} children={len(results)} "

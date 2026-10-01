@@ -422,6 +422,19 @@ async def share_location(
     """Share real-time location update during active session."""
     _check_rate_limit(str(user.id), "share-location")
 
+    # Canonical Family Circle producer authority is enforced at this API
+    # boundary. Former/paused/Lifeline/minor/Guardian canonical accounts may
+    # not bypass the preferred mobile producer through this legacy endpoint.
+    # Emergency SOS location uses the dedicated emergency path and is not
+    # blocked here.
+    from app.core.family_circle_permissions import ACTION_PRODUCE_LOCATION
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family_authority = await runtime_decision(
+        session, actor_user_id=user.id, action=ACTION_PRODUCE_LOCATION
+    )
+    if family_authority.canonical and not family_authority.allowed:
+        raise HTTPException(403, f"Family Circle location production denied: {family_authority.code}")
+
     gs = (await session.execute(
         select(GuardianSession).where(and_(
             GuardianSession.user_id == user.id,

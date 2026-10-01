@@ -10,11 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db_session
 from app.core.family_consent_policy import (
     CURRENT_FAMILY_NOTICE_VERSION,
-    FAMILY_CONSENT_PURPOSES,
-    SUPPORTED_LANGUAGES,
-    normalize_purpose,
-    purpose_allowed_for_subject,
-    subject_may_self_consent,
 )
 from app.models.family_circle import FamilyCircle
 from app.models.user import User
@@ -126,6 +121,15 @@ async def create_family_circle_invite(
     session: AsyncSession = Depends(get_db_session),
 ):
     try:
+        if str(req.invitee_kind or "adult").strip().lower() == "minor":
+            # Counsel has not yet approved the verifiable-parental-consent
+            # mechanism. A caller-supplied reference is not proof, and the
+            # spec also requires fresh step-up OTP for adding a Minor. Keep
+            # this public path fail-closed until both server-verified artifacts
+            # exist.
+            raise FamilyInviteError(
+                "Adding a Minor is temporarily unavailable until verified parental consent and step-up verification are enabled."
+            )
         code, expires_at, circle, seat, kind = await create_invite(
             session,
             actor=user,
@@ -216,50 +220,22 @@ async def record_onboarding_consent(
     state = await onboarding_state(session, user.id)
     if not state.has_circle or not state.tracked:
         raise HTTPException(status_code=403, detail="This Family Circle seat is not tracked.")
-    if not subject_may_self_consent(user.date_of_birth):
-        raise HTTPException(status_code=403, detail="A Minor cannot self-administer Family Circle consent.")
-    if req.notice_version != CURRENT_FAMILY_NOTICE_VERSION:
-        raise HTTPException(status_code=409, detail="The current Family Circle consent notice must be reviewed.")
-    if req.language not in SUPPORTED_LANGUAGES:
-        raise HTTPException(status_code=422, detail="Unsupported consent language.")
-    if not req.decisions:
-        raise HTTPException(status_code=422, detail="At least one consent decision is required.")
-
-    normalized: dict[str, bool] = {}
-    for raw_purpose, granted in req.decisions.items():
-        try:
-            purpose = normalize_purpose(raw_purpose)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        if purpose not in FAMILY_CONSENT_PURPOSES or not purpose_allowed_for_subject(user.date_of_birth, purpose):
-            raise HTTPException(status_code=403, detail=f"Consent purpose is not allowed: {purpose}")
-        normalized[purpose] = bool(granted)
-
-    from sqlalchemy import text
-    import uuid
-    for purpose, granted in normalized.items():
-        await session.execute(
-            text(
-                """
-                INSERT INTO family_consent_events (
-                    id, subject_user_id, actor_user_id, purpose, state,
-                    notice_version, language, device_id, created_at
-                ) VALUES (
-                    :id, :subject_user_id, :actor_user_id, :purpose, :state,
-                    :notice_version, :language, :device_id, NOW()
-                )
-                """
-            ),
-            {
-                "id": uuid.uuid4(),
-                "subject_user_id": user.id,
-                "actor_user_id": user.id,
-                "purpose": purpose,
-                "state": "granted" if granted else "withdrawn",
-                "notice_version": req.notice_version,
-                "language": req.language,
-                "device_id": req.device_id,
-            },
+    try:
+        from app.services.family_circle_consent_service import record_self_consent
+        normalized = await record_self_consent(
+            session,
+            user=user,
+            decisions=req.decisions,
+            notice_version=req.notice_version,
+            language=req.language,
+            device_id=req.device_id,
         )
-    await session.commit()
+        await session.commit()
+    except PermissionError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        await session.rollback()
+        status_code = 409 if "notice" in str(exc) else 422
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     return {"saved": True, "notice_version": req.notice_version, "decisions": normalized}

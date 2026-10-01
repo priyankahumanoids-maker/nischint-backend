@@ -434,7 +434,7 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
         from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
         from app.services.family_circle_runtime_authority import filter_targets_for_action
         user_ids = await filter_targets_for_action(
-            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION
+            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION, record_disclosures=True
         )
     now = datetime.now(timezone.utc)
     from app.services.redis_service import get_user_pings
@@ -816,7 +816,7 @@ async def get_active_sessions(session: AsyncSession, guardian_email: str, guardi
         from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
         from app.services.family_circle_runtime_authority import filter_targets_for_action
         user_ids = await filter_targets_for_action(
-            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION
+            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION, record_disclosures=True
         )
     if not user_ids:
         return []
@@ -1028,7 +1028,7 @@ async def get_session_history(session: AsyncSession, guardian_email: str, limit:
         from app.core.family_circle_permissions import ACTION_VIEW_LOCATION_HISTORY
         from app.services.family_circle_runtime_authority import filter_targets_for_action
         user_ids = await filter_targets_for_action(
-            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION_HISTORY
+            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION_HISTORY, record_disclosures=True
         )
     if not user_ids:
         return []

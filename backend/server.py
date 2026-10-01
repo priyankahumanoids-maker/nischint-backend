@@ -528,6 +528,20 @@ async def startup_db():
             )
             raise
 
+    # FC-06: canonical entitlement, lifecycle and append-only audit foundation.
+    # This is provider-neutral; no live payment gateway is initialized here.
+    if pool:
+        try:
+            from app.migrations.fc06_family_entitlement_lifecycle_audit import (
+                ensure_family_entitlement_lifecycle_audit_schema,
+            )
+            await ensure_family_entitlement_lifecycle_audit_schema()
+        except Exception as _e:
+            logger.error(
+                f"[FC-06] required startup DDL failed; refusing startup: {_e}"
+            )
+            raise
+
     if pool:
         try:
             from app.db.session import async_session

@@ -23,6 +23,39 @@ SSE_PING_INTERVAL = settings.sse_ping_interval
 router = APIRouter(prefix="/stream", tags=["stream"])
 
 
+async def _family_event_allowed(session: AsyncSession, viewer: User, event: dict) -> bool:
+    """Re-authorize ordinary location-bearing SSE events at delivery time.
+
+    Emergency SOS delivery is deliberately independent of normal sharing. The
+    canonical check prevents queued/replayed ordinary location from surviving a
+    pause, consent withdrawal, entitlement expiry, leave or removal.
+    """
+    event_type = str(event.get("type") or "")
+    if event_type == "emergency_triggered":
+        return True
+    if event_type not in {"location_update", "risk_update"}:
+        return True
+    data = event.get("data")
+    if not isinstance(data, dict):
+        return True
+    target = data.get("child_id") or data.get("user_id")
+    if not target or str(target) == str(viewer.id):
+        return True
+    from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+    from app.services.family_circle_runtime_authority import runtime_decision
+    decision = await runtime_decision(
+        session, actor_user_id=viewer.id, target_user_id=target,
+        action=ACTION_VIEW_LOCATION, record_disclosure=True,
+    )
+    if decision.canonical:
+        if decision.allowed:
+            await session.commit()
+            return True
+        await session.rollback()
+        return False
+    return True
+
+
 async def get_user_from_token(
     token: Optional[str] = Query(None),
     session: AsyncSession = Depends(get_db_session),
@@ -45,7 +78,7 @@ async def get_user_from_token(
     return user
 
 
-async def _scoped_event_generator(channel: str, request: Request, meta: dict):
+async def _scoped_event_generator(channel: str, request: Request, meta: dict, session: AsyncSession, viewer: User):
     """Generate SSE events for a specific channel with replay on reconnect."""
     queue = await broadcaster.subscribe(channel)
 
@@ -55,6 +88,8 @@ async def _scoped_event_generator(channel: str, request: Request, meta: dict):
         # Replay missed events (last 5 minutes) — covers disconnect gaps
         replay_events = await broadcaster.get_replay_events(channel)
         for evt in replay_events:
+            if not await _family_event_allowed(session, viewer, evt):
+                continue
             event_type = evt.get("type", "message")
             event_id = evt.get("id", "")
             yield f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(evt)}\n\n"
@@ -66,6 +101,8 @@ async def _scoped_event_generator(channel: str, request: Request, meta: dict):
 
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=float(SSE_PING_INTERVAL))
+                if not await _family_event_allowed(session, viewer, event):
+                    continue
                 event_type = event.get("type", "message")
                 event_id = event.get("id", "")
                 yield f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(event)}\n\n"
@@ -83,6 +120,8 @@ async def _coparent_event_generator(
     primary_channel: str,
     request: Request,
     meta: dict,
+    session: AsyncSession,
+    viewer: User,
 ):
     """Co-parent SSE with zero-extra-publish SOS fast lane.
 
@@ -140,6 +179,8 @@ async def _coparent_event_generator(
         # Keep the canonical co-parent replay unchanged. Primary-channel replay
         # contributes only SOS-trigger events and is logically deduplicated.
         for event in await broadcaster.get_replay_events(user_channel):
+            if not await _family_event_allowed(session, viewer, event):
+                continue
             if duplicate(event):
                 continue
             event_type = event.get("type", "message")
@@ -165,6 +206,8 @@ async def _coparent_event_generator(
                 )
                 if source == "primary" and not primary_fast_allowed(event):
                     continue
+                if source == "user" and not await _family_event_allowed(session, viewer, event):
+                    continue
                 if duplicate(event):
                     continue
                 event_type = event.get("type", "message")
@@ -188,6 +231,7 @@ async def _coparent_event_generator(
 async def stream_events(
     request: Request,
     current_user: User = Depends(get_user_from_token),
+    session: AsyncSession = Depends(get_db_session),
 ):
     """
     SSE endpoint scoped by user role:
@@ -211,9 +255,11 @@ async def stream_events(
             primary_channel,
             request,
             meta,
+            session,
+            current_user,
         )
     else:
-        generator = _scoped_event_generator(channel, request, meta)
+        generator = _scoped_event_generator(channel, request, meta, session, current_user)
 
     return StreamingResponse(
         generator,

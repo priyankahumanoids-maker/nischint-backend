@@ -21,6 +21,7 @@ from app.core.family_circle_permissions import (
     ACTION_PRODUCE_LOCATION,
 )
 from app.services.family_circle_runtime_authority import runtime_decision, sharing_paused
+from app.services.family_circle_audit_service import record_location_disclosure
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/location", tags=["Location Sharing"])
@@ -390,6 +391,11 @@ async def get_tracking_data(
             .order_by(GuardianSession.started_at.desc()).limit(1)
         )).scalar_one_or_none()
         loc = last_gs.current_location if last_gs else None
+        if canonical and loc and loc.get("lat") is not None and loc.get("lng") is not None:
+            await record_location_disclosure(
+                session, subject_user_id=share.user_id, view_kind="live",
+                viewer_kind="public_link", viewer_label="Shared tracking link",
+            )
         return TrackingDataResponse(
             status="live", share_name=share.share_name or user_name, user_name=user_name,
             lat=loc.get("lat") if loc else None, lng=loc.get("lng") if loc else None,
@@ -420,6 +426,12 @@ async def get_tracking_data(
                 detail=f"{int(gs.route_deviation_m)}m off expected route \u00b7 {ist_time}",
                 severity="warning",
             )
+
+    if canonical and loc.get("lat") is not None and loc.get("lng") is not None:
+        await record_location_disclosure(
+            session, subject_user_id=share.user_id, view_kind="live",
+            viewer_kind="public_link", viewer_label="Shared tracking link",
+        )
 
     return TrackingDataResponse(
         status="live", share_name=share.share_name or user_name, user_name=user_name,
@@ -472,6 +484,12 @@ async def get_trail_data(
 
     if not points:
         return TrailResponse(trail=[], has_data=False)
+
+    if canonical:
+        await record_location_disclosure(
+            session, subject_user_id=share.user_id, view_kind="history",
+            viewer_kind="public_link", viewer_label="Shared tracking link",
+        )
 
     # Check current session for deviation info
     gs = (await session.execute(
@@ -567,6 +585,12 @@ async def get_geofence_context(
         route_deviated = False
         total_dist = 0.0
         dur_min = 0
+
+    if canonical and lat is not None and lng is not None:
+        await record_location_disclosure(
+            session, subject_user_id=share.user_id, view_kind="live",
+            viewer_kind="public_link", viewer_label="Shared tracking link",
+        )
 
     if not lat or not lng:
         return ContextResponse(zones=[], current_zone=None, timeline=[], ai_context="Waiting for location data")

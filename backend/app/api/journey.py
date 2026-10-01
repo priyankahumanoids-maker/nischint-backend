@@ -56,6 +56,14 @@ async def get_polyline(
         .limit(limit)
     )).scalars().all()
 
+    if gs.user_id != current_user.id and current_user.role in ("admin", "operator") and rows:
+        from app.services.family_circle_audit_service import record_location_disclosure
+        await record_location_disclosure(
+            session, subject_user_id=gs.user_id, view_kind="history",
+            viewer_user_id=current_user.id, viewer_kind="staff",
+            viewer_label=current_user.full_name or current_user.email or "Staff",
+        )
+
     return {
         "session_id":   str(session_id),
         "is_offline":   bool(gs.is_offline),

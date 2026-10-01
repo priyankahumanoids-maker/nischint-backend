@@ -17,6 +17,8 @@ from app.services.family_circle_plan_service import (
 )
 from app.services.family_circle_service import CircleAuthorityError, create_circle, get_active_membership
 
+from app.services.family_circle_entitlement_service import seed_entitlement_state
+
 TERMS_VERSION = "2026-09"
 PRIVACY_VERSION = "2026-09"
 
@@ -149,6 +151,7 @@ async def create_creator_circle(
             phone=user.phone,
             device_id=device_id,
         )
+        await seed_entitlement_state(session, circle)
         await record_legal_acceptance(session, user_id=user.id)
         await session.flush()
         return await onboarding_state(session, user.id)
