@@ -154,14 +154,17 @@ def _is_admin(user) -> bool:
 
 
 async def _can_view_safety(session: AsyncSession, user: User, target_user_id: str) -> bool:
-    """Return True when caller may read a protected member's safety state.
-
-    A co-parent/co-guardian created from a Family Circle invite points to the
-    Primary Guardian through ``users.guardian_id``.  It inherits that primary
-    guardian's monitoring/read scope, but never mutation rights.
-    """
+    """Return True when caller may read a protected member's safety state."""
     if _is_admin(user):
         return True
+
+    from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family = await runtime_decision(
+        session, actor_user_id=user.id, target_user_id=target_user_id, action=ACTION_VIEW_LOCATION
+    )
+    if family.canonical:
+        return family.allowed
 
     caller_id = str(user.id)
     if caller_id == target_user_id:
@@ -204,14 +207,19 @@ async def _can_view_safety(session: AsyncSession, user: User, target_user_id: st
 
 
 async def _can_manage_safety(session: AsyncSession, user: User, target_user_id: str) -> bool:
-    """Only admins and linked primary guardians may mutate safety assignments.
-
-    Protected members can view assignments made for them, but cannot create,
-    edit, or delete those records. Co-guardians/co-parents remain read-only.
-    """
+    """Use Family Circle role authority when canonical membership exists."""
     if _is_admin(user):
         return True
     caller_id = str(user.id)
+
+    from app.core.family_circle_permissions import ACTION_MANAGE_OTHER_SAFETY, ACTION_MANAGE_OWN_SAFETY
+    from app.services.family_circle_runtime_authority import runtime_decision
+    action = ACTION_MANAGE_OWN_SAFETY if caller_id == target_user_id else ACTION_MANAGE_OTHER_SAFETY
+    family = await runtime_decision(
+        session, actor_user_id=user.id, target_user_id=(target_user_id if caller_id != target_user_id else None), action=action
+    )
+    if family.canonical:
+        return family.allowed
     if caller_id == target_user_id:
         return False
     role = (getattr(user, "role", None) or "").lower().replace("-", "_")
@@ -427,6 +435,17 @@ async def location_update(
     if target_id != str(user.id) and not _is_admin(user):
         raise HTTPException(status_code=403, detail="You can only update your own location.")
 
+    family_ai_allowed = True
+    if not _is_admin(user):
+        from app.core.family_circle_permissions import ACTION_PRODUCE_AI_PROFILE, ACTION_PRODUCE_LOCATION
+        from app.services.family_circle_runtime_authority import runtime_decision
+        loc_decision = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_LOCATION)
+        if loc_decision.canonical and not loc_decision.allowed:
+            raise HTTPException(status_code=403, detail=f"Family Circle location authority denied: {loc_decision.code}")
+        ai_decision = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_AI_PROFILE)
+        if ai_decision.canonical:
+            family_ai_allowed = ai_decision.allowed
+
     telemetry = await record_protected_telemetry(
         session,
         target_id,
@@ -464,19 +483,20 @@ async def location_update(
     # Safe Walk, SOS, or emergency escalation. Import/scheduling failure is
     # contained so existing location behavior remains authoritative.
     try:
-        from app.services.protected_behavior_advisory import (
-            record_protected_behavior_observation,
-        )
+        if family_ai_allowed:
+            from app.services.protected_behavior_advisory import (
+                record_protected_behavior_observation,
+            )
 
-        background_tasks.add_task(
-            record_protected_behavior_observation,
-            target_id,
-            req.lat,
-            req.lng,
-            speed_mps=req.speed_mps,
-            accuracy_m=req.accuracy_m,
-            captured_at=telemetry.get("updated_at"),
-        )
+            background_tasks.add_task(
+                record_protected_behavior_observation,
+                target_id,
+                req.lat,
+                req.lng,
+                speed_mps=req.speed_mps,
+                accuracy_m=req.accuracy_m,
+                captured_at=telemetry.get("updated_at"),
+            )
     except Exception as exc:
         logger.warning(
             "[PROTECTED_BEHAVIOR] background learner scheduling skipped user=%s: %s",

@@ -136,6 +136,18 @@ async def _resolve_guardian_ids(session: AsyncSession, child_user_id: str) -> tu
     child_user = (await session.execute(select(User).where(User.id == cu_uuid))).scalar_one_or_none()
     child_name = child_user.full_name if (child_user and child_user.full_name) else None
 
+    # Phase 5: Family Circle membership is authoritative for alert recipients.
+    # Emergency/SOS delivery follows plan visibility and deliberately ignores
+    # ordinary sharing pause/consent so SOS remains available.
+    try:
+        from app.services.family_circle_runtime_authority import alert_recipient_ids
+        canonical, recipients = await alert_recipient_ids(session, cu_uuid)
+        if canonical:
+            return recipients, child_name
+    except Exception as exc:
+        logger.warning("[ALERT_TRIGGER] Family Circle recipient resolution failed child=%s: %s", child_user_id, exc)
+        return [], child_name
+
     seen: set[str] = set()
     out: list[str] = []
 
@@ -235,6 +247,18 @@ async def _resolve_guardian_ids_fast(session: AsyncSession, child_user_id: str) 
     try:
         child_uuid = uuid.UUID(str(child_user_id))
     except (ValueError, AttributeError, TypeError):
+        return [], None
+
+    # Canonical Family Circle alerts do not use legacy relationship unions.
+    try:
+        from app.services.family_circle_runtime_authority import alert_recipient_ids
+        canonical, recipients = await alert_recipient_ids(session, child_uuid)
+        if canonical:
+            child = (await session.execute(select(User).where(User.id == child_uuid))).scalar_one_or_none()
+            child_name = (child.full_name or child.email) if child else None
+            return recipients, child_name
+    except Exception as exc:
+        logger.warning("[ALERT_TRIGGER] Family Circle fast recipient resolution failed child=%s: %s", child_user_id, exc)
         return [], None
 
     try:

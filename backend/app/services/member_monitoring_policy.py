@@ -103,7 +103,23 @@ async def _canonical_protected_member(session: AsyncSession, member_id: str) -> 
         {"member_id": str(member_uuid)},
     )
     row = result.mappings().first()
-    if not row or not row["is_active"] or not is_protected_member(row["role"]):
+    if not row or not row["is_active"]:
+        raise HTTPException(status_code=404, detail="Protected member not found")
+
+    # Phase 5: Family-plan/Protected-seat tracking authority supersedes legacy
+    # product-role labels. This lets a Family member remain tracked even if the
+    # historical users.role value is guardian/parent.
+    from app.services.family_circle_runtime_authority import membership_snapshot
+    family = await membership_snapshot(session, member_uuid)
+    if family is not None:
+        tracked = (family.circle.plan == "family" and family.membership.seat == "member") or (
+            family.circle.plan in {"trial", "individual"} and family.membership.seat == "protected"
+        )
+        if not tracked:
+            raise HTTPException(status_code=404, detail="Protected member not found")
+        return str(row["id"])
+
+    if not is_protected_member(row["role"]):
         raise HTTPException(status_code=404, detail="Protected member not found")
     return str(row["id"])
 
@@ -123,6 +139,18 @@ async def require_policy_read_access(
     member_id: str,
 ) -> str:
     target_id = await _canonical_protected_member(session, member_id)
+    from app.core.family_circle_permissions import ACTION_MANAGE_OTHER_SAFETY, ACTION_MANAGE_OWN_SAFETY
+    from app.services.family_circle_runtime_authority import runtime_decision
+    action = ACTION_MANAGE_OWN_SAFETY if str(actor.id) == target_id else ACTION_MANAGE_OTHER_SAFETY
+    family = await runtime_decision(
+        session, actor_user_id=actor.id,
+        target_user_id=(target_id if action == ACTION_MANAGE_OTHER_SAFETY else None),
+        action=action,
+    )
+    if family.canonical:
+        if family.allowed:
+            return target_id
+        raise HTTPException(status_code=403, detail=f"Family Circle monitoring policy denied: {family.code}")
     if str(actor.id) == target_id and is_protected_member(actor.role):
         return target_id
     return await require_policy_write_access(session, actor, target_id)
@@ -136,6 +164,28 @@ async def require_policy_write_access(
     """Only primary Guardian / authorized co-parent writes."""
     target_id = await _canonical_protected_member(session, member_id)
     role = normalize_role(actor.role)
+
+    from app.core.family_circle_permissions import ACTION_MANAGE_OTHER_SAFETY, ACTION_MANAGE_OWN_SAFETY
+    from app.services.family_circle_runtime_authority import membership_snapshot, runtime_decision
+    target_family = await membership_snapshot(session, target_id)
+    if target_family is not None:
+        if str(actor.id) == target_id:
+            family = await runtime_decision(session, actor_user_id=actor.id, action=ACTION_MANAGE_OWN_SAFETY)
+        else:
+            # No one remotely toggles another adult. Parent/admin safety
+            # configuration is permitted only for a canonical Minor.
+            if target_family.membership.role != "minor":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Another adult cannot change this member's monitoring or sharing settings.",
+                )
+            family = await runtime_decision(
+                session, actor_user_id=actor.id, target_user_id=target_id, action=ACTION_MANAGE_OTHER_SAFETY
+            )
+        if family.canonical:
+            if family.allowed:
+                return target_id
+            raise HTTPException(status_code=403, detail=f"Family Circle monitoring policy denied: {family.code}")
 
     # Phase 3: every adult controls their own monitoring/sharing consent.
     if str(actor.id) == target_id and is_protected_member(actor.role):

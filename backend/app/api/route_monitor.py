@@ -10,7 +10,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_db_session
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import User
 
 router = APIRouter(prefix="/route-monitor", tags=["route-monitor"])
@@ -31,10 +32,17 @@ class LocationUpdateRequest(BaseModel):
 @router.post("/start")
 async def start_monitoring(
     req: StartMonitorRequest,
+    session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
     """Start live route monitoring. Generates corridor and stores in Redis."""
     from app.services.route_monitor_service import start_route_monitoring
+    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY
+    from app.services.family_circle_runtime_authority import runtime_decision
+
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_ACTIVITY)
+    if family.canonical and not family.allowed:
+        raise HTTPException(403, f"Family Circle route authority denied: {family.code}")
 
     if req.mode not in ("fastest", "safest", "balanced", "night_guardian"):
         raise HTTPException(400, f"Invalid mode: {req.mode}")
@@ -68,10 +76,17 @@ async def stop_monitoring(
 @router.post("/location")
 async def update_location(
     req: LocationUpdateRequest,
+    session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
     """Process GPS location update against active route corridor."""
     from app.services.route_monitor_service import process_location_update
+    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY
+    from app.services.family_circle_runtime_authority import runtime_decision
+
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_ACTIVITY)
+    if family.canonical and not family.allowed:
+        raise HTTPException(403, f"Family Circle route authority denied: {family.code}")
 
     result = await process_location_update(str(user.id), req.lat, req.lng)
     if "error" in result:

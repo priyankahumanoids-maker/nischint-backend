@@ -56,6 +56,18 @@ async def _caller_can_manage_owned_device(
     user: User,
     owner_user_id,
 ) -> bool:
+    from app.core.family_circle_permissions import ACTION_MANAGE_OTHER_SAFETY, ACTION_PRODUCE_WEARABLE
+    from app.services.family_circle_runtime_authority import runtime_decision
+    if owner_user_id is not None:
+        action = ACTION_PRODUCE_WEARABLE if str(owner_user_id) == str(user.id) else ACTION_MANAGE_OTHER_SAFETY
+        family = await runtime_decision(
+            db, actor_user_id=user.id,
+            target_user_id=(owner_user_id if action == ACTION_MANAGE_OTHER_SAFETY else None),
+            action=action,
+        )
+        if family.canonical:
+            return family.allowed
+
     # Owner or Primary Guardian may disconnect/release a protected wearable.
     # Co-parents remain monitoring-only.
     if owner_user_id is None:
@@ -79,6 +91,24 @@ async def _caller_can_manage_owned_device(
         include_checkin_recovery=False,
     )
     return any(str(member_id) == str(owner_user_id) for member_id in linked)
+
+
+async def _require_family_wearable_producer(db: AsyncSession, user: User) -> None:
+    from app.core.family_circle_permissions import ACTION_PRODUCE_WEARABLE
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family = await runtime_decision(db, actor_user_id=user.id, action=ACTION_PRODUCE_WEARABLE)
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle wearable authority denied: {family.code}")
+
+
+async def _require_family_wearable_view(db: AsyncSession, user: User, target_user_id) -> None:
+    from app.core.family_circle_permissions import ACTION_VIEW_WEARABLE
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family = await runtime_decision(
+        db, actor_user_id=user.id, target_user_id=target_user_id, action=ACTION_VIEW_WEARABLE
+    )
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle wearable visibility denied: {family.code}")
 
 
 # ──────────────────────────────────────────────
@@ -295,6 +325,7 @@ async def register_device(
     """Register a BLE peripheral device. Returns device_id for subsequent calls."""
     await _ensure_schema(db)
     await subscription_service.require_member_entitlement(db, user.id, 'wearable')
+    await _require_family_wearable_producer(db, user)
 
     if not req.device_uid.strip():
         raise HTTPException(status_code=422, detail="A Bluetooth device identifier is required")
@@ -353,6 +384,7 @@ async def bind_device(
     """
     await _ensure_schema(db)
     await subscription_service.require_member_entitlement(db, user.id, 'wearable')
+    await _require_family_wearable_producer(db, user)
 
     if str(user.id) != str(req.user_id):
         raise HTTPException(
@@ -570,6 +602,7 @@ async def ingest_event(
     """
     await _ensure_schema(db)
     await subscription_service.require_member_entitlement(db, user.id, 'wearable')
+    await _require_family_wearable_producer(db, user)
 
     # Idempotency: skip if event_id already processed
     if req.event_id:
@@ -711,6 +744,7 @@ async def device_heartbeat(
     """Device health telemetry — battery, signal strength, connectivity check."""
     await _ensure_schema(db)
     await subscription_service.require_member_entitlement(db, user.id, 'wearable')
+    await _require_family_wearable_producer(db, user)
 
     now = datetime.now(timezone.utc)
 
@@ -793,6 +827,7 @@ async def list_devices(
 ):
     """List all wearable devices linked to the current user."""
     await _ensure_schema(db)
+    await _require_family_wearable_view(db, user, user.id)
 
     r = await db.execute(text("""
         SELECT id, device_uid, device_type, device_name, capabilities, status, battery_level,
@@ -850,7 +885,15 @@ async def list_dependent_devices(
     if not user_exists.fetchone():
         raise HTTPException(status_code=404, detail="Protected member not found")
 
-    if str(user.id) != str(dependent_id):
+    from app.services.family_circle_runtime_authority import runtime_decision
+    from app.core.family_circle_permissions import ACTION_VIEW_WEARABLE
+    family = await runtime_decision(
+        db, actor_user_id=user.id, target_user_id=dependent_id, action=ACTION_VIEW_WEARABLE
+    )
+    if family.canonical:
+        if not family.allowed:
+            raise HTTPException(status_code=403, detail=f"Family Circle wearable visibility denied: {family.code}")
+    elif str(user.id) != str(dependent_id):
         from app.services.alert_trigger import _resolve_guardian_ids
         guardian_ids, _ = await _resolve_guardian_ids(db, dependent_id)
         if str(user.id) not in {str(guardian_id) for guardian_id in guardian_ids}:

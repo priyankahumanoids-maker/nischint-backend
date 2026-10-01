@@ -104,6 +104,7 @@ from app.api.sb01_hermes import admin_router as sb01_admin_router, feedback_rout
 from app.api.emergency_stream import router as emergency_stream_router
 from app.api.subscriptions import router as subscriptions_router
 from app.api.family_circle_onboarding import router as family_circle_onboarding_router
+from app.api.family_circle_runtime import router as family_circle_runtime_router
 
 api_router = APIRouter()
 
@@ -149,6 +150,7 @@ api_router.include_router(sb01_feedback_router)
 api_router.include_router(emergency_stream_router)
 api_router.include_router(subscriptions_router)
 api_router.include_router(family_circle_onboarding_router)
+api_router.include_router(family_circle_runtime_router)
 api_router.include_router(journey_router)
 api_router.include_router(operator_router)
 api_router.include_router(my_router)

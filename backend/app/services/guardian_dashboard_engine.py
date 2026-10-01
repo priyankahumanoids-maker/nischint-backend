@@ -154,6 +154,19 @@ async def _get_linked_user_ids(
 
     normalized_role = (user_role or "").strip().lower()
 
+    # Phase 5: once a user belongs to the canonical Family Circle model, its
+    # plan/seat visibility is authoritative. Do not widen access through old
+    # relationship rows. Staff/admin operational scope remains unchanged.
+    if guardian_user_id and normalized_role not in {"admin", "operator"}:
+        try:
+            from app.services.family_circle_runtime_authority import plan_visible_target_ids
+            canonical, family_ids = await plan_visible_target_ids(session, guardian_user_id)
+            if canonical:
+                return list(family_ids)
+        except Exception as exc:
+            logger.warning("Family Circle scope resolution failed guardian=%s: %s", guardian_user_id, exc)
+            return []
+
     # Admin sees all protected-role users for oversight.
     if normalized_role == "admin":
         admin_result = await session.execute(
@@ -417,6 +430,12 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
         guardian_user_id,
         user_role,
     )
+    if guardian_user_id:
+        from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+        from app.services.family_circle_runtime_authority import filter_targets_for_action
+        user_ids = await filter_targets_for_action(
+            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION
+        )
     now = datetime.now(timezone.utc)
     from app.services.redis_service import get_user_pings
     presence_pings = get_user_pings([str(uid) for uid in user_ids])
@@ -793,6 +812,12 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
 async def get_active_sessions(session: AsyncSession, guardian_email: str, guardian_user_id: str | None = None, user_role: str | None = None) -> list[dict]:
     """Get all active sessions with batched user and alert hydration."""
     user_ids = await _get_linked_user_ids(session, guardian_email, guardian_user_id, user_role)
+    if guardian_user_id:
+        from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+        from app.services.family_circle_runtime_authority import filter_targets_for_action
+        user_ids = await filter_targets_for_action(
+            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION
+        )
     if not user_ids:
         return []
 
@@ -999,6 +1024,12 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
 async def get_session_history(session: AsyncSession, guardian_email: str, limit: int = 20, guardian_user_id: str | None = None, user_role: str | None = None) -> list[dict]:
     """Get completed journey history with grouped alert counts."""
     user_ids = await _get_linked_user_ids(session, guardian_email, guardian_user_id, user_role)
+    if guardian_user_id:
+        from app.core.family_circle_permissions import ACTION_VIEW_LOCATION_HISTORY
+        from app.services.family_circle_runtime_authority import filter_targets_for_action
+        user_ids = await filter_targets_for_action(
+            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION_HISTORY
+        )
     if not user_ids:
         return []
 

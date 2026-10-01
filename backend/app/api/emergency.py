@@ -77,6 +77,11 @@ async def _caller_can_monitor_emergency(
     if str(event_user_id) == str(user.id):
         return True
 
+    from app.services.family_circle_runtime_authority import plan_visible_target_ids
+    canonical, family_targets = await plan_visible_target_ids(session, user.id)
+    if canonical:
+        return any(str(target_id) == str(event_user_id) for target_id in family_targets)
+
     from app.services.guardian_dashboard_engine import _get_linked_user_ids
 
     linked_user_ids = await _get_linked_user_ids(
@@ -175,7 +180,13 @@ async def silent_sos(
         "admin":    False,
     }
     user_role = (getattr(user, "role", None) or "").lower()
-    if not CAN_TRIGGER_SOS.get(user_role, False):
+    from app.core.family_circle_permissions import ACTION_TRIGGER_SOS
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family_sos = await runtime_decision(session, actor_user_id=user.id, action=ACTION_TRIGGER_SOS)
+    if family_sos.canonical:
+        if not family_sos.allowed:
+            raise HTTPException(status_code=403, detail=f"Family Circle SOS authority denied: {family_sos.code}")
+    elif not CAN_TRIGGER_SOS.get(user_role, False):
         raise HTTPException(
             status_code=403,
             detail=f"Role '{user_role or 'unknown'}' cannot trigger SOS. Only protected members may emit emergency events.",

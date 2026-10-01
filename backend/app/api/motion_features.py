@@ -94,6 +94,13 @@ async def ingest_motion_features(
     that already exists is reported `status=duplicate` and the
     uploader can drop it from its retry queue."""
     user_id = current_user.id
+    if current_user.role not in ("admin", "operator"):
+        from app.core.family_circle_permissions import ACTION_PRODUCE_AI_PROFILE
+        from app.services.family_circle_runtime_authority import runtime_decision
+        family = await runtime_decision(session, actor_user_id=current_user.id, action=ACTION_PRODUCE_AI_PROFILE)
+        if family.canonical and not family.allowed:
+            raise HTTPException(status_code=403, detail=f"Family Circle AI authority denied: {family.code}")
+
     # Per-window persistence — ON CONFLICT DO NOTHING makes each
     # statement idempotent without needing a transaction-wide
     # rollback if one row collides.

@@ -203,6 +203,12 @@ async def report_voice_distress(
     user: User = Depends(get_current_user),
 ):
     """Report voice distress from mobile (keywords + scream + audio features)."""
+    from app.core.family_circle_permissions import ACTION_PRODUCE_VOICE_DISTRESS
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_VOICE_DISTRESS)
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle voice authority denied: {family.code}")
+
     import logging as _logging
     _logger = _logging.getLogger(__name__)
     _logger.info(
@@ -277,6 +283,12 @@ async def verify_voice_distress(
     3. Queues async Whisper transcription + distress analysis
     4. Returns event_id immediately (non-blocking)
     """
+    from app.core.family_circle_permissions import ACTION_PRODUCE_VOICE_DISTRESS
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_VOICE_DISTRESS)
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle voice authority denied: {family.code}")
+
     import os
     from pathlib import Path
     from app.services.whisper_verification_service import queue_whisper_verification, UPLOAD_DIR, MAX_AUDIO_BYTES
@@ -466,6 +478,11 @@ async def ingest_ai_safety_event_endpoint(
 ):
     """Evaluate/store one AI candidate and create a child confirmation when actionable."""
     from app.services.ai_safety_event_service import ingest_ai_safety_event
+    from app.core.family_circle_permissions import ACTION_PRODUCE_AI_PROFILE
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_AI_PROFILE)
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle AI authority denied: {family.code}")
 
     return await ingest_ai_safety_event(
         session,

@@ -91,6 +91,13 @@ async def ingest_motion_signal(
                 detail=f"target user_id not found: {target_user_id}",
             )
 
+    if current_user.role not in ("admin", "operator"):
+        from app.core.family_circle_permissions import ACTION_PRODUCE_AI_PROFILE
+        from app.services.family_circle_runtime_authority import runtime_decision
+        family = await runtime_decision(session, actor_user_id=current_user.id, action=ACTION_PRODUCE_AI_PROFILE)
+        if family.canonical and not family.allowed:
+            raise HTTPException(status_code=403, detail=f"Family Circle AI authority denied: {family.code}")
+
     ts = payload.timestamp or datetime.now(timezone.utc)
     bundle = {
         "fall":           round(float(payload.fall), 3),

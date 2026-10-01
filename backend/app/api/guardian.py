@@ -111,6 +111,16 @@ async def _require_journey_viewer(
     if str(journey.user_id) == str(user.id) or role in {"admin", "operator"}:
         return journey
 
+    from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family = await runtime_decision(
+        session, actor_user_id=user.id, target_user_id=journey.user_id, action=ACTION_VIEW_LOCATION
+    )
+    if family.canonical:
+        if family.allowed:
+            return journey
+        raise HTTPException(status_code=403, detail=f"Family Circle journey visibility denied: {family.code}")
+
     if is_primary_guardian(role) or is_co_guardian(role):
         from app.services.guardian_dashboard_engine import _get_linked_user_ids
 
@@ -198,6 +208,11 @@ async def start_session(
     user: User = Depends(get_current_user),
 ):
     from app.services.guardian_mode_engine import start_session as start_s
+    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_ACTIVITY)
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle Safe Walk authority denied: {family.code}")
     return await start_s(
         session, str(user.id), req.location.lat, req.location.lng,
         dest_lat=req.destination.lat if req.destination else None,
@@ -270,6 +285,11 @@ async def update_location(
     user: User = Depends(get_current_user),
 ):
     await _require_journey_owner(session, req.session_id, user)
+    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_ACTIVITY)
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle journey authority denied: {family.code}")
 
     logger.info(f"GPS_UPDATE_RECEIVED user={user.id} session={req.session_id} lat={req.location.lat} lng={req.location.lng}")
     from app.services.guardian_mode_engine import update_location as update_l

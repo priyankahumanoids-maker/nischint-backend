@@ -15,6 +15,12 @@ from app.models.user import User
 from app.models.guardian import GuardianSession
 from app.models.location_share import LocationShare
 from app.models.location_trail import LocationTrailPoint
+from app.core.family_circle_permissions import (
+    ACTION_PRODUCE_ACTIVITY,
+    ACTION_PRODUCE_AI_PROFILE,
+    ACTION_PRODUCE_LOCATION,
+)
+from app.services.family_circle_runtime_authority import runtime_decision, sharing_paused
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/location", tags=["Location Sharing"])
@@ -275,6 +281,29 @@ async def _record_trail_point(session: AsyncSession, token: str, lat: float, lng
         pass  # deviation is broadcast from the main tracking endpoint below
 
 
+async def _canonical_public_share_state(session: AsyncSession, user_id) -> tuple[bool, bool, bool, bool]:
+    """Return (canonical, location, activity, ai) for an existing public share.
+
+    Public tracking tokens are intentionally re-authorized on every read so a
+    consent withdrawal or sharing pause takes effect immediately instead of
+    remaining exposed until the token expires.
+    """
+    location = await runtime_decision(
+        session, actor_user_id=user_id, action=ACTION_PRODUCE_LOCATION
+    )
+    if not location.canonical:
+        return False, True, True, True
+    if not location.allowed or await sharing_paused(session, user_id):
+        return True, False, False, False
+    activity = await runtime_decision(
+        session, actor_user_id=user_id, action=ACTION_PRODUCE_ACTIVITY
+    )
+    ai = await runtime_decision(
+        session, actor_user_id=user_id, action=ACTION_PRODUCE_AI_PROFILE
+    )
+    return True, True, activity.allowed, ai.allowed
+
+
 # ── 1. Create share link ──
 
 @router.post("/share", response_model=CreateShareResponse)
@@ -282,7 +311,17 @@ async def create_share_link(
     body: CreateShareRequest,
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
+
 ):
+    location_auth = await runtime_decision(
+        session, actor_user_id=user.id, action=ACTION_PRODUCE_LOCATION
+    )
+    if location_auth.canonical:
+        if not location_auth.allowed:
+            raise HTTPException(403, "Location sharing is not allowed by Family Circle consent or seat policy")
+        if await sharing_paused(session, user.id):
+            raise HTTPException(403, "Location sharing is currently paused")
+
     gs = (await session.execute(
         select(GuardianSession).where(and_(
             GuardianSession.user_id == user.id, GuardianSession.status == "active",
@@ -327,6 +366,17 @@ async def get_tracking_data(
     if now > share.expires_at:
         return TrackingDataResponse(status="expired", share_name=share.share_name or "Unknown", user_name="", expires_at=share.expires_at.isoformat())
 
+    canonical, location_allowed, activity_allowed, ai_allowed = await _canonical_public_share_state(
+        session, share.user_id
+    )
+    if canonical and not location_allowed:
+        return TrackingDataResponse(
+            status="inactive",
+            share_name=share.share_name or "Unknown",
+            user_name="",
+            expires_at=share.expires_at.isoformat(),
+        )
+
     user = (await session.execute(select(User).where(User.id == share.user_id))).scalar_one_or_none()
     user_name = (user.full_name or user.email.split("@")[0]) if user else "Unknown"
 
@@ -345,14 +395,17 @@ async def get_tracking_data(
             lat=loc.get("lat") if loc else None, lng=loc.get("lng") if loc else None,
             accuracy_m=loc.get("accuracy_m") if loc else None, risk_level="SAFE", session_active=False,
             last_updated=loc.get("updated_at") if loc else None, expires_at=share.expires_at.isoformat(),
-            ai_insight=AIInsight(state="clear", title="AI INSIGHT", lines=["Last known location", "No active session", "Tracking link active"], risk_level="SAFE"),
+            ai_insight=(
+                AIInsight(state="clear", title="AI INSIGHT", lines=["Last known location", "No active session", "Tracking link active"], risk_level="SAFE")
+                if ai_allowed else None
+            ),
         )
 
     loc = gs.current_location or {}
     duration_s = int((now - gs.started_at).total_seconds()) if gs.started_at else 0
 
     # Record trail point (side effect)
-    if loc.get("lat") and loc.get("lng"):
+    if activity_allowed and loc.get("lat") and loc.get("lng"):
         await _record_trail_point(
             session, token, loc["lat"], loc["lng"], gs.speed_mps or 0.0,
             share.share_name or user_name, str(share.user_id),
@@ -371,13 +424,18 @@ async def get_tracking_data(
     return TrackingDataResponse(
         status="live", share_name=share.share_name or user_name, user_name=user_name,
         lat=loc.get("lat"), lng=loc.get("lng"), accuracy_m=loc.get("accuracy_m"),
-        heading=loc.get("heading"), speed_mps=gs.speed_mps,
-        risk_level=gs.risk_level or "SAFE", risk_score=gs.risk_score or 0.0,
-        session_active=True, destination_name=gs.destination.get("name") if gs.destination else None,
-        total_distance_m=gs.total_distance_m or 0.0, session_duration_s=duration_s,
+        heading=loc.get("heading"), speed_mps=(gs.speed_mps if activity_allowed else None),
+        risk_level=(gs.risk_level or "SAFE") if ai_allowed else "SAFE",
+        risk_score=(gs.risk_score or 0.0) if ai_allowed else 0.0,
+        session_active=True,
+        destination_name=(gs.destination.get("name") if gs.destination else None) if activity_allowed else None,
+        total_distance_m=(gs.total_distance_m or 0.0) if activity_allowed else 0.0,
+        session_duration_s=duration_s if activity_allowed else 0,
         last_updated=loc.get("updated_at"), expires_at=share.expires_at.isoformat(),
-        route_deviated=gs.route_deviated or False, route_deviation_m=gs.route_deviation_m or 0.0,
-        is_idle=gs.is_idle or False, ai_insight=_compute_ai_insight(gs),
+        route_deviated=(gs.route_deviated or False) if activity_allowed else False,
+        route_deviation_m=(gs.route_deviation_m or 0.0) if activity_allowed else 0.0,
+        is_idle=(gs.is_idle or False) if ai_allowed else False,
+        ai_insight=_compute_ai_insight(gs) if ai_allowed else None,
     )
 
 
@@ -396,6 +454,12 @@ async def get_trail_data(
 
     now = datetime.now(timezone.utc)
     if not share.is_active or now > share.expires_at:
+        return TrailResponse(trail=[], has_data=False)
+
+    canonical, location_allowed, activity_allowed, _ = await _canonical_public_share_state(
+        session, share.user_id
+    )
+    if canonical and (not location_allowed or not activity_allowed):
         return TrailResponse(trail=[], has_data=False)
 
     # Fetch trail points (last 2 hours, ordered by time)
@@ -473,6 +537,14 @@ async def get_geofence_context(
     if not share.is_active or now > share.expires_at:
         return ContextResponse(zones=[], current_zone=None, timeline=[], ai_context="Tracking link is no longer active")
 
+    canonical, location_allowed, activity_allowed, ai_allowed = await _canonical_public_share_state(
+        session, share.user_id
+    )
+    if canonical and not location_allowed:
+        return ContextResponse(zones=[], current_zone=None, timeline=[], ai_context="Location sharing is paused or unavailable")
+    if canonical and not activity_allowed:
+        return ContextResponse(zones=[], current_zone=None, timeline=[], ai_context="Route activity sharing is unavailable")
+
     # Get current location from active session or last session
     gs = (await session.execute(
         select(GuardianSession).where(and_(GuardianSession.user_id == share.user_id, GuardianSession.status == "active"))
@@ -505,6 +577,11 @@ async def get_geofence_context(
         total_distance_m=total_dist,
         total_duration_min=dur_min,
     )
+
+    if canonical and not ai_allowed:
+        # Keep geofence/route context available under background-location consent
+        # without exposing behavioural-AI interpretation.
+        ctx.ai_context = "Location safety context available"
 
     # Broadcast zone events to Command Centre (fire-and-forget, deduped in-memory)
     user_name = share.share_name or "Unknown"

@@ -55,15 +55,30 @@ async def get_protected_users(
     """
     users = []
 
-    # User.guardian_id is a relationship pointer and can also be present on
-    # caregiver/co-parent records. Filter by protected role before exposing a
-    # record as a protected member.
-    rels = (await session.execute(
-        select(User).where(and_(
-            User.guardian_id == user.id,
-            User.is_active == True,
-        ))
-    )).scalars().all()
+    # Phase 5: canonical Family Circle visibility wins when present.
+    from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+    from app.services.family_circle_runtime_authority import (
+        filter_targets_for_action, plan_visible_target_ids,
+    )
+    canonical, family_ids = await plan_visible_target_ids(session, user.id)
+    if canonical:
+        family_ids = await filter_targets_for_action(
+            session, user.id, list(family_ids), ACTION_VIEW_LOCATION
+        )
+        if family_ids:
+            rels = (await session.execute(
+                select(User).where(User.id.in_(family_ids), User.is_active == True)
+            )).scalars().all()
+        else:
+            rels = []
+    else:
+        # Legacy relationship compatibility for users not yet in Family Circle.
+        rels = (await session.execute(
+            select(User).where(and_(
+                User.guardian_id == user.id,
+                User.is_active == True,
+            ))
+        )).scalars().all()
 
     seen_ids = set()
     for u in rels:
@@ -105,25 +120,32 @@ async def get_live_status(
     except (ValueError, AttributeError):
         raise HTTPException(422, "Invalid user ID format")
 
-    # Allow self-view OR verify guardian relationship via User.guardian_id
+    # Allow self-view or the canonical Family Circle viewer relationship.
     is_self = target_uid == user.id
     if not is_self:
-        rel = (await session.execute(
-            select(User).where(and_(
-                User.id == target_uid,
-                User.guardian_id == user.id,
-                User.is_active == True,
-            )).limit(1)
-        )).scalar_one_or_none()
-
-        if not rel:
-            raise HTTPException(403, "You are not a guardian of this user")
-        if not _is_protected_member(rel):
-            raise HTTPException(403, "This account is not a protected member")
-        relationship = "family"
+        from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+        from app.services.family_circle_runtime_authority import runtime_decision
+        family = await runtime_decision(
+            session, actor_user_id=user.id, target_user_id=target_uid, action=ACTION_VIEW_LOCATION
+        )
+        if family.canonical:
+            if not family.allowed:
+                raise HTTPException(403, f"Family Circle live-location visibility denied: {family.code}")
+            relationship = "family"
+        else:
+            rel = (await session.execute(
+                select(User).where(and_(
+                    User.id == target_uid,
+                    User.guardian_id == user.id,
+                    User.is_active == True,
+                )).limit(1)
+            )).scalar_one_or_none()
+            if not rel:
+                raise HTTPException(403, "You are not a guardian of this user")
+            if not _is_protected_member(rel):
+                raise HTTPException(403, "This account is not a protected member")
+            relationship = "family"
     else:
-        # Preserve the existing personal self-safety status path without
-        # advertising the guardian as a protected-member card.
         relationship = "self"
 
     # Get target user info
@@ -319,6 +341,11 @@ async def _compute_live_risk(session: AsyncSession, user: User):
             include_checkin_recovery=False,
         )
     )
+    from app.core.family_circle_permissions import ACTION_VIEW_AI_PROFILE
+    from app.services.family_circle_runtime_authority import filter_targets_for_action
+    child_ids = set(await filter_targets_for_action(
+        session, user.id, list(child_ids), ACTION_VIEW_AI_PROFILE
+    ))
     if not child_ids:
         return []
 
