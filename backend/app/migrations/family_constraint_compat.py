@@ -223,6 +223,11 @@ def converge_constraints(bind, ddl: str):
     """Called only by Alembic, within its transaction, never by app startup."""
     if not bind.in_transaction():
         raise FamilySchemaCompatibilityError('FC preflight requires an enclosing migration transaction')
+
+    # Alembic owns NISCHINT application objects in public.  Keep pg_temp
+    # available for transaction-local reference tables used by the
+    # compatibility validator.
+    bind.execute(text("SET LOCAL search_path TO public, pg_temp"))
     for table in schema_manifest(ddl):
         actual = relation(bind, table.name)
         if actual is None:

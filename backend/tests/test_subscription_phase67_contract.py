@@ -45,8 +45,11 @@ def test_old_premium_five_member_bypass_removed():
     assert "Visa ending 4242" not in settings
 
 
-def test_subscription_ui_is_per_member():
+def test_legacy_subscription_ui_stays_isolated_from_canonical_wearable_authority():
     settings = (MOBILE / "app/(tabs)/settings.tsx").read_text(encoding="utf-8")
     assert "Each subscription includes 1 Parent + 1 Co-Parent + 1 Protected Member" in settings
     assert "The slot is consumed only after a protected member successfully joins" in settings
-    assert "Premium ₹499 required" in (MOBILE / "app/(tabs)/incidents.tsx").read_text(encoding="utf-8")
+    protection = (MOBILE / "app/(tabs)/incidents.tsx").read_text(encoding="utf-8")
+    assert "Premium ₹499 required" not in protection
+    assert "subscription.canonical" in protection
+    assert "settingsSubscriptionSummary?.canonical" in settings

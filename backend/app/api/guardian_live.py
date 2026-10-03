@@ -122,6 +122,7 @@ async def get_live_status(
 
     # Allow self-view or the canonical Family Circle viewer relationship.
     is_self = target_uid == user.id
+    can_activity = can_history = can_ai = True
     if not is_self:
         from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
         from app.services.family_circle_runtime_authority import runtime_decision
@@ -132,6 +133,16 @@ async def get_live_status(
             if not family.allowed:
                 raise HTTPException(403, f"Family Circle live-location visibility denied: {family.code}")
             relationship = "family"
+            from app.core.family_circle_permissions import (
+                ACTION_VIEW_ACTIVITY, ACTION_VIEW_LOCATION_HISTORY, ACTION_VIEW_AI_PROFILE,
+            )
+            capabilities = []
+            for action in (ACTION_VIEW_ACTIVITY, ACTION_VIEW_LOCATION_HISTORY, ACTION_VIEW_AI_PROFILE):
+                decision = await runtime_decision(
+                    session, actor_user_id=user.id, target_user_id=target_uid, action=action,
+                )
+                capabilities.append(decision.allowed)
+            can_activity, can_history, can_ai = capabilities
         else:
             rel = (await session.execute(
                 select(User).where(and_(
@@ -173,7 +184,7 @@ async def get_live_status(
             session,
             target_uid,
             datetime.now(timezone.utc),
-        )
+        ) if can_ai else None
         if isinstance(live_risk, dict):
             risk_data = {
                 "score": live_risk.get("score", 0),
@@ -267,7 +278,7 @@ async def get_live_status(
             "distance_m": round(ps.total_distance_m, 1),
         })
 
-    return {
+    response = {
         "user_id": str(target_uid),
         "user_name": target.full_name or target.email,
         "email": target.email,
@@ -285,6 +296,20 @@ async def get_live_status(
         "past_sessions": past_sessions,
         "last_update": now.isoformat(),
     }
+    from app.services.family_location_disclosure import filter_live_status, has_coordinates
+    from app.services.family_circle_audit_service import record_location_disclosure
+    response = filter_live_status(response, activity=can_activity, history=can_history, ai=can_ai)
+    if not is_self:
+        if has_coordinates((response.get("session") or {}).get("current_location")):
+            await record_location_disclosure(
+                session, subject_user_id=target_uid, viewer_user_id=user.id, view_kind="live",
+            )
+        if has_coordinates(response.get("recent_alerts")) or has_coordinates((response.get("session") or {}).get("route_points")):
+            await record_location_disclosure(
+                session, subject_user_id=target_uid, viewer_user_id=user.id, view_kind="history",
+            )
+        await session.commit()
+    return response
 
 
 @router.get("/risk")

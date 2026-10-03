@@ -235,16 +235,21 @@ async def sharing_paused(
 
     # Timed pause has expired. Reconcile it exactly once when a canonical
     # runtime/status request next touches the member. The caller owns commit.
-    await session.execute(
+    resumed = await session.execute(
         text(
             """
             UPDATE family_sharing_states
                SET paused=FALSE, pause_mode=NULL, paused_until=NULL, updated_at=:at
              WHERE user_id=:uid AND paused=TRUE AND pause_mode IN ('1h','8h')
+               AND paused_until=:until
             """
         ),
-        {"uid": str(user_id), "at": point},
+        {"uid": str(user_id), "at": point, "until": paused_until},
     )
+    if getattr(resumed, "rowcount", 1) == 0:
+        # Another request extended/replaced the pause after our read. Do not
+        # publish a resume event or allow collection from this stale decision.
+        return True
     circle_row = (
         await session.execute(
             text(
@@ -257,7 +262,7 @@ async def sharing_paused(
         )
     ).mappings().first()
     if circle_row:
-        await append_family_audit(
+        inserted = await append_family_audit(
             session,
             circle_id=circle_row["circle_id"],
             actor_user_id=None,
@@ -266,6 +271,17 @@ async def sharing_paused(
             details={"automatic": True, "paused_until": paused_until.isoformat()},
             event_key=f"auto-resume:{user_id}:{paused_until.isoformat()}",
         )
+        if inserted:
+            from app.services.family_circle_notification_outbox import enqueue_family_notifications
+            subject = await session.get(User, await _uuid(user_id))
+            _, recipients = await alert_recipient_ids(session, user_id)
+            await enqueue_family_notifications(
+                session, circle_id=circle_row["circle_id"], recipient_user_ids=recipients,
+                event_type="family_sharing_resumed", title="NISCHINT sharing update",
+                body=f'{subject.full_name if subject and subject.full_name else "A family member"} resumed location sharing.',
+                payload={"user_id": str(user_id)},
+                event_key_prefix=f"auto-resume:{user_id}:{paused_until.isoformat()}",
+            )
     return False
 
 

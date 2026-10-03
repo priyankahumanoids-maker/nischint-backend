@@ -3,7 +3,7 @@ from logging.config import fileConfig
 import os
 from dotenv import load_dotenv
 
-from sqlalchemy import pool
+from sqlalchemy import pool, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config, create_async_engine
 
@@ -42,6 +42,30 @@ if config.config_file_name is not None:
 from app.db.base import Base
 target_metadata = Base.metadata
 
+# Preserve existing revision values, including the 39-character FC06 stamp.
+# TEXT widens storage without truncating installations already using >32 chars.
+VERSION_STORAGE_DDL = (
+    "CREATE TABLE IF NOT EXISTS alembic_version (version_num TEXT NOT NULL PRIMARY KEY)",
+    "ALTER TABLE alembic_version ALTER COLUMN version_num TYPE TEXT",
+)
+
+# Either duplicate historical dp01 file may have produced a dp01/dp02 stamp.
+# ab1a2b3c4dq01 builds an ack_type index BEFORE FC07, so repair only those
+# ambiguous stamps before walking the graph. Fresh/pre-dp01 databases still
+# receive their ACK columns from the unchanged original ACK revision.
+AMBIGUOUS_ACK_DDL = """
+DO $compat$ BEGIN
+  IF EXISTS (SELECT 1 FROM alembic_version
+             WHERE version_num IN ('aa1a2b3c4dp01','aa1a2b3c4dp02')) THEN
+    ALTER TABLE guardian_alerts ADD COLUMN IF NOT EXISTS context_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE guardian_alerts ADD COLUMN IF NOT EXISTS ack_type VARCHAR(16);
+    ALTER TABLE guardian_alerts ADD COLUMN IF NOT EXISTS seen_deadline TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS ix_guardian_alerts_seen_lapse
+      ON guardian_alerts(seen_deadline) WHERE ack_type='seen';
+  END IF;
+END $compat$;
+"""
+
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode."""
@@ -54,13 +78,18 @@ def run_migrations_offline() -> None:
     )
 
     with context.begin_transaction():
+        for statement in VERSION_STORAGE_DDL:
+            context.execute(statement)
+        context.execute(AMBIGUOUS_ACK_DDL)
         context.run_migrations()
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
-
-    with context.begin_transaction():
+    with connection.begin():
+        for statement in VERSION_STORAGE_DDL:
+            connection.execute(text(statement))
+        connection.execute(text(AMBIGUOUS_ACK_DDL))
+        context.configure(connection=connection, target_metadata=target_metadata)
         context.run_migrations()
 
 

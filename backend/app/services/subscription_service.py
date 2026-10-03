@@ -273,6 +273,14 @@ async def _summary_rows_for_guardian(session: AsyncSession, guardian_id):
 
 
 async def summary_for_guardian(session: AsyncSession, actor: User) -> dict[str, Any]:
+    from app.services.family_circle_runtime_authority import canonical_membership_state, runtime_snapshot
+    if await canonical_membership_state(session, actor.id) != "legacy":
+        return {
+            "canonical": True, "guardian_user_id": str(actor.id),
+            "subscriptions": [], "free_protected_member_slots": 0,
+            "protected_member_limit_per_subscription": 0, "co_parent_included_per_subscription": 0,
+            "payment_mode": "provider_deferred", "runtime": await runtime_snapshot(session, actor.id),
+        }
     _require_primary_guardian(actor)
 
     # Fast path: summary is a pure read. Do not run CREATE INDEX / legacy
@@ -342,6 +350,9 @@ async def summary_for_guardian(session: AsyncSession, actor: User) -> dict[str, 
 
 
 async def activate_test_subscription(session: AsyncSession, actor: User, plan: str) -> dict[str, Any]:
+    # Retired UAT shortcut. Paid canonical activation requires a future
+    # server-verified provider event; no environment toggle can enable this API.
+    raise HTTPException(status_code=410, detail="Test subscription activation is disabled")
     _require_primary_guardian(actor)
     await ensure_tables()
     plan = str(plan or "").strip().lower()
@@ -374,6 +385,21 @@ async def activate_test_subscription(session: AsyncSession, actor: User, plan: s
 
 
 async def member_subscription(session: AsyncSession, member_id) -> dict[str, Any] | None:
+    from app.services.family_circle_runtime_authority import canonical_membership_state, runtime_snapshot
+    if await canonical_membership_state(session, member_id) != "legacy":
+        runtime = await runtime_snapshot(session, member_id)
+        wearable = runtime.get("can_produce_wearable") is True
+        return {
+            "canonical": True, "protected_member_user_id": str(member_id),
+            "plan": runtime.get("plan"), "status": "active" if runtime.get("entitlement") in {"active", "grace"} else "expired",
+            "price_monthly": {"trial": 0, "individual": 299, "family": 999}.get(runtime.get("plan")),
+            "entitlements": {
+                "wearable": wearable, "wearable_sos": wearable,
+                "battery_device_sync_alerts": wearable, "advanced_sensor_monitoring": wearable,
+                "ai_safety_monitoring": runtime.get("can_produce_ai") is True,
+                "emergency_sos": runtime.get("can_trigger_sos") is True,
+            },
+        }
     await ensure_tables()
     row = (
         await session.execute(
@@ -465,6 +491,8 @@ async def require_member_entitlement(session: AsyncSession, member_id, entitleme
     if not sub or sub.get("status") != "active":
         raise HTTPException(status_code=402, detail="An active subscription is required for this protected member")
     if not bool((sub.get("entitlements") or {}).get(entitlement, False)):
+        if sub.get("canonical"):
+            raise HTTPException(status_code=403, detail="Family Circle plan, seat, age or consent does not allow this feature")
         raise HTTPException(status_code=403, detail="Premium subscription required for this feature")
     return sub
 

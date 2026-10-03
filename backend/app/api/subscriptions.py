@@ -1,5 +1,5 @@
 """Day 6/7 subscription endpoints. Payment gateway intentionally deferred."""
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,7 +29,7 @@ async def activate_test_subscription(
     session: AsyncSession = Depends(get_db_session),
 ):
     """Temporary Day-6/7 activation only. No money is charged."""
-    return await subscription_service.activate_test_subscription(session, user, req.plan)
+    raise HTTPException(status_code=410, detail="Test subscription activation is disabled")
 
 
 @router.get("/member/{member_id}")

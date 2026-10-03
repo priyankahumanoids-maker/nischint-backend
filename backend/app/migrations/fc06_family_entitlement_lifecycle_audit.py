@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
-from app.db.session import engine
 
 DDL = r'''
 CREATE TABLE IF NOT EXISTS family_circle_entitlements (
@@ -66,6 +65,7 @@ CREATE INDEX IF NOT EXISTS ix_family_audit_subject_time
 
 ALTER TABLE family_circle_audit_log ADD COLUMN IF NOT EXISTS event_key VARCHAR(220) NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_family_audit_event_key ON family_circle_audit_log(event_key) WHERE event_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_family_audit_event_key_all ON family_circle_audit_log(event_key);
 
 CREATE TABLE IF NOT EXISTS family_location_view_log (
     id UUID PRIMARY KEY,
@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS family_notification_outbox (
 );
 CREATE INDEX IF NOT EXISTS ix_family_notification_outbox_recipient_pending
     ON family_notification_outbox(recipient_user_id, created_at) WHERE delivered_at IS NULL;
+ALTER TABLE family_notification_outbox ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS ix_family_outbox_due ON family_notification_outbox(next_attempt_at) WHERE delivered_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS family_age18_transitions (
     user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -125,6 +127,7 @@ CREATE TABLE IF NOT EXISTS family_age18_transitions (
 
 
 async def ensure_family_entitlement_lifecycle_audit_schema() -> None:
+    from app.db.session import engine
     async with engine.begin() as conn:
         for statement in [s.strip() for s in DDL.split(';') if s.strip()]:
             await conn.execute(text(statement))

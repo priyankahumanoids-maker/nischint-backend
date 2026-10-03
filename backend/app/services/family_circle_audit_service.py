@@ -33,7 +33,7 @@ async def append_family_audit(
             VALUES
                 (:id, :circle_id, :actor_user_id, :subject_user_id, :event_type,
                  :event_key, CAST(:event_json AS JSONB), NOW())
-            ON CONFLICT (event_key) DO NOTHING
+            ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO NOTHING
             RETURNING id
             """
         ),

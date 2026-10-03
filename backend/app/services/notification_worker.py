@@ -58,6 +58,16 @@ async def _deliver_push(recipient: str, payload: dict, session) -> bool:
 
 async def process_notification_jobs():
     """Poll pending/retrying jobs, deliver, update status."""
+    # Existing scheduler owns retries; no mobile poll or second scheduler.
+    # A separate transaction reads only committed lifecycle outbox entries.
+    from app.services.family_circle_notification_outbox import drain_family_notifications
+    async with async_session() as family_session:
+        try:
+            await drain_family_notifications(family_session)
+            await family_session.commit()
+        except Exception:
+            await family_session.rollback()
+            logger.exception("Family notification outbox drain failed")
     async with async_session() as session:
         try:
             now = datetime.now(timezone.utc)

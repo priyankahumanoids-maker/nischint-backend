@@ -22,6 +22,43 @@ SSE_PING_INTERVAL = settings.sse_ping_interval
 
 router = APIRouter(prefix="/stream", tags=["stream"])
 
+_disclosure_tasks: set[asyncio.Task] = set()
+
+
+async def _write_emergency_view(viewer_id, target_id):
+    # Independent short transaction; emergency delivery never waits for DB I/O.
+    from app.db.session import async_session
+    from app.services.family_circle_audit_service import record_location_disclosure
+    try:
+        async with async_session() as audit_session:
+            await record_location_disclosure(
+                audit_session, subject_user_id=target_id, viewer_user_id=viewer_id,
+                viewer_kind="emergency", view_kind="live",
+            )
+            await audit_session.commit()
+    except Exception:
+        logger.exception("Emergency location disclosure audit failed")
+
+
+def _encode_event(viewer: User, event: dict) -> str:
+    from app.services.family_location_disclosure import has_coordinates
+    data = event.get("data") or {}
+    target = data.get("child_id") or data.get("user_id") if isinstance(data, dict) else None
+    if (event.get("type") in {"emergency_triggered", "emergency_location_update"}
+            and target and str(target) != str(viewer.id) and has_coordinates(data)):
+        if len(_disclosure_tasks) < 128:
+            async def bounded_audit():
+                try:
+                    await asyncio.wait_for(_write_emergency_view(viewer.id, target), timeout=3)
+                except Exception:
+                    logger.warning("Emergency location disclosure audit timed out or failed")
+            task = asyncio.create_task(bounded_audit())
+            _disclosure_tasks.add(task)
+            task.add_done_callback(_disclosure_tasks.discard)
+        else:
+            logger.error("Emergency disclosure audit backlog full; delivery preserved")
+    return f"id: {event.get('id', '')}\nevent: {event.get('type', 'message')}\ndata: {json.dumps(event)}\n\n"
+
 
 async def _family_event_allowed(session: AsyncSession, viewer: User, event: dict) -> bool:
     """Re-authorize ordinary location-bearing SSE events at delivery time.
@@ -31,7 +68,7 @@ async def _family_event_allowed(session: AsyncSession, viewer: User, event: dict
     pause, consent withdrawal, entitlement expiry, leave or removal.
     """
     event_type = str(event.get("type") or "")
-    if event_type == "emergency_triggered":
+    if event_type in {"emergency_triggered", "emergency_location_update"}:
         return True
     if event_type not in {"location_update", "risk_update"}:
         return True
@@ -41,14 +78,54 @@ async def _family_event_allowed(session: AsyncSession, viewer: User, event: dict
     target = data.get("child_id") or data.get("user_id")
     if not target or str(target) == str(viewer.id):
         return True
-    from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+    from app.core.family_circle_permissions import (
+        ACTION_VIEW_LOCATION, ACTION_VIEW_AI_PROFILE, ACTION_VIEW_ACTIVITY, ACTION_VIEW_LOCATION_HISTORY,
+    )
+    from app.services.family_location_disclosure import has_coordinates
     from app.services.family_circle_runtime_authority import runtime_decision
     decision = await runtime_decision(
         session, actor_user_id=viewer.id, target_user_id=target,
-        action=ACTION_VIEW_LOCATION, record_disclosure=True,
+        action=ACTION_VIEW_LOCATION, record_disclosure=False,
     )
     if decision.canonical:
         if decision.allowed:
+            # risk_update has a distinct purpose, never an implicit location grant.
+            if event_type == "risk_update":
+                ai = await runtime_decision(session, actor_user_id=viewer.id,
+                    target_user_id=target, action=ACTION_VIEW_AI_PROFILE)
+                if not ai.allowed:
+                    await session.rollback()
+                    return False
+            else:
+                # Per-recipient copy: never redact the shared broadcaster event.
+                filtered = dict(data)
+                purpose_fields = (
+                    (ACTION_VIEW_AI_PROFILE, {"risk", "risk_level", "risk_score", "behavior_pattern", "recommendation", "factors"}),
+                    (ACTION_VIEW_ACTIVITY, {"session", "session_id", "eta_minutes", "speed", "speed_mps", "distance_m", "route_deviated"}),
+                    (ACTION_VIEW_LOCATION_HISTORY, {"trail", "route_points", "location_history"}),
+                )
+                for action, fields in purpose_fields:
+                    if fields.intersection(filtered):
+                        field_decision = await runtime_decision(session, actor_user_id=viewer.id,
+                            target_user_id=target, action=action)
+                        if not field_decision.allowed:
+                            filtered = {key: value for key, value in filtered.items() if key not in fields}
+                event["data"] = filtered
+            # Log only the fields actually surviving per-recipient filtering.
+            # Recheck the purpose at disclosure time; permission probes and
+            # redacted historical coordinates must not create a live view.
+            disclosed = event.get("data") or {}
+            history_fields = {"trail", "route_points", "location_history"}
+            for action, coordinates in (
+                (ACTION_VIEW_LOCATION, {k: v for k, v in disclosed.items() if k not in history_fields}),
+                (ACTION_VIEW_LOCATION_HISTORY, {k: v for k, v in disclosed.items() if k in history_fields}),
+            ):
+                if has_coordinates(coordinates):
+                    logged = await runtime_decision(session, actor_user_id=viewer.id,
+                        target_user_id=target, action=action, record_disclosure=True)
+                    if not logged.allowed:
+                        await session.rollback()
+                        return False
             await session.commit()
             return True
         await session.rollback()
@@ -88,11 +165,12 @@ async def _scoped_event_generator(channel: str, request: Request, meta: dict, se
         # Replay missed events (last 5 minutes) — covers disconnect gaps
         replay_events = await broadcaster.get_replay_events(channel)
         for evt in replay_events:
+            evt = dict(evt)
             if not await _family_event_allowed(session, viewer, evt):
                 continue
             event_type = evt.get("type", "message")
             event_id = evt.get("id", "")
-            yield f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(evt)}\n\n"
+            yield _encode_event(viewer, evt)
 
         while True:
             if await request.is_disconnected():
@@ -101,11 +179,12 @@ async def _scoped_event_generator(channel: str, request: Request, meta: dict, se
 
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=float(SSE_PING_INTERVAL))
+                event = dict(event)
                 if not await _family_event_allowed(session, viewer, event):
                     continue
                 event_type = event.get("type", "message")
                 event_id = event.get("id", "")
-                yield f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(event)}\n\n"
+                yield _encode_event(viewer, event)
             except asyncio.TimeoutError:
                 yield f"event: ping\ndata: {json.dumps({'ts': asyncio.get_event_loop().time()})}\n\n"
 
@@ -179,20 +258,21 @@ async def _coparent_event_generator(
         # Keep the canonical co-parent replay unchanged. Primary-channel replay
         # contributes only SOS-trigger events and is logically deduplicated.
         for event in await broadcaster.get_replay_events(user_channel):
+            event = dict(event)
             if not await _family_event_allowed(session, viewer, event):
                 continue
             if duplicate(event):
                 continue
             event_type = event.get("type", "message")
             event_id = event.get("id", "")
-            yield f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(event)}\n\n"
+            yield _encode_event(viewer, event)
 
         for event in await broadcaster.get_replay_events(primary_channel):
             if not primary_fast_allowed(event) or duplicate(event):
                 continue
             event_type = event.get("type", "message")
             event_id = event.get("id", "")
-            yield f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(event)}\n\n"
+            yield _encode_event(viewer, event)
 
         while True:
             if await request.is_disconnected():
@@ -204,6 +284,7 @@ async def _coparent_event_generator(
                     merged_queue.get(),
                     timeout=float(SSE_PING_INTERVAL),
                 )
+                event = dict(event)
                 if source == "primary" and not primary_fast_allowed(event):
                     continue
                 if source == "user" and not await _family_event_allowed(session, viewer, event):
@@ -212,7 +293,7 @@ async def _coparent_event_generator(
                     continue
                 event_type = event.get("type", "message")
                 event_id = event.get("id", "")
-                yield f"id: {event_id}\nevent: {event_type}\ndata: {json.dumps(event)}\n\n"
+                yield _encode_event(viewer, event)
             except asyncio.TimeoutError:
                 yield f"event: ping\ndata: {json.dumps({'ts': asyncio.get_event_loop().time()})}\n\n"
 
