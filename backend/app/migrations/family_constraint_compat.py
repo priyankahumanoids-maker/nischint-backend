@@ -149,19 +149,55 @@ def rows(bind, sql, **params):
     return [dict(row) for row in bind.execute(text(sql), params).mappings().all()]
 
 
-def relation(bind, name):
-    # Preserve the historical lookup first so existing behavior, pg_temp
-    # references and already-qualified objects remain unchanged.
-    found = rows(bind, RELATION_SQL, name=name)
+DIRECT_RELATION_SQL = """
+SELECT c.oid,
+       n.nspname AS schema,
+       c.relname AS name,
+       c.relkind
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relname = :relname
+   AND (
+        (:schema_name = 'pg_temp' AND c.relnamespace = pg_my_temp_schema())
+        OR
+        (:schema_name <> 'pg_temp' AND n.nspname = :schema_name)
+   )
+"""
 
-    # Real PostgreSQL/Neon may not resolve an unqualified application
-    # relation through to_regclass() immediately after additive DDL even
-    # though the canonical object exists in public.  Retry deterministically
-    # against public, without replacing or accepting any incompatible object.
-    if not found and "." not in name and '"' not in name:
-        found = rows(bind, RELATION_SQL, name="public." + name)
-
+def _direct_relation(bind, schema_name: str, relname: str):
+    found = rows(
+        bind,
+        DIRECT_RELATION_SQL,
+        schema_name=schema_name,
+        relname=relname,
+    )
     return found[0] if found else None
+
+
+def relation(bind, name):
+    # Keep the original lookup first. This preserves all previously validated
+    # behavior and quoted/legacy lookups.
+    found = rows(bind, RELATION_SQL, name=name)
+    if found:
+        return found[0]
+
+    # Explicit pg_temp objects are resolved through the current backend's
+    # actual temporary namespace rather than search_path/to_regclass.
+    if name.startswith("pg_temp."):
+        return _direct_relation(bind, "pg_temp", name.split(".", 1)[1].strip('"'))
+
+    # Explicit public identifiers may arrive quoted from qualified().
+    cleaned = name.replace('"', '')
+    if cleaned.startswith("public."):
+        return _direct_relation(bind, "public", cleaned.split(".", 1)[1])
+
+    # Family Circle application relations are canonical public-schema objects.
+    # Direct catalog lookup avoids driver/search_path/to_regclass ambiguity
+    # immediately after transactional DDL.
+    if "." not in name:
+        return _direct_relation(bind, "public", name.strip('"'))
+
+    return None
 
 
 def qualified(rel):
