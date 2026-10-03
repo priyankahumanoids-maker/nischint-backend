@@ -150,7 +150,17 @@ def rows(bind, sql, **params):
 
 
 def relation(bind, name):
+    # Preserve the historical lookup first so existing behavior, pg_temp
+    # references and already-qualified objects remain unchanged.
     found = rows(bind, RELATION_SQL, name=name)
+
+    # Real PostgreSQL/Neon may not resolve an unqualified application
+    # relation through to_regclass() immediately after additive DDL even
+    # though the canonical object exists in public.  Retry deterministically
+    # against public, without replacing or accepting any incompatible object.
+    if not found and "." not in name and '"' not in name:
+        found = rows(bind, RELATION_SQL, name="public." + name)
+
     return found[0] if found else None
 
 
