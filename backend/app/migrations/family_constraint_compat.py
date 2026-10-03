@@ -112,7 +112,7 @@ def schema_manifest(ddl: str) -> list[Table]:
     return list(tables.values())
 
 
-RELATION_SQL = """SELECT c.oid, n.nspname AS schema, c.relname AS name, c.relkind
+RELATION_SQL = """SELECT c.oid, n.nspname AS schema, c.relname AS name, c.relkind::text AS relkind
  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
  WHERE c.oid=to_regclass(:name)"""
 COLUMNS_SQL = """SELECT a.attname AS name, format_type(a.atttypid,a.atttypmod) AS type,
@@ -120,15 +120,15 @@ COLUMNS_SQL = """SELECT a.attname AS name, format_type(a.atttypid,a.atttypmod) A
  pg_get_expr(d.adbin,d.adrelid) AS default_expr
  FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
  WHERE a.attrelid=:oid AND a.attnum>0 AND NOT a.attisdropped"""
-CONSTRAINTS_SQL = """SELECT c.conname AS name, c.contype AS kind,
+CONSTRAINTS_SQL = """SELECT c.conname AS name, c.contype::text AS kind,
  ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY k(num,ord)
        JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.num ORDER BY k.ord) AS columns,
  c.condeferrable AS deferrable, c.condeferred AS deferred, c.convalidated AS validated,
  COALESCE((to_jsonb(c)->>'conenforced')::boolean, TRUE) AS enforced,
  c.connoinherit AS no_inherit, c.conindid AS index_oid,
  pg_get_constraintdef(c.oid, FALSE) AS definition,
- c.confrelid AS target_oid, c.confupdtype AS update_action,
- c.confdeltype AS delete_action, c.confmatchtype AS match_type,
+ c.confrelid AS target_oid, c.confupdtype::text AS update_action,
+ c.confdeltype::text AS delete_action, c.confmatchtype::text AS match_type,
  to_jsonb(c)->>'confdelsetcols' AS delete_columns,
  ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY k(num,ord)
        JOIN pg_attribute a ON a.attrelid=c.confrelid AND a.attnum=k.num ORDER BY k.ord) AS target_columns
@@ -149,55 +149,9 @@ def rows(bind, sql, **params):
     return [dict(row) for row in bind.execute(text(sql), params).mappings().all()]
 
 
-DIRECT_RELATION_SQL = """
-SELECT c.oid,
-       n.nspname AS schema,
-       c.relname AS name,
-       c.relkind
-  FROM pg_class c
-  JOIN pg_namespace n ON n.oid = c.relnamespace
- WHERE c.relname = :relname
-   AND (
-        (:schema_name = 'pg_temp' AND c.relnamespace = pg_my_temp_schema())
-        OR
-        (:schema_name <> 'pg_temp' AND n.nspname = :schema_name)
-   )
-"""
-
-def _direct_relation(bind, schema_name: str, relname: str):
-    found = rows(
-        bind,
-        DIRECT_RELATION_SQL,
-        schema_name=schema_name,
-        relname=relname,
-    )
-    return found[0] if found else None
-
-
 def relation(bind, name):
-    # Keep the original lookup first. This preserves all previously validated
-    # behavior and quoted/legacy lookups.
     found = rows(bind, RELATION_SQL, name=name)
-    if found:
-        return found[0]
-
-    # Explicit pg_temp objects are resolved through the current backend's
-    # actual temporary namespace rather than search_path/to_regclass.
-    if name.startswith("pg_temp."):
-        return _direct_relation(bind, "pg_temp", name.split(".", 1)[1].strip('"'))
-
-    # Explicit public identifiers may arrive quoted from qualified().
-    cleaned = name.replace('"', '')
-    if cleaned.startswith("public."):
-        return _direct_relation(bind, "public", cleaned.split(".", 1)[1])
-
-    # Family Circle application relations are canonical public-schema objects.
-    # Direct catalog lookup avoids driver/search_path/to_regclass ambiguity
-    # immediately after transactional DDL.
-    if "." not in name:
-        return _direct_relation(bind, "public", name.strip('"'))
-
-    return None
+    return found[0] if found else None
 
 
 def qualified(rel):
