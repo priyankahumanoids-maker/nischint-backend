@@ -328,6 +328,11 @@ def converge_existing_indexes(bind, statements):
         name, table = match.groups()
         actual = relation(bind, table)
         if not actual or actual['relkind'] != 'r':
+            # caregiver_statuses belongs to an optional historical risk-score lineage.
+            # Its absence must not block Family Circle convergence; if present,
+            # the existing validation path remains fail-closed.
+            if table == 'caregiver_statuses' and relation(bind, table) is None:
+                continue
             fail(table, name, 'missing or unsupported table')
         _execute(bind, table, 'lock', f'LOCK TABLE {qualified(actual)} IN ACCESS EXCLUSIVE MODE')
         _index(bind, table, actual, name, statement)
