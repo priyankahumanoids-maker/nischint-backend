@@ -8,6 +8,7 @@ from alembic import op
 from sqlalchemy import text
 
 from app.migrations.fc04_family_consent_authority import _DDL
+from app.migrations.family_constraint_compat import converge_constraints
 
 revision = "fc04_family_consent_authority"
 down_revision = "fc03_circle_plan_seat_trial"
@@ -20,9 +21,7 @@ def _statements():
 
 
 def upgrade():
-    bind = op.get_bind()
-    for statement in _statements():
-        bind.execute(text(statement))
+    converge_constraints(op.get_bind(), _DDL)
 
 
 def downgrade():

@@ -8,6 +8,7 @@ from alembic import op
 from sqlalchemy import text
 
 from app.migrations.fc06_family_entitlement_lifecycle_audit import DDL
+from app.migrations.family_constraint_compat import converge_constraints
 
 revision = "fc06_family_entitlement_lifecycle_audit"
 down_revision = "fc05_family_onboarding_invites"
@@ -21,8 +22,11 @@ def _statements():
 
 def upgrade():
     bind = op.get_bind()
+    # Establish structural authority before the existing idempotent backfill.
+    converge_constraints(bind, DDL)
     for statement in _statements():
-        bind.execute(text(statement))
+        if statement.startswith("INSERT INTO "):
+            bind.execute(text(statement))
 
 
 def downgrade():
