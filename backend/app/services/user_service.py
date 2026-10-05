@@ -51,11 +51,16 @@ async def hash_password_async(password: str) -> str:
     return await asyncio.to_thread(pwd_context.hash, password)
 
 
-async def create_user(session: AsyncSession, user_create: UserCreate) -> User:
+async def create_user(session: AsyncSession, user_create: UserCreate, *, request) -> User:
     """
     Create a new user with hashed password.
     Raises ValueError if email already exists.
     """
+    from app.services.auth_registration_admission import admit_independent_account
+    phone = await admit_independent_account(
+        session, request, phone=user_create.phone, email=user_create.email,
+        date_of_birth=user_create.date_of_birth,
+    )
     # Check if email already exists
     existing = await get_user_by_email(session, user_create.email)
     if existing:
@@ -65,6 +70,9 @@ async def create_user(session: AsyncSession, user_create: UserCreate) -> User:
     user = User(
         email=user_create.email,
         password_hash=hash_password(user_create.password),
+        full_name=user_create.full_name,
+        phone=phone,
+        date_of_birth=user_create.date_of_birth,
     )
 
     session.add(user)
@@ -117,7 +125,7 @@ async def auto_provision_cognito_user(
     """
     Auto-provision a local DB user for a Cognito-authenticated user.
     If user with this email exists, link the cognito_sub.
-    If not, create a new user.
+    Unknown identities must complete the phone/DOB registration boundary.
     """
     # Check if already linked
     existing = await get_user_by_cognito_sub(session, cognito_sub)
@@ -133,18 +141,8 @@ async def auto_provision_cognito_user(
         await session.flush()
         return by_email
 
-    # Create new user
-    user = User(
-        email=email,
-        password_hash="cognito-managed",
-        cognito_sub=cognito_sub,
-        role=role,
-        full_name=full_name,
-        phone=phone,
-    )
-    session.add(user)
-    await session.flush()
-    return user
+    from app.services.auth_registration_admission import require_registration_admission
+    require_registration_admission()
 
 
 async def get_guardian_by_invite_code(session: AsyncSession, code: str) -> User | None:

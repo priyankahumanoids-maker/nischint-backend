@@ -88,13 +88,17 @@ def test_local_reset_contract_is_hashed_one_time_and_attempt_bounded():
     assert 'PASSWORD_RESET_TTL_SECONDS = 15 * 60' in full_src
     assert "PASSWORD_RESET_MAX_ATTEMPTS = 5" in full_src
     assert "_password_reset_digest(email, code)" in store_src
-    assert "set_json" in store_src
-    assert "ttl=PASSWORD_RESET_TTL_SECONDS" in store_src
+    # AUTH-03 already moved reset state from Redis into durable PostgreSQL.
+    # 7C-2 preserves these helpers; the old Redis literals were stale.
+    assert "INSERT INTO auth_password_resets" in store_src
+    assert '"ttl_seconds": PASSWORD_RESET_TTL_SECONDS' in store_src
+    assert "await session.commit()" in store_src
 
     assert "hmac.compare_digest" in consume_src
     assert "PASSWORD_RESET_MAX_ATTEMPTS" in consume_src
-    assert "delete_key" in consume_src
-    assert "set_json" in consume_src
+    assert "DELETE FROM auth_password_resets" in consume_src
+    assert "FOR UPDATE" in consume_src
+    assert "await session.commit()" in consume_src
 
 
 def test_cognito_password_reset_contract_calls_expected_aws_operations():

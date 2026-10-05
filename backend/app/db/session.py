@@ -35,7 +35,12 @@ elif DATABASE_URL.startswith("postgresql://"):
 
 # Remove sslmode from URL (asyncpg uses 'ssl' parameter instead)
 # and handle it via connect_args
-if "sslmode=" in DATABASE_URL:
+_DB_SSL_DISABLED = (
+    "ssl=disable" in DATABASE_URL.lower()
+    or "sslmode=disable" in DATABASE_URL.lower()
+)
+
+if "sslmode=" in DATABASE_URL.lower() or "ssl=" in DATABASE_URL.lower():
     DATABASE_URL = DATABASE_URL.split("?")[0]
 
 # SSL context: encryption-required, chain not verified.
@@ -67,7 +72,7 @@ engine = create_async_engine(
     pool_recycle=1800,
     pool_pre_ping=True,
     connect_args={
-        "ssl": _ssl_ctx,
+        "ssl": _ssl_ctx if settings.db_ssl_enabled else False,
         # pgbouncer transaction-mode (Supabase port 6543) reuses physical
         # backend connections across queries — prepared statements created
         # in one query may not exist on the next backend. Disable both the

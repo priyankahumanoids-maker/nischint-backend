@@ -1,4 +1,7 @@
 # Emergency API — Silent SOS endpoints
+from datetime import datetime, timedelta, timezone
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -6,6 +9,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session as get_session
+from app.api.sos_auth import (
+    SOS_CREDENTIAL_TTL_DAYS,
+    current_local_session_id,
+    get_sos_trigger_user,
+)
+from app.core.config import settings
 from app.core.product_roles import is_primary_guardian, normalize_role
 
 router = APIRouter(prefix="/emergency", tags=["Emergency"])
@@ -23,6 +32,10 @@ class SilentSOSRequest(BaseModel):
     trigger_source: str = "hidden_button"
     cancel_pin: str | None = None
     device_metadata: dict | None = None
+
+
+class SOSCredentialIssueRequest(BaseModel):
+    installation_id: UUID
 
 
 class LocationUpdateRequest(BaseModel):
@@ -136,12 +149,57 @@ def _rate_limit_headers(result) -> dict:
     }
 
 
+@router.post("/credential")
+async def issue_emergency_credential(
+    req: SOSCredentialIssueRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(get_current_user),
+):
+    """Issue/rotate the installation-bound emergency-only credential."""
+    from app.services.auth_installation_service import associate_installation
+    from app.services.auth_sos_credential_service import rotate_sos_credential
+
+    session_id = current_local_session_id(request)
+    if session_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail="A current NISCHINT application session is required to enable emergency access.",
+        )
+
+    now = datetime.now(timezone.utc)
+    installation_id = await associate_installation(
+        session,
+        user_id=user.id,
+        session_id=session_id,
+        installation_id=req.installation_id,
+        key=settings.jwt_secret.encode("utf-8"),
+        now=now,
+    )
+    expires_at = now + timedelta(days=SOS_CREDENTIAL_TTL_DAYS)
+    credential = await rotate_sos_credential(
+        session,
+        user_id=user.id,
+        installation_id=installation_id,
+        now=now,
+        expires_at=expires_at,
+    )
+    await session.commit()
+    return {
+        "credential": credential,
+        "scope": "emergency:raise",
+        "user_id": str(user.id),
+        "installation_id": str(installation_id),
+        "expires_at": expires_at.isoformat(),
+    }
+
+
 @router.post("/silent-sos")
 async def silent_sos(
     req: SilentSOSRequest,
     request: Request,
     session: AsyncSession = Depends(get_session),
-    user=Depends(get_current_user),
+    user=Depends(get_sos_trigger_user),
 ):
     from app.services.redis_service import check_rate_limit
     from app.services.emergency_engine import (

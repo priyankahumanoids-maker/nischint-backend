@@ -13,12 +13,13 @@ class Settings(BaseSettings):
     # ── JWT ──
     jwt_secret: str = "nischint_jwt_secret_key_prod_2026"
     jwt_algorithm: str = "HS256"
-    jwt_expires_minutes: int = 60
+    jwt_expires_minutes: int = Field(default=15, ge=5, le=60)
     jwt_refresh_expires_days: int = Field(default=30, ge=1, le=365)
     family_invite_ttl_minutes: int = Field(default=15, ge=1, le=1440)
 
     # ── Database (Neon PostgreSQL) ──
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/nischint"
+    db_ssl_enabled: bool = True
 
     # ── MongoDB (legacy status checks) ──
     mongo_url: str = "mongodb://localhost:27017"

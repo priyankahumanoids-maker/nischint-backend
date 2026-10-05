@@ -34,6 +34,36 @@ def _safe_uuid(value: str | uuid.UUID | None) -> uuid.UUID | None:
         return None
 
 
+async def lock_user_auth_boundary(
+    session: AsyncSession,
+    user_id: str | uuid.UUID,
+) -> bool:
+    """Serialize refresh against user-wide credential revocation.
+
+    The existing ``users`` row is the lock point, so AUTH-05 needs no extra
+    schema.  Callers hold this transaction lock until commit/rollback.  This
+    closes the legacy/no-sid race where a refresh could validate just before
+    logout-all/password-reset bumped the user token epoch and then create a
+    new session after the global revocation committed.
+    """
+    uid = _safe_uuid(user_id)
+    if not uid:
+        return False
+
+    result = await session.execute(
+        text(
+            """
+            SELECT id
+            FROM users
+            WHERE id = CAST(:uid AS UUID)
+            FOR UPDATE
+            """
+        ),
+        {"uid": str(uid)},
+    )
+    return result.scalar_one_or_none() is not None
+
+
 def _request_metadata(request: Any | None) -> tuple[str | None, str | None, str | None]:
     if request is None:
         return None, None, None

@@ -1,13 +1,14 @@
 """AUTH-04 hashed OTP + email-verification foundation.
 
-OTP enforcement is intentionally not wired into registration/login yet.  The
-foundation is safe to deploy before a company-controlled email sender is
-configured, and can be enabled after real inbox UAT.
+Shared challenge persistence. Phone authentication passes the 7C-1 timing
+policy explicitly; existing email verification and signup proof defaults stay
+compatible. Schema application and real delivery validation are separate.
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import uuid
 from datetime import datetime, timezone
 
@@ -47,6 +48,8 @@ async def store_otp(
     email: str,
     purpose: str,
     code: str,
+    ttl_seconds: int = OTP_TTL_SECONDS,
+    cooldown_seconds: int = OTP_RESEND_COOLDOWN_SECONDS,
 ) -> int:
     """Store one hashed OTP.
 
@@ -70,7 +73,7 @@ async def store_otp(
     row = current.mappings().first()
     if row and row["resend_available_at"] is not None:
         now = datetime.now(timezone.utc)
-        retry = int((row["resend_available_at"] - now).total_seconds())
+        retry = math.ceil((row["resend_available_at"] - now).total_seconds())
         if retry > 0:
             return retry
 
@@ -108,8 +111,8 @@ async def store_otp(
             "email_hash": ehash,
             "purpose": normalized_purpose,
             "code_digest": otp_digest(email, normalized_purpose, code),
-            "ttl_seconds": OTP_TTL_SECONDS,
-            "cooldown_seconds": OTP_RESEND_COOLDOWN_SECONDS,
+            "ttl_seconds": ttl_seconds,
+            "cooldown_seconds": cooldown_seconds,
         },
     )
     return 0
@@ -121,6 +124,7 @@ async def consume_otp(
     email: str,
     purpose: str,
     code: str,
+    max_age_seconds: int | None = None,
 ) -> bool:
     ehash = email_hash(email)
     normalized_purpose = str(purpose or "").strip()[:40]
@@ -131,10 +135,14 @@ async def consume_otp(
             DELETE FROM auth_otps
             WHERE email_hash = :email_hash
               AND purpose = :purpose
-              AND expires_at <= NOW()
+              AND (
+                  expires_at <= NOW()
+                  OR (CAST(:max_age_seconds AS INTEGER) > 0 AND
+                      created_at <= clock_timestamp() - (CAST(:max_age_seconds AS INTEGER) * INTERVAL '1 second'))
+              )
             """
         ),
-        {"email_hash": ehash, "purpose": normalized_purpose},
+        {"email_hash": ehash, "purpose": normalized_purpose, "max_age_seconds": max_age_seconds or 0},
     )
 
     result = await session.execute(
@@ -145,10 +153,12 @@ async def consume_otp(
             WHERE email_hash = :email_hash
               AND purpose = :purpose
               AND expires_at > NOW()
+              AND (CAST(:max_age_seconds AS INTEGER) = 0 OR
+                   created_at > clock_timestamp() - (CAST(:max_age_seconds AS INTEGER) * INTERVAL '1 second'))
             FOR UPDATE
             """
         ),
-        {"email_hash": ehash, "purpose": normalized_purpose},
+        {"email_hash": ehash, "purpose": normalized_purpose, "max_age_seconds": max_age_seconds or 0},
     )
     row = result.mappings().first()
     if not row:

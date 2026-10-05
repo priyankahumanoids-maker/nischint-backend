@@ -9,8 +9,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
+from app.api.sos_auth import get_sos_trigger_user
 from app.core.rbac import require_role
-from app.core.product_roles import PROTECTED_MEMBER_ROLES
+from app.core.product_roles import PROTECTED_MEMBER_ROLES, normalize_role, normalize_roles
 from app.core.rate_limiter import limiter
 from app.models.user import User
 from app.services import sos_service as svc
@@ -25,6 +26,19 @@ _escape_role = require_role(sorted(_ESCAPE_ROLES))
 # protected members as well, so use the canonical product-role set rather than
 # maintaining another partial hard-coded list here.
 _trigger_role = require_role(sorted(_ESCAPE_ROLES | PROTECTED_MEMBER_ROLES))
+_TRIGGER_ROLES = normalize_roles(_ESCAPE_ROLES | PROTECTED_MEMBER_ROLES)
+
+
+async def _trigger_sos_user(user: User = Depends(get_sos_trigger_user)) -> User:
+    roles = set()
+    if getattr(user, "roles", None):
+        roles.update(normalize_roles(user.roles))
+    normalized = normalize_role(getattr(user, "role", None))
+    if normalized:
+        roles.add(normalized)
+    if not (_TRIGGER_ROLES & roles):
+        raise HTTPException(status_code=403, detail="SOS trigger role is not permitted")
+    return user
 
 
 # ── Schemas ──
@@ -105,7 +119,7 @@ async def trigger_sos(
     request: Request,
     body: SOSTrigger,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_trigger_role),
+    user: User = Depends(_trigger_sos_user),
     x_loadtest_token: Optional[str] = Header(default=None, alias="X-Loadtest-Token"),
 ):
     if _loadtest_short_circuit_allowed(x_loadtest_token):

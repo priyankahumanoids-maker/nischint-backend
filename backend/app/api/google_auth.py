@@ -1,6 +1,7 @@
 # Google OAuth Authentication
 # REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
 import logging
+from datetime import date
 from typing import Optional
 
 import httpx
@@ -29,12 +30,14 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 class GoogleCredentialRequest(BaseModel):
     credential: str  # ID token from Google Sign-In
     phone: Optional[str] = None  # required only when provisioning a brand-new account
+    date_of_birth: Optional[date] = None
 
 
 class GoogleCodeRequest(BaseModel):
     code: str  # Authorization code from Google Sign-In
     redirect_uri: str  # REMINDER: DO NOT HARDCODE THE URL, THIS BREAKS THE AUTH
     phone: Optional[str] = None  # required only when provisioning a brand-new account
+    date_of_birth: Optional[date] = None
 
 
 class GoogleAuthResponse(BaseModel):
@@ -140,6 +143,8 @@ async def _provision_google_user(
     google_info: dict,
     *,
     phone: Optional[str] = None,
+    date_of_birth: Optional[date] = None,
+    request: Optional[Request] = None,
 ) -> tuple[User, bool]:
     """
     Find or create a local user for a Google-authenticated user.
@@ -161,38 +166,10 @@ async def _provision_google_user(
         await session.flush()
         return user, False
 
-    # New social accounts must complete the same phone-identity requirement as
-    # password registration. Existing Google-linked users can sign in without
-    # resupplying a phone. This avoids creating another phone=NULL account while
-    # the mobile social-onboarding UI is still intentionally deferred.
-    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
-    if len(digits) == 10:
-        normalized_phone = f"+91{digits}"
-    elif len(digits) == 12 and digits.startswith("91"):
-        normalized_phone = f"+{digits}"
-    elif 10 <= len(digits) <= 15:
-        normalized_phone = f"+{digits}"
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "A valid mobile number is required to complete Google sign-up. "
-                "Existing accounts may sign in with Google without entering it again."
-            ),
-        )
-
-    from sqlalchemy import func, select
-    last10 = normalized_phone.lstrip("+")[-10:]
-    duplicate = await session.execute(
-        select(User.id).where(
-            func.right(func.regexp_replace(User.phone, r"\D", "", "g"), 10) == last10
-        ).limit(1)
+    from app.services.auth_registration_admission import admit_independent_account
+    normalized_phone = await admit_independent_account(
+        session, request, phone=phone, email=email, date_of_birth=date_of_birth,
     )
-    if duplicate.scalar_one_or_none() is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This mobile number is already registered. Please sign in instead.",
-        )
 
     user = User(
         email=email,
@@ -201,6 +178,7 @@ async def _provision_google_user(
         role="guardian",
         full_name=name,
         phone=normalized_phone,
+        date_of_birth=date_of_birth,
     )
     session.add(user)
     await session.flush()
@@ -283,7 +261,9 @@ async def google_auth_credential(
 
     # Find or create local user and issue the same durable AUTH-04 session
     # used by password login.
-    user, is_new = await _provision_google_user(session, google_info, phone=req.phone)
+    user, is_new = await _provision_google_user(
+        session, google_info, phone=req.phone, date_of_birth=req.date_of_birth, request=request,
+    )
     response = await _issue_google_session(
         session,
         request,
@@ -330,7 +310,9 @@ async def google_auth_code(
         )
 
     # Find or create local user and bind Google login to a durable session.
-    user, is_new = await _provision_google_user(session, google_info, phone=req.phone)
+    user, is_new = await _provision_google_user(
+        session, google_info, phone=req.phone, date_of_birth=req.date_of_birth, request=request,
+    )
     response = await _issue_google_session(
         session,
         request,

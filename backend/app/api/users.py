@@ -1,7 +1,7 @@
 # Users Router
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session
@@ -13,12 +13,13 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
+    request: Request,
     user_create: UserCreate,
     session: AsyncSession = Depends(get_db_session),
 ):
     """Create a new user."""
     try:
-        user = await user_service.create_user(session, user_create)
+        user = await user_service.create_user(session, user_create, request=request)
         return user
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

@@ -59,3 +59,31 @@ def _build_limiter() -> Limiter:
 
 
 limiter = _build_limiter()
+
+
+async def enforce_otp_limit(request, *, identity, purpose, operation, key, include_peer=True):
+    """OTP-only distributed quota boundary; never changes SOS/general fallback."""
+    import asyncio
+    from fastapi import HTTPException
+    from app.core.otp_rate_limit import check_quota, QuotaUnavailable
+    from app.services.redis_service import _get_client
+
+    # Trust only the ASGI peer established by the server. Raw forwarded headers
+    # are not identity evidence; deployment proxy policy is a separate review.
+    peer = getattr(getattr(request, "client", None), "host", None)
+    if not peer:
+        raise HTTPException(503, "OTP request origin unavailable", headers={"Retry-After": "30"})
+
+    def check():
+        try:
+            return check_quota(_get_client(), identity=identity, ip=peer,
+                               purpose=purpose, operation=operation, key=key, include_peer=include_peer)
+        except Exception:
+            raise QuotaUnavailable("Shared OTP quota unavailable") from None
+
+    try:
+        retry = await asyncio.to_thread(check)
+    except QuotaUnavailable:
+        raise HTTPException(503, "Verification temporarily unavailable", headers={"Retry-After": "30"}) from None
+    if retry:
+        raise HTTPException(429, "Too many verification requests", headers={"Retry-After": str(retry)})

@@ -19,6 +19,16 @@ from app.core.cognito import is_cognito_enabled
 from app.core.age_policy import ADULT_AGE_YEARS, calculate_age, is_minor
 from app.core.config import settings
 from app.core.rate_limiter import limiter
+from app.core.auth_foundation_policy import (
+    OTP_TTL_SECONDS as PHONE_OTP_TTL_SECONDS,
+    OTP_RESEND_COOLDOWN_SECONDS as PHONE_OTP_RESEND_SECONDS,
+)
+from app.services.auth_phone_otp_service import (
+    canonical_phone, issue_phone_code, verify_phone_code, limit_account_otp,
+)
+from app.services.auth_registration_admission import (
+    admit_independent_account, consume_registration_proof,
+)
 from app.core.product_roles import normalize_roles, select_primary_role
 from app.core.security import (
     create_access_token,
@@ -33,6 +43,7 @@ from app.services.auth_session_service import (
     bump_user_token_epoch,
     create_auth_session,
     list_auth_sessions,
+    lock_user_auth_boundary,
     revoke_all_auth_sessions,
     revoke_auth_session,
     touch_auth_session,
@@ -54,6 +65,12 @@ from app.services.auth_otp_service import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+from app.api.phone_auth import router as phone_auth_router
+from app.api.stepup_auth import router as stepup_auth_router
+from app.api.phone_change_auth import router as phone_change_auth_router
+router.include_router(phone_auth_router)
+router.include_router(stepup_auth_router)
+router.include_router(phone_change_auth_router)
 
 # Product rule: a family scanner/code is intentionally short-lived. It is
 # valid for 15 minutes at most and is consumed immediately by one successful
@@ -612,59 +629,29 @@ async def _send_email_verification_email(email: str, code: str) -> bool:
 
 # NISCHINT_SETTINGS_PHASE4F_SMS_2FA
 async def _send_sms_two_factor_code(
-    session: AsyncSession,
-    *,
-    user: User,
-    purpose: str,
-    action_label: str,
+    session: AsyncSession, *, request: Request, user: User, purpose: str, action_label: str,
 ) -> int:
-    phone = auth_two_factor_service.normalize_phone(user.phone)
-    if not phone:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "A valid mobile number is required for SMS verification. "
-                "Update your registered phone number in Profile first."
-            ),
-        )
+    phone = canonical_phone(user.phone)
     if not sms_service.is_available():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="SMS verification is temporarily unavailable.",
-        )
-
-    code = f"{secrets.randbelow(1_000_000):06d}"
-    retry_after = await store_otp(
-        session,
-        email=user.email,
-        purpose=purpose,
-        code=code,
+        raise HTTPException(503, "SMS verification is temporarily unavailable.")
+    code = await issue_phone_code(
+        session, request, phone=phone, purpose=purpose, identity=user.email,
     )
-    if retry_after > 0:
-        await session.rollback()
-        return retry_after
-
-    sent = sms_service.send_sms(
-        phone,
-        (
-            f"NISCHINT verification code: {code}. "
-            f"Use it to {action_label}. "
-            "It expires in 10 minutes. Do not share this code."
-        ),
+    await session.commit()
+    sent = await asyncio.to_thread(
+        sms_service.send_sms, phone,
+        f"NISCHINT verification code: {code}. Use it to {action_label}. "
+        "It expires in 5 minutes. Do not share this code.",
     )
     if not sent:
-        await session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="SMS verification could not be delivered. Please try again later.",
-        )
-    await session.commit()
+        raise HTTPException(503, "SMS verification could not be delivered. Please try again later.")
     return 0
 
 
 async def _maybe_begin_login_two_factor(
     session: AsyncSession,
     *,
+    request: Request,
     user: User,
     provider: str,
 ) -> Optional[TwoFactorChallengeResponse]:
@@ -691,6 +678,7 @@ async def _maybe_begin_login_two_factor(
     )
     retry_after = await _send_sms_two_factor_code(
         session,
+        request=request,
         user=user,
         purpose=auth_two_factor_service.TWO_FACTOR_LOGIN_PURPOSE,
         action_label="finish signing in",
@@ -832,36 +820,9 @@ async def _delete_signup_verified_ticket(
 
 
 async def _consume_signup_phone_verification(
-    session: AsyncSession,
-    request: Request,
-    normalized_phone: str,
+    session: AsyncSession, request: Request, normalized_phone: str, *, email=None,
 ) -> None:
-    verification_token = str(
-        request.headers.get("X-Signup-Phone-Verification") or ""
-    ).strip()
-    if not (32 <= len(verification_token) <= 160):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Mobile number verification is required before registration.",
-        )
-
-    verified = await consume_otp(
-        session,
-        email=_signup_phone_otp_identity(normalized_phone),
-        purpose=SIGNUP_PHONE_VERIFIED_PURPOSE,
-        code=verification_token,
-    )
-    if not verified:
-        # Invalid-token attempts are persisted so the existing attempt bound
-        # remains meaningful even though this request is rejected.
-        await session.commit()
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "Mobile verification expired or is no longer valid. "
-                "Please verify the number again."
-            ),
-        )
+    await consume_registration_proof(session, request, normalized_phone, email=email)
 
 
 @router.post("/check-phone")
@@ -875,64 +836,28 @@ async def check_phone(
 @router.post("/signup-phone/request", status_code=status.HTTP_202_ACCEPTED)
 @limiter.limit("5/minute")
 async def request_signup_phone_otp(
-    request: Request,
-    req: SignupPhoneOtpRequest,
+    request: Request, req: SignupPhoneOtpRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
-    normalized_phone = _require_normalized_phone(req.phone)
-    if await _phone_exists(session, normalized_phone):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This mobile number is already registered. Please sign in instead.",
-        )
+    normalized_phone = canonical_phone(req.phone)
     if not sms_service.is_available():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="SMS verification is temporarily unavailable. Please try again shortly.",
-        )
-
-    code = f"{secrets.randbelow(1_000_000):06d}"
-    identity = _signup_phone_otp_identity(normalized_phone)
-    retry_after = await store_otp(
-        session,
-        email=identity,
-        purpose=SIGNUP_PHONE_OTP_PURPOSE,
-        code=code,
+        raise HTTPException(503, "SMS verification is temporarily unavailable.")
+    code = await issue_phone_code(
+        session, request, phone=normalized_phone, purpose=SIGNUP_PHONE_OTP_PURPOSE,
     )
-    if retry_after > 0:
-        await session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"A verification code was requested recently. Try again in {retry_after} seconds.",
-            headers={"Retry-After": str(retry_after)},
-        )
-
-    # Starting a new OTP challenge invalidates any older successful signup
-    # ticket for the same phone, so a stale verification cannot be replayed.
     await _delete_signup_verified_ticket(session, normalized_phone)
-
+    await session.commit()
     sent = await asyncio.to_thread(
-        sms_service.send_sms,
-        normalized_phone,
-        (
-            f"NISCHINT verification code: {code}. "
-            "Use it to verify your mobile number for signup. "
-            "It expires in 10 minutes. Do not share this code."
-        ),
+        sms_service.send_sms, normalized_phone,
+        f"NISCHINT verification code: {code}. Use it to verify signup. "
+        "It expires in 5 minutes. Do not share this code.",
     )
     if not sent:
-        await session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The SMS verification code could not be delivered. Please try again.",
-        )
-
-    await session.commit()
+        raise HTTPException(503, "The SMS verification code could not be delivered. Please try again.")
     return {
-        "sent": True,
-        "masked_phone": _mask_signup_phone(normalized_phone),
-        "expires_in_seconds": OTP_TTL_SECONDS,
-        "resend_cooldown_seconds": OTP_RESEND_COOLDOWN_SECONDS,
+        "sent": True, "masked_phone": _mask_signup_phone(normalized_phone),
+        "expires_in_seconds": PHONE_OTP_TTL_SECONDS,
+        "resend_cooldown_seconds": PHONE_OTP_RESEND_SECONDS,
         "max_attempts": OTP_MAX_ATTEMPTS,
     }
 
@@ -940,45 +865,23 @@ async def request_signup_phone_otp(
 @router.post("/signup-phone/verify")
 @limiter.limit("10/minute")
 async def verify_signup_phone_otp(
-    request: Request,
-    req: SignupPhoneOtpVerifyRequest,
+    request: Request, req: SignupPhoneOtpVerifyRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
-    normalized_phone = _require_normalized_phone(req.phone)
-    if await _phone_exists(session, normalized_phone):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This mobile number is already registered. Please sign in instead.",
-        )
-
-    identity = _signup_phone_otp_identity(normalized_phone)
-    valid = await consume_otp(
-        session,
-        email=identity,
-        purpose=SIGNUP_PHONE_OTP_PURPOSE,
-        code=req.code,
+    normalized_phone = canonical_phone(req.phone)
+    await verify_phone_code(
+        session, request, phone=normalized_phone,
+        purpose=SIGNUP_PHONE_OTP_PURPOSE, code=req.code,
     )
-    if not valid:
-        await session.commit()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The verification code is invalid or expired.",
-        )
-
-    # The OTP itself is never carried into later screens. Exchange it for a
-    # random one-time registration ticket; only its HMAC digest is persisted.
     verification_token = secrets.token_urlsafe(32)
     await _delete_signup_verified_ticket(session, normalized_phone)
     await store_otp(
-        session,
-        email=identity,
-        purpose=SIGNUP_PHONE_VERIFIED_PURPOSE,
-        code=verification_token,
+        session, email=_signup_phone_otp_identity(normalized_phone),
+        purpose=SIGNUP_PHONE_VERIFIED_PURPOSE, code=verification_token,
     )
     await session.commit()
     return {
-        "verified": True,
-        "verification_token": verification_token,
+        "verified": True, "verification_token": verification_token,
         "masked_phone": _mask_signup_phone(normalized_phone),
         "expires_in_seconds": OTP_TTL_SECONDS,
     }
@@ -987,23 +890,14 @@ async def verify_signup_phone_otp(
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
 async def register(
-    request: Request,
-    req: RegisterRequest,
+    request: Request, req: RegisterRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
-    """
-    Register a new guardian account.
-    Uses Cognito when enabled, falls back to local auth.
-    """
-    normalized_phone = _require_normalized_phone(req.phone)
-    if await _phone_exists(session, normalized_phone):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This mobile number is already registered. Please sign in instead.",
-        )
-    _require_adult_self_registration(req.date_of_birth)
-    await _consume_signup_phone_verification(session, request, normalized_phone)
-
+    """Admit new independent adults; existing-user login remains compatible."""
+    normalized_phone = await admit_independent_account(
+        session, request, phone=req.phone, email=req.email, date_of_birth=req.date_of_birth,
+    )
+    req = req.model_copy(update={"phone": normalized_phone})
     if is_cognito_enabled():
         return await _cognito_register(req, session, request)
     return await _local_register(req, session, request)
@@ -1058,47 +952,19 @@ async def update_my_phone(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Update the signed-in user's registered mobile number.
+    """Compatibility endpoint: direct phone mutation is intentionally closed.
 
-    This also provides a safe repair path for legacy accounts that were
-    created by older clients which accidentally dropped the phone field.
+    Phase 7C-5 requires the dual-number/recovery workflow under
+    /auth/phone-change/*. Keeping this route mounted prevents old clients from
+    silently falling back to an insecure write.
     """
-    from sqlalchemy import select
     normalized_phone = _require_normalized_phone(req.phone)
-    two_factor = await auth_two_factor_service.get_sms_two_factor_state(
-        session, user_id=user.id, phone=user.phone
+    if normalized_phone == _require_normalized_phone(user.phone):
+        return {"updated": False, "phone": normalized_phone, "unchanged": True}
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Changing the registered mobile number requires fresh verification. Use the phone-change workflow.",
     )
-    _assert_two_factor_phone_change_allowed(two_factor, user.phone, normalized_phone)
-
-    if await _phone_exists(
-        session,
-        normalized_phone,
-        exclude_user_id=user.id,
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This mobile number is already registered. Please use another number.",
-        )
-
-    result = await session.execute(
-        select(User).where(User.id == user.id).with_for_update()
-    )
-    db_user = result.scalar_one_or_none()
-    if not db_user:
-        raise HTTPException(status_code=404, detail="User account not found")
-
-    db_user.phone = normalized_phone
-    await session.commit()
-
-    user_cache.invalidate_user_keys(
-        str(db_user.id),
-        str(db_user.cognito_sub or ""),
-    )
-
-    return {
-        "updated": True,
-        "phone": normalized_phone,
-    }
 
 
 class UpdateMyProfileRequest(BaseModel):
@@ -1129,24 +995,30 @@ async def update_my_profile(
                 detail="Full name cannot be empty.",
             )
 
-    normalized_phone = None
+    same_phone_payload = False
     if req.phone is not None:
-        normalized_phone = _require_normalized_phone(req.phone)
-        two_factor = await auth_two_factor_service.get_sms_two_factor_state(
-            session, user_id=user.id, phone=user.phone
-        )
-        _assert_two_factor_phone_change_allowed(two_factor, user.phone, normalized_phone)
-        if await _phone_exists(
-            session,
-            normalized_phone,
-            exclude_user_id=user.id,
-        ):
+        requested_phone = _require_normalized_phone(req.phone)
+        current_phone = _require_normalized_phone(user.phone)
+        if requested_phone != current_phone:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="This mobile number is already registered. Please use another number.",
+                detail="Changing the registered mobile number requires fresh verification. Use the phone-change workflow.",
             )
+        # Same-number payloads from older clients are harmless. Preserve their
+        # compatibility without turning this route back into a phone write path.
+        same_phone_payload = True
 
-    if requested_name is None and normalized_phone is None:
+    if requested_name is None:
+        if same_phone_payload:
+            return {
+                "updated": False,
+                "id": str(user.id),
+                "email": user.email,
+                "full_name": user.full_name,
+                "phone": user.phone,
+                "role": user.role,
+                "unchanged": True,
+            }
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No editable profile fields were provided.",
@@ -1161,8 +1033,6 @@ async def update_my_profile(
 
     if requested_name is not None:
         db_user.full_name = requested_name
-    if normalized_phone is not None:
-        db_user.phone = normalized_phone
 
     await session.commit()
     await session.refresh(db_user)
@@ -1202,6 +1072,7 @@ async def get_two_factor_status(
 
 @router.post("/two-factor/enable/request", status_code=status.HTTP_202_ACCEPTED)
 async def request_two_factor_enable(
+    request: Request,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -1214,6 +1085,7 @@ async def request_two_factor_enable(
     await auth_two_factor_service.ensure_two_factor_schema()
     retry_after = await _send_sms_two_factor_code(
         session,
+        request=request,
         user=user,
         purpose=auth_two_factor_service.TWO_FACTOR_ENABLE_PURPOSE,
         action_label="enable two-factor authentication",
@@ -1229,13 +1101,14 @@ async def request_two_factor_enable(
 
 @router.post("/two-factor/enable/confirm")
 async def confirm_two_factor_enable(
+    request: Request,
     req: TwoFactorCodeRequest,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    valid = await consume_otp(
-        session,
-        email=user.email,
+    valid = await verify_phone_code(
+        session, request, phone=user.phone,
+        identity=user.email,
         purpose=auth_two_factor_service.TWO_FACTOR_ENABLE_PURPOSE,
         code=req.code,
     )
@@ -1254,6 +1127,7 @@ async def confirm_two_factor_enable(
 
 @router.post("/two-factor/disable/request", status_code=status.HTTP_202_ACCEPTED)
 async def request_two_factor_disable(
+    request: Request,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -1264,6 +1138,7 @@ async def request_two_factor_disable(
         return {"sent": False, "enabled": False, "method": "sms"}
     retry_after = await _send_sms_two_factor_code(
         session,
+        request=request,
         user=user,
         purpose=auth_two_factor_service.TWO_FACTOR_DISABLE_PURPOSE,
         action_label="disable two-factor authentication",
@@ -1279,13 +1154,14 @@ async def request_two_factor_disable(
 
 @router.post("/two-factor/disable/confirm")
 async def confirm_two_factor_disable(
+    request: Request,
     req: TwoFactorCodeRequest,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
-    valid = await consume_otp(
-        session,
-        email=user.email,
+    valid = await verify_phone_code(
+        session, request, phone=user.phone,
+        identity=user.email,
         purpose=auth_two_factor_service.TWO_FACTOR_DISABLE_PURPOSE,
         code=req.code,
     )
@@ -1333,9 +1209,9 @@ async def verify_two_factor_login(
             detail="SMS two-factor authentication is no longer active for this account.",
         )
 
-    valid = await consume_otp(
-        session,
-        email=user.email,
+    valid = await verify_phone_code(
+        session, request, phone=user.phone,
+        identity=user.email,
         purpose=auth_two_factor_service.TWO_FACTOR_LOGIN_PURPOSE,
         code=req.code,
     )
@@ -1361,6 +1237,7 @@ async def verify_two_factor_login(
 
 @router.post("/two-factor/login/resend", status_code=status.HTTP_202_ACCEPTED)
 async def resend_two_factor_login(
+    request: Request,
     req: TwoFactorLoginResendRequest,
     session: AsyncSession = Depends(get_db_session),
 ):
@@ -1386,6 +1263,7 @@ async def resend_two_factor_login(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="SMS two-factor authentication is not active")
     retry_after = await _send_sms_two_factor_code(
         session,
+        request=request,
         user=user,
         purpose=auth_two_factor_service.TWO_FACTOR_LOGIN_PURPOSE,
         action_label="finish signing in",
@@ -1435,6 +1313,14 @@ async def refresh(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Refresh session is invalid or expired",
+            )
+
+        # Serialize local refresh with logout-all/password-reset on the existing
+        # user row. No new schema or refresh-token architecture is introduced.
+        if not await lock_user_auth_boundary(session, refresh_user_id):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh session is no longer valid",
             )
 
         result = await session.execute(
@@ -1624,10 +1510,11 @@ async def refresh(
 
 
 @router.post("/confirm")
-async def confirm(req: ConfirmRequest):
+async def confirm(request: Request, req: ConfirmRequest, session: AsyncSession = Depends(get_db_session)):
     """Confirm sign-up with verification code (Cognito only)."""
     if not is_cognito_enabled():
         raise HTTPException(status_code=400, detail="Cognito not enabled")
+    await limit_account_otp(session, request, email=req.email, purpose="cognito_confirm", operation="verify")
     from app.core.cognito import confirm_sign_up
     try:
         confirm_sign_up(req.email, req.code)
@@ -1657,6 +1544,7 @@ async def request_email_verification(
     session: AsyncSession = Depends(get_db_session),
 ):
     """Create a hashed verification OTP without enforcing it on login yet."""
+    await limit_account_otp(session, request, email=user.email, purpose=EMAIL_VERIFICATION_PURPOSE, operation="issue")
     if await is_email_verified(session, user_id=user.id, email=user.email):
         return {
             "accepted": True,
@@ -1708,6 +1596,7 @@ async def confirm_email_verification(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ):
+    await limit_account_otp(session, request, email=user.email, purpose=EMAIL_VERIFICATION_PURPOSE, operation="verify")
     if await is_email_verified(session, user_id=user.id, email=user.email):
         return {"verified": True}
 
@@ -1746,6 +1635,7 @@ async def forgot_password(
     Cognito is authoritative when enabled. Accounts that exist only in the
     local compatibility store use PostgreSQL + SendGrid fallback.
     """
+    await limit_account_otp(session, request, email=req.email, purpose="password_reset", operation="issue")
     normalized_email = _normalize_email(req.email)
     generic_response = {
         "accepted": True,
@@ -1805,6 +1695,7 @@ async def reset_password(
     """Complete Cognito or local password recovery and keep local fallback
     credentials synchronized with the new password.
     """
+    await limit_account_otp(session, request, email=req.email, purpose="password_reset", operation="verify")
     normalized_email = _normalize_email(req.email)
     cognito_reset = False
 
@@ -1860,6 +1751,11 @@ async def reset_password(
     # refresh/access credentials cannot resurrect a session after a password
     # reset.
     if user:
+        if not await lock_user_auth_boundary(session, user.id):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account is no longer available",
+            )
         user.password_hash = await user_service.hash_password_async(req.password)
         await revoke_all_auth_sessions(
             session,
@@ -1930,6 +1826,11 @@ async def logout_all(
     session: AsyncSession = Depends(get_db_session),
 ):
     """Revoke every server session and all older local token generations."""
+    if not await lock_user_auth_boundary(session, user.id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account is no longer available",
+        )
     revoked_count = await revoke_all_auth_sessions(
         session,
         user.id,
@@ -1942,6 +1843,13 @@ async def logout_all(
         text("DELETE FROM push_tokens WHERE user_id = :uid"),
         {"uid": user.id},
     )
+
+    # Commit local revocation while the auth-boundary row lock is held. External
+    # provider sign-out runs only after commit so no database lock is held across
+    # a network call. Local logout-all remains authoritative even if Cognito is
+    # temporarily unavailable.
+    await session.commit()
+    user_cache.invalidate_user_keys(str(user.id), str(user.cognito_sub or ""))
 
     provider_revoked = False
     if is_cognito_enabled() and getattr(user, "cognito_sub", None):
@@ -1956,8 +1864,6 @@ async def logout_all(
                 str(exc)[:200],
             )
 
-    await session.commit()
-    user_cache.invalidate_user_keys(str(user.id), str(user.cognito_sub or ""))
     return {
         "signed_out_all": True,
         "revoked_sessions": revoked_count,
@@ -2354,7 +2260,7 @@ async def verify_invite_code(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="This mobile number is already registered. Please sign in instead.",
             )
-        await _consume_signup_phone_verification(session, request, normalized_phone)
+        await _consume_signup_phone_verification(session, request, normalized_phone, email=req.email)
 
         canonical_role = (
             "child"
@@ -2475,7 +2381,7 @@ async def verify_invite_code(
     # The same verified-phone gate applies to invite-based protected-member
     # and co-parent signup. The one-time ticket is consumed in this transaction
     # and is restored automatically if later account creation rolls back.
-    await _consume_signup_phone_verification(session, request, normalized_phone)
+    await _consume_signup_phone_verification(session, request, normalized_phone, email=req.email)
 
     # 4. Create the new family member account linked to the guardian
     new_user = User(
@@ -2682,7 +2588,7 @@ async def _local_login(
     reset(normalized_email)
 
     two_factor_challenge = await _maybe_begin_login_two_factor(
-        session, user=user, provider="local"
+        session, request=request, user=user, provider="local"
     )
     if two_factor_challenge is not None:
         return two_factor_challenge
@@ -2910,7 +2816,7 @@ async def _cognito_login(
         )
 
     two_factor_challenge = await _maybe_begin_login_two_factor(
-        session, user=user, provider="cognito"
+        session, request=request, user=user, provider="cognito"
     )
     if two_factor_challenge is not None:
         return two_factor_challenge

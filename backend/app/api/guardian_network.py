@@ -4,7 +4,7 @@ import uuid as uuid_mod
 import secrets
 from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from sqlalchemy import select, and_, update, delete
@@ -354,25 +354,47 @@ async def update_guardian(
 @router.delete("/{relationship_id}")
 async def remove_guardian(
     relationship_id: str,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(require_role("admin", "operator", "guardian")),
 ):
-    """Remove a guardian from network (soft delete)."""
+    """Remove one legacy safety-recipient edge after fresh OTP step-up.
+
+    This remains a GuardianRelationship soft-delete only. It does not mutate
+    canonical CircleMembership, roles, seats, subscription state or consent.
+    """
     try:
         rid = uuid_mod.UUID(relationship_id)
     except (ValueError, TypeError):
         raise HTTPException(422, "Invalid ID format")
 
-    result = await session.execute(
-        update(GuardianRelationship)
+    rel = (await session.execute(
+        select(GuardianRelationship)
         .where(and_(
             GuardianRelationship.id == rid,
             GuardianRelationship.user_id == user.id,
+            GuardianRelationship.is_active == True,
         ))
-        .values(is_active=False, updated_at=datetime.now(timezone.utc))
-    )
-    if result.rowcount == 0:
+        .with_for_update()
+    )).scalar_one_or_none()
+    if rel is None:
         raise HTTPException(404, "Guardian relationship not found")
+
+    # This edge participates in legacy SOS/escalation recipient resolution.
+    # Consume the fresh proof in the SAME transaction as the soft-delete so a
+    # rollback does not burn a valid proof and a replay cannot remove another edge.
+    from app.api.stepup_auth import consume_stepup_for_action
+    await consume_stepup_for_action(
+        request,
+        session=session,
+        user=user,
+        action="member_remove",
+        target_id=rid,
+        legacy_member_namespace=True,
+    )
+
+    rel.is_active = False
+    rel.updated_at = datetime.now(timezone.utc)
     await session.commit()
     return {"status": "removed", "id": relationship_id}
 

@@ -24,7 +24,7 @@ def test_signup_otp_reuses_hashed_durable_store_and_never_returns_code():
     otp = src(OTP)
     assert 'SIGNUP_PHONE_OTP_PURPOSE = "signup_phone"' in source
     assert 'SIGNUP_PHONE_VERIFIED_PURPOSE = "signup_phone_verified"' in source
-    assert 'store_otp(' in source and 'consume_otp(' in source
+    assert 'store_otp(' in source and 'verify_phone_code(' in source
     assert 'code_digest' in otp and 'hmac.compare_digest' in otp
     request_start = source.index('async def request_signup_phone_otp(')
     verify_start = source.index('async def verify_signup_phone_otp(')
@@ -43,9 +43,13 @@ def test_verified_ticket_is_one_time_and_bound_to_normalized_phone_identity():
     consume_at = source.index('async def _consume_signup_phone_verification(')
     request_at = source.index('@router.post("/check-phone")', consume_at)
     block = source[consume_at:request_at]
-    assert 'X-Signup-Phone-Verification' in block
-    assert 'consume_otp(' in block
-    assert 'SIGNUP_PHONE_VERIFIED_PURPOSE' in block
+    assert 'consume_registration_proof(' in block
+    admission = src(ROOT / 'app/services/auth_registration_admission.py')
+    phone = src(ROOT / 'app/services/auth_phone_otp_service.py')
+    assert 'X-Signup-Phone-Verification' in admission
+    assert 'purpose=SIGNUP_PROOF' in admission
+    assert 'consume_otp(' in phone
+    assert 'SIGNUP_PROOF = "signup_phone_verified"' in phone
 
 
 def test_both_registration_paths_require_verified_phone_ticket():
@@ -53,12 +57,14 @@ def test_both_registration_paths_require_verified_phone_ticket():
     register_at = source.index('async def register(')
     login_at = source.index('@router.post("/login"', register_at)
     register_block = source[register_at:login_at]
-    assert '_consume_signup_phone_verification(session, request, normalized_phone)' in register_block
+    assert 'admit_independent_account(' in register_block
+    admission = src(ROOT / 'app/services/auth_registration_admission.py')
+    assert 'return await consume_registration_proof(' in admission
 
     invite_at = source.index('async def verify_invite_code(')
     guardian_at = source.index('# â”€â”€ My Guardian', invite_at)
     invite_block = source[invite_at:guardian_at]
-    assert '_consume_signup_phone_verification(session, request, normalized_phone)' in invite_block
+    assert '_consume_signup_phone_verification(session, request, normalized_phone, email=req.email)' in invite_block
 
 
 def test_no_plaintext_signup_otp_schema_was_added():

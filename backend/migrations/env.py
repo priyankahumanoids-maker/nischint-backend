@@ -12,6 +12,8 @@ from alembic import context
 # Load environment variables
 load_dotenv()
 
+_DB_SSL_ENABLED = os.environ.get("DB_SSL_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
@@ -26,11 +28,16 @@ elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 # Remove sslmode from URL (asyncpg uses 'ssl' parameter instead)
-if "sslmode=" in DATABASE_URL:
+_DB_SSL_DISABLED = (
+    "ssl=disable" in DATABASE_URL.lower()
+    or "sslmode=disable" in DATABASE_URL.lower()
+)
+
+if "sslmode=" in DATABASE_URL.lower() or "ssl=" in DATABASE_URL.lower():
     DATABASE_URL = DATABASE_URL.split("?")[0]
 
 # Set the sqlalchemy.url in config
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -106,7 +113,7 @@ async def run_async_migrations() -> None:
         DATABASE_URL,
         poolclass=pool.NullPool,
         connect_args={
-            "ssl": _ssl_ctx,
+            "ssl": _ssl_ctx if _DB_SSL_ENABLED else False,
             "statement_cache_size": 0,
             "prepared_statement_cache_size": 0,
         },

@@ -82,8 +82,11 @@ def test_new_registration_schema_requires_dob():
 
 def test_normal_self_registration_rejects_minors_before_consuming_phone_ticket():
     register_source = _function_source(AUTH_PATH, "register")
-    age_guard = register_source.index("_require_adult_self_registration(req.date_of_birth)")
-    consume_ticket = register_source.index("_consume_signup_phone_verification")
+    assert 'admit_independent_account(' in register_source
+    admission_path = BACKEND_ROOT / 'app/services/auth_registration_admission.py'
+    admission = _function_source(admission_path, 'admit_independent_account')
+    age_guard = admission.index("require_adult(date_of_birth)")
+    consume_ticket = admission.index("consume_registration_proof")
     assert age_guard < consume_ticket
 
     guard_source = _function_source(AUTH_PATH, "_require_adult_self_registration")
