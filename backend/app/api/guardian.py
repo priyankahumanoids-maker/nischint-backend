@@ -157,6 +157,19 @@ async def _require_journey_viewer(
     )
 
 
+async def _require_legacy_guardian_contact_management(session: AsyncSession, user: User) -> None:
+    role = normalize_role(getattr(user, "role", None))
+    if role in {"admin", "operator"}:
+        return
+    from app.services.family_circle_runtime_authority import canonical_membership_state
+    state = await canonical_membership_state(session, user.id)
+    if state != "legacy":
+        raise HTTPException(
+            status_code=409,
+            detail="This account is managed by Family Circle. Use Family Circle member management.",
+        )
+
+
 # ── Guardian CRUD ──
 
 @router.post("/add")
@@ -165,6 +178,7 @@ async def add_guardian(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    await _require_legacy_guardian_contact_management(session, user)
     from app.services.guardian_mode_engine import add_guardian as add_g
     return await add_g(session, str(user.id), req.name, req.phone, req.email, req.relationship)
 
@@ -185,6 +199,7 @@ async def remove_guardian(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    await _require_legacy_guardian_contact_management(session, user)
     import uuid
     from sqlalchemy import select
     from app.models.guardian import Guardian
@@ -225,11 +240,12 @@ async def start_session(
     user: User = Depends(get_current_user),
 ):
     from app.services.guardian_mode_engine import start_session as start_s
-    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY
+    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY, ACTION_PRODUCE_LOCATION
     from app.services.family_circle_runtime_authority import runtime_decision
-    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_ACTIVITY)
-    if family.canonical and not family.allowed:
-        raise HTTPException(status_code=403, detail=f"Family Circle Safe Walk authority denied: {family.code}")
+    for action in (ACTION_PRODUCE_ACTIVITY, ACTION_PRODUCE_LOCATION):
+        family = await runtime_decision(session, actor_user_id=user.id, action=action)
+        if family.canonical and not family.allowed:
+            raise HTTPException(status_code=403, detail=f"Family Circle Safe Walk authority denied: {family.code}")
     return await start_s(
         session, str(user.id), req.location.lat, req.location.lng,
         dest_lat=req.destination.lat if req.destination else None,
@@ -302,11 +318,12 @@ async def update_location(
     user: User = Depends(get_current_user),
 ):
     await _require_journey_owner(session, req.session_id, user)
-    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY
+    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY, ACTION_PRODUCE_LOCATION
     from app.services.family_circle_runtime_authority import runtime_decision
-    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_ACTIVITY)
-    if family.canonical and not family.allowed:
-        raise HTTPException(status_code=403, detail=f"Family Circle journey authority denied: {family.code}")
+    for action in (ACTION_PRODUCE_ACTIVITY, ACTION_PRODUCE_LOCATION):
+        family = await runtime_decision(session, actor_user_id=user.id, action=action)
+        if family.canonical and not family.allowed:
+            raise HTTPException(status_code=403, detail=f"Family Circle journey authority denied: {family.code}")
 
     logger.info(f"GPS_UPDATE_RECEIVED user={user.id} session={req.session_id} lat={req.location.lat} lng={req.location.lng}")
     from app.services.guardian_mode_engine import update_location as update_l

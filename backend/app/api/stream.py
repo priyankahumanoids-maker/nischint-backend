@@ -133,6 +133,30 @@ async def _family_event_allowed(session: AsyncSession, viewer: User, event: dict
     return True
 
 
+async def _emergency_recipient_allowed(session: AsyncSession, viewer: User, event: dict) -> bool:
+    """Re-authorize the current emergency recipient at SSE delivery time.
+
+    Emergency eligibility remains independent of ordinary sharing, pause, consent
+    and Lifeline. This check only prevents stale/legacy channels from delivering
+    another person's emergency event to a viewer who is no longer a current
+    canonical emergency recipient. Genuine legacy-to-legacy delivery is retained.
+    """
+    event_type = str(event.get("type") or "")
+    if event_type not in {"emergency_triggered", "emergency_location_update"}:
+        return True
+    data = event.get("data")
+    if not isinstance(data, dict):
+        return True
+    target = data.get("child_id") or data.get("user_id")
+    if not target or str(target) == str(viewer.id):
+        return True
+    from app.services.family_circle_runtime_authority import alert_recipient_ids
+    canonical, recipients = await alert_recipient_ids(session, target)
+    if not canonical:
+        return True
+    return str(viewer.id) in {str(uid) for uid in recipients}
+
+
 async def get_user_from_token(
     token: Optional[str] = Query(None),
     session: AsyncSession = Depends(get_db_session),
@@ -166,6 +190,8 @@ async def _scoped_event_generator(channel: str, request: Request, meta: dict, se
         replay_events = await broadcaster.get_replay_events(channel)
         for evt in replay_events:
             evt = dict(evt)
+            if not await _emergency_recipient_allowed(session, viewer, evt):
+                continue
             if not await _family_event_allowed(session, viewer, evt):
                 continue
             event_type = evt.get("type", "message")
@@ -180,6 +206,8 @@ async def _scoped_event_generator(channel: str, request: Request, meta: dict, se
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=float(SSE_PING_INTERVAL))
                 event = dict(event)
+                if not await _emergency_recipient_allowed(session, viewer, event):
+                    continue
                 if not await _family_event_allowed(session, viewer, event):
                     continue
                 event_type = event.get("type", "message")
@@ -259,6 +287,8 @@ async def _coparent_event_generator(
         # contributes only SOS-trigger events and is logically deduplicated.
         for event in await broadcaster.get_replay_events(user_channel):
             event = dict(event)
+            if not await _emergency_recipient_allowed(session, viewer, event):
+                continue
             if not await _family_event_allowed(session, viewer, event):
                 continue
             if duplicate(event):
@@ -268,7 +298,12 @@ async def _coparent_event_generator(
             yield _encode_event(viewer, event)
 
         for event in await broadcaster.get_replay_events(primary_channel):
-            if not primary_fast_allowed(event) or duplicate(event):
+            if not primary_fast_allowed(event):
+                continue
+            event = dict(event)
+            if not await _emergency_recipient_allowed(session, viewer, event):
+                continue
+            if duplicate(event):
                 continue
             event_type = event.get("type", "message")
             event_id = event.get("id", "")
@@ -286,6 +321,8 @@ async def _coparent_event_generator(
                 )
                 event = dict(event)
                 if source == "primary" and not primary_fast_allowed(event):
+                    continue
+                if not await _emergency_recipient_allowed(session, viewer, event):
                     continue
                 if source == "user" and not await _family_event_allowed(session, viewer, event):
                     continue

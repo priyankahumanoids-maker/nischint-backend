@@ -12,11 +12,41 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
 from app.core.roles import require_role
+from app.core.product_roles import normalize_role
 from app.models.user import User
 from app.models.guardian_network import GuardianRelationship, EmergencyContact, GuardianInvite
 from app.services.email_service import send_guardian_invite_email
 
 router = APIRouter(prefix="/guardian-network", tags=["Guardian Network"])
+
+
+async def _require_legacy_network_management(session: AsyncSession, user: User) -> None:
+    """Allow old GuardianNetwork mutations only for genuine legacy users.
+
+    Canonical Family Circle users must mutate membership/invites through the
+    canonical Family Circle services so legacy edges cannot become a parallel
+    authority graph. Explicit admin/operator tooling remains separate.
+    """
+    if normalize_role(getattr(user, "role", None)) in {"admin", "operator"}:
+        return
+
+    from app.services.family_circle_runtime_authority import canonical_membership_state
+    state = await canonical_membership_state(session, user.id)
+    if state != "legacy":
+        raise HTTPException(
+            status_code=409,
+            detail="This account is managed by Family Circle. Use the Family Circle member/invite APIs.",
+        )
+
+
+async def _require_legacy_inviter(session: AsyncSession, inviter_user_id) -> None:
+    from app.services.family_circle_runtime_authority import canonical_membership_state
+    state = await canonical_membership_state(session, inviter_user_id)
+    if state != "legacy":
+        raise HTTPException(
+            status_code=410,
+            detail="This legacy invite is no longer valid for a Family Circle account.",
+        )
 
 
 # ── Pydantic schemas ──
@@ -269,6 +299,7 @@ async def add_guardian(
     user: User = Depends(require_role("admin", "operator", "guardian")),
 ):
     """Add a guardian to the user's network."""
+    await _require_legacy_network_management(session, user)
     guardian_user_id = None
     if body.guardian_user_id:
         try:
@@ -317,6 +348,7 @@ async def update_guardian(
     user: User = Depends(require_role("admin", "operator", "guardian")),
 ):
     """Update a guardian relationship."""
+    await _require_legacy_network_management(session, user)
     try:
         rid = uuid_mod.UUID(relationship_id)
     except (ValueError, TypeError):
@@ -363,6 +395,7 @@ async def remove_guardian(
     This remains a GuardianRelationship soft-delete only. It does not mutate
     canonical CircleMembership, roles, seats, subscription state or consent.
     """
+    await _require_legacy_network_management(session, user)
     try:
         rid = uuid_mod.UUID(relationship_id)
     except (ValueError, TypeError):
@@ -590,6 +623,7 @@ async def create_invite(
     user: User = Depends(require_role("admin", "operator", "guardian")),
 ):
     """Create a guardian invite link. Returns the invite token and shareable URL."""
+    await _require_legacy_network_management(session, user)
     token = secrets.token_urlsafe(32)
     now = datetime.now(timezone.utc)
 
@@ -710,12 +744,15 @@ async def accept_invite(
     user: User = Depends(require_role("admin", "operator", "guardian")),
 ):
     """Accept a guardian invite. Creates the guardian relationship."""
+    await _require_legacy_network_management(session, user)
     invite = (await session.execute(
         select(GuardianInvite).where(GuardianInvite.invite_token == token)
     )).scalar_one_or_none()
 
     if not invite:
         raise HTTPException(404, "Invite not found")
+
+    await _require_legacy_inviter(session, invite.inviter_user_id)
 
     now = datetime.now(timezone.utc)
     if invite.status != "pending":
@@ -792,6 +829,7 @@ async def revoke_invite(
     user: User = Depends(require_role("admin", "operator", "guardian")),
 ):
     """Revoke a pending invite."""
+    await _require_legacy_network_management(session, user)
     invite = (await session.execute(
         select(GuardianInvite).where(and_(
             GuardianInvite.invite_token == token,

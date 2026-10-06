@@ -287,7 +287,18 @@ async def record_protected_behavior_observation(
                    AND is_active = TRUE
                  LIMIT 1
             """), {"uid": str(user_id)})).first()
-            if not user_row or _normalize_role(user_row.role) not in PROTECTED_ROLES:
+            if not user_row:
+                return
+
+            from app.core.family_circle_permissions import ACTION_PRODUCE_AI_PROFILE
+            from app.services.family_circle_runtime_authority import runtime_decision
+            eligibility = await runtime_decision(
+                session, actor_user_id=user_id, action=ACTION_PRODUCE_AI_PROFILE,
+            )
+            if eligibility.canonical:
+                if not eligibility.allowed:
+                    return
+            elif _normalize_role(user_row.role) not in PROTECTED_ROLES:
                 return
 
             previous = (await session.execute(text("""
@@ -705,6 +716,34 @@ async def _deliver_advisory(
 
     guardian_ids = await _resolve_guardian_ids(session, user_id)
     guardian_ids = list(dict.fromkeys(str(gid) for gid in guardian_ids if gid))
+
+    # Behavioral advisories are AI-purpose disclosures, not implicit location
+    # disclosures. Re-check each canonical recipient at delivery time.
+    try:
+        from app.core.family_circle_permissions import ACTION_VIEW_AI_PROFILE
+        from app.services.family_circle_runtime_authority import (
+            canonical_membership_state, runtime_decision,
+        )
+        target_state = await canonical_membership_state(session, user_id)
+        if target_state != "legacy":
+            allowed_guardians: list[str] = []
+            for guardian_id in guardian_ids:
+                decision = await runtime_decision(
+                    session,
+                    actor_user_id=guardian_id,
+                    target_user_id=user_id,
+                    action=ACTION_VIEW_AI_PROFILE,
+                )
+                if decision.allowed:
+                    allowed_guardians.append(guardian_id)
+            guardian_ids = allowed_guardians
+    except Exception as exc:
+        logger.warning(
+            "[PROTECTED_BEHAVIOR] canonical advisory audience resolution failed user=%s: %s",
+            user_id, exc,
+        )
+        guardian_ids = []
+
     if not guardian_ids:
         return
 
@@ -826,7 +865,20 @@ async def get_protected_behavior_summary(session, user_id: str) -> dict:
             "state": "unavailable",
             "reason": "protected_member_not_found",
         }
-    if _normalize_role(user_row.role) not in PROTECTED_ROLES:
+    from app.core.family_circle_permissions import ACTION_PRODUCE_AI_PROFILE
+    from app.services.family_circle_runtime_authority import runtime_decision
+    eligibility = await runtime_decision(
+        session, actor_user_id=user_id, action=ACTION_PRODUCE_AI_PROFILE,
+    )
+    if eligibility.canonical:
+        if not eligibility.allowed:
+            return {
+                "user_id": str(user_id),
+                "status": "unavailable",
+                "state": "unavailable",
+                "reason": eligibility.code,
+            }
+    elif _normalize_role(user_row.role) not in PROTECTED_ROLES:
         return {
             "user_id": str(user_id),
             "status": "unavailable",

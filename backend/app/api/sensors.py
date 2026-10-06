@@ -11,12 +11,34 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 from typing import Optional
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.product_roles import normalize_role
 
 from app.api.deps import get_current_user, get_db_session
 from app.models import User
 
 router = APIRouter(prefix="/sensors", tags=["sensors"])
+
+
+async def _require_event_owner_or_staff(
+    session: AsyncSession, user: User, model, event_id: str, *, label: str,
+):
+    try:
+        event_uuid = __import__("uuid").UUID(str(event_id))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=404, detail=f"{label} event not found")
+
+    event = (await session.execute(select(model).where(model.id == event_uuid))).scalar_one_or_none()
+    if event is None:
+        raise HTTPException(status_code=404, detail=f"{label} event not found")
+
+    if normalize_role(getattr(user, "role", None)) in {"admin", "operator"}:
+        return event
+    if str(event.user_id) != str(user.id):
+        raise HTTPException(status_code=403, detail=f"Not authorized for this {label} event")
+    return event
 
 
 class FallReportRequest(BaseModel):
@@ -90,8 +112,10 @@ async def auto_sos(
     user: User = Depends(get_current_user),
 ):
     """Trigger auto-SOS for unresolved fall (user didn't respond in time)."""
+    from app.models.fall_event import FallEvent
     from app.services.fall_detection_service import trigger_auto_sos
 
+    await _require_event_owner_or_staff(session, user, FallEvent, event_id, label="fall")
     result = await trigger_auto_sos(session, event_id)
     return result
 
@@ -143,7 +167,13 @@ async def check_wandering(
     user: User = Depends(get_current_user),
 ):
     """Check user location against safe zones. Detect wandering."""
+    from app.core.family_circle_permissions import ACTION_PRODUCE_LOCATION
+    from app.services.family_circle_runtime_authority import runtime_decision
     from app.services.wandering_detection_service import check_wandering
+
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_LOCATION)
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle location authority denied: {family.code}")
 
     result = await check_wandering(session, str(user.id), req.lat, req.lng, req.speed, req.heading)
     return result
@@ -357,8 +387,10 @@ async def get_voice_verification(
     user: User = Depends(get_current_user),
 ):
     """Get verification status and result for a voice distress event."""
+    from app.models.voice_distress_event import VoiceDistressEvent
     from app.services.whisper_verification_service import get_verification_status
 
+    await _require_event_owner_or_staff(session, user, VoiceDistressEvent, event_id, label="voice distress")
     result = await get_verification_status(session, event_id)
     if "error" in result:
         raise HTTPException(404, result["error"])
@@ -371,9 +403,11 @@ async def re_verify_voice_event(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    """Guardian requests re-verification of a past voice event."""
+    """Re-verify a past voice event for its owner or explicit staff."""
+    from app.models.voice_distress_event import VoiceDistressEvent
     from app.services.whisper_verification_service import verify_voice_event
 
+    await _require_event_owner_or_staff(session, user, VoiceDistressEvent, event_id, label="voice distress")
     result = await verify_voice_event(session, event_id, audio_path=None)
     if "error" in result:
         raise HTTPException(404, result["error"])

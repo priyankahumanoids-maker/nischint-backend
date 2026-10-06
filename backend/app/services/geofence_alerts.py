@@ -467,10 +467,24 @@ def _compute_state(distance_m: float, radius_m: float, prev_state: GeoState | No
 
 
 async def _resolve_guardian_ids(session: AsyncSession, child_user_id: str) -> list[str]:
-    """Resolve all guardian user_ids linked to a protected member.
+    """Resolve current recipients for ordinary location disclosure.
 
-    Redis cache (namespace `geofence:guardians`, TTL 10min).
+    Canonical Family Circle authority is recalculated on every publish so a
+    stale Redis cache can never outlive pause, consent withdrawal, leave or
+    removal. The legacy 10-minute cache remains only for genuine legacy users.
     """
+    try:
+        from app.services.family_circle_runtime_authority import location_recipient_ids
+        canonical, recipients = await location_recipient_ids(session, child_user_id)
+        if canonical:
+            return list(dict.fromkeys(str(uid) for uid in recipients if uid))
+    except Exception as exc:
+        logger.warning(
+            "[GEOFENCE] canonical location recipient resolution failed child=%s: %s",
+            child_user_id, exc,
+        )
+        return []
+
     from app.services.redis_service import get_json, set_json
     cached = get_json("geofence:guardians", child_user_id)
     if cached is not None and isinstance(cached, dict) and "ids" in cached:

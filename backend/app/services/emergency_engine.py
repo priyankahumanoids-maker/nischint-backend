@@ -77,50 +77,23 @@ async def _resolve_fast_guardians_v64(
     session: AsyncSession,
     child_user_id: str,
 ) -> tuple[list[str], str]:
-    """Primary guardian + current co-parent path in at most two DB reads."""
+    """Resolve first SOS recipients through the canonical-first resolver.
+
+    The shared alert resolver already preserves genuine legacy compatibility
+    while making Family Circle membership authoritative for canonical users.
+    This prevents the first low-latency SOS fan-out from leaking to stale
+    guardian/co-parent links before the later canonical pass runs.
+    """
     try:
-        child_uuid = uuid.UUID(str(child_user_id))
-    except (ValueError, TypeError, AttributeError):
+        from app.services.alert_trigger import _resolve_guardian_ids_fast
+        guardian_ids, child_name = await _resolve_guardian_ids_fast(session, child_user_id)
+        return guardian_ids, child_name or "Protected member"
+    except Exception as exc:
+        logger.warning(
+            "[SOS_FAST_RESOLVE_V64] canonical-first resolution failed child=%s error=%s",
+            child_user_id, exc,
+        )
         return [], "Protected member"
-
-    child = await session.get(User, child_uuid)
-    if child is None:
-        return [], "Protected member"
-
-    child_name = child.full_name or "Protected member"
-    guardian_ids: list[str] = []
-
-    primary_guardian_id = getattr(child, "guardian_id", None)
-    if primary_guardian_id:
-        primary = str(primary_guardian_id)
-        guardian_ids.append(primary)
-
-        try:
-            from app.core.product_roles import is_co_guardian
-
-            co_parent_rows = (
-                await session.execute(
-                    select(User).where(
-                        User.guardian_id == primary_guardian_id,
-                        User.is_active.is_(True),
-                    )
-                )
-            ).scalars().all()
-
-            for candidate in co_parent_rows:
-                if not is_co_guardian(candidate.role):
-                    continue
-                candidate_id = str(candidate.id)
-                if candidate_id not in guardian_ids:
-                    guardian_ids.append(candidate_id)
-        except Exception as exc:
-            logger.warning(
-                "[SOS_FAST_RESOLVE_V64] co-parent lookup failed child=%s error=%s",
-                child_user_id,
-                exc,
-            )
-
-    return guardian_ids, child_name
 
 
 async def _guardian_realtime_after_response_v64(

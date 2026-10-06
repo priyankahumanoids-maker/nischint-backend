@@ -12,6 +12,7 @@ from app.models.device import Device
 from app.models.senior import Senior
 from app.schemas.telemetry import TelemetryResponse
 from app.services import telemetry_service
+from app.services.family_circle_runtime_authority import canonical_membership_state
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
@@ -53,7 +54,21 @@ async def get_device_telemetry(
     Device must belong to a senior under the authenticated guardian.
     Returns records ordered by created_at desc.
     """
-    # Verify device belongs to guardian's senior
+    # Legacy Device/Senior rows do not carry an authoritative canonical
+    # protected-user/wearer binding. Once an identity is owned by Family Circle
+    # authority, do not let stale Senior.guardian_id relationships release old
+    # telemetry. Genuine legacy users retain the historical compatibility path.
+    family_state = await canonical_membership_state(session, current_user.id)
+    if family_state != "legacy":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Legacy device telemetry is unavailable for Family Circle identities; "
+                "use the canonical wearable/member telemetry path"
+            ),
+        )
+
+    # Verify device belongs to guardian's senior for genuine legacy users only.
     device = await verify_device_ownership(session, device_id, current_user.id)
     
     if not device:

@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
-from app.core.rbac import require_role
+from app.core.product_roles import normalize_role
 from app.models.user import User
 from app.services import voice_trigger_service as svc
 
@@ -18,7 +18,26 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/voice-trigger", tags=["voice-trigger"])
 
-_escape_role = require_role(["guardian", "operator", "admin"])
+
+
+
+async def _require_voice_authority(session: AsyncSession, user: User) -> None:
+    role = normalize_role(getattr(user, "role", None))
+    if role in {"admin", "operator"}:
+        return
+
+    from app.core.family_circle_permissions import ACTION_PRODUCE_VOICE_DISTRESS
+    from app.services.family_circle_runtime_authority import runtime_decision
+
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_VOICE_DISTRESS)
+    if family.canonical:
+        if not family.allowed:
+            raise HTTPException(status_code=403, detail=f"Family Circle voice authority denied: {family.code}")
+        return
+
+    if role != "guardian":
+        raise HTTPException(status_code=403, detail="Voice trigger access not permitted")
+
 
 UPLOAD_DIR = Path("/tmp/nischint_voice_trigger")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,8 +58,9 @@ class RecognizeRequest(BaseModel):
 @router.get("/commands")
 async def list_commands(
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_escape_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_voice_authority(session, user)
     await svc.ensure_defaults(session, user.id)
     await session.commit()
     commands = await svc.list_commands(session, user.id)
@@ -51,8 +71,9 @@ async def list_commands(
 async def create_command(
     body: CommandCreate,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_escape_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_voice_authority(session, user)
     return await svc.create_command(session, user.id, body.model_dump())
 
 
@@ -60,8 +81,9 @@ async def create_command(
 async def delete_command(
     cmd_id: str,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_escape_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_voice_authority(session, user)
     ok = await svc.delete_command(session, user.id, uuid.UUID(cmd_id))
     if not ok:
         raise HTTPException(status_code=404, detail="Command not found or is default")
@@ -72,8 +94,9 @@ async def delete_command(
 async def recognize_voice(
     body: RecognizeRequest,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_escape_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_voice_authority(session, user)
     return await svc.recognize_and_trigger(session, user.id, body.transcribed_text)
 
 
@@ -81,12 +104,13 @@ async def recognize_voice(
 async def recognize_audio(
     audio: UploadFile = File(...),
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_escape_role),
+    user: User = Depends(get_current_user),
 ):
     """
     Accept audio file, transcribe via OpenAI Whisper, then match against
     configured voice commands. Returns transcription + trigger result.
     """
+    await _require_voice_authority(session, user)
     # Validate file size
     contents = await audio.read()
     if len(contents) > MAX_AUDIO_BYTES:
@@ -134,7 +158,8 @@ async def recognize_audio(
 async def trigger_history(
     limit: int = 20,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_escape_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_voice_authority(session, user)
     logs = await svc.get_history(session, user.id, limit)
     return {"history": logs, "count": len(logs)}

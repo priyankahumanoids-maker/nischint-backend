@@ -20,7 +20,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db_session
+from app.api.deps import get_db_session, get_current_user
+from app.core.product_roles import normalize_role
+from app.core.roles import require_role
+from app.models.user import User
 from app.services.behavioral import (
     ANOMALY_PIPELINE_VERSION,
     BASELINE_VERSION,
@@ -37,10 +40,52 @@ from app.services.behavioral.trust import (
 router = APIRouter(prefix="/behavioral", tags=["behavioral-twin"])
 
 
+async def _require_behavioral_subject_access(
+    session: AsyncSession, user: User, entity_id: uuid.UUID,
+) -> None:
+    """Authorize disclosure of one person-bound Behavioral AI profile.
+
+    Canonical Family Circle users are checked with the shared AI-profile
+    permission. Genuine legacy users retain self-only compatibility.
+    Admin/operator access remains an explicit staff boundary.
+    """
+    subject = await session.get(User, entity_id)
+    if subject is None:
+        raise HTTPException(status_code=404, detail="Behavioral subject not found")
+
+    if normalize_role(getattr(user, "role", None)) in {"admin", "operator"}:
+        return
+
+    from app.core.family_circle_permissions import ACTION_VIEW_AI_PROFILE
+    from app.services.family_circle_runtime_authority import runtime_decision
+
+    decision = await runtime_decision(
+        session,
+        actor_user_id=user.id,
+        target_user_id=entity_id,
+        action=ACTION_VIEW_AI_PROFILE,
+    )
+    if decision.canonical:
+        if not decision.allowed:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Family Circle Behavioral AI authority denied: {decision.code}",
+            )
+        return
+
+    # Genuine legacy compatibility is deliberately self-only here.
+    if str(user.id) != str(entity_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this Behavioral AI profile")
+
+
+_staff_behavioral = require_role("admin", "operator")
+
+
 @router.get("/baseline/{entity_id}")
 async def get_baseline(
     entity_id: str,
     session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Return the warm baseline for an entity. `status='cold_start'`
     when no row exists yet."""
@@ -48,6 +93,8 @@ async def get_baseline(
         eid = uuid.UUID(entity_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid entity_id UUID")
+
+    await _require_behavioral_subject_access(session, user, eid)
 
     row = (await session.execute(text("""
         SELECT zone_affinity, route_entropy, dwell_duration,
@@ -89,6 +136,7 @@ async def list_anomalies(
     entity_id: str,
     limit: int = Query(50, ge=1, le=500),
     session: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Newest-first anomaly ledger view. Bounded — defaults to 50,
     capped at 500 per request."""
@@ -96,6 +144,8 @@ async def list_anomalies(
         eid = uuid.UUID(entity_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid entity_id UUID")
+
+    await _require_behavioral_subject_access(session, user, eid)
 
     rows = (await session.execute(text("""
         SELECT id, anomaly_type, anomaly_score, deviation_class,
@@ -133,6 +183,7 @@ async def list_anomalies(
 @router.get("/metrics")
 async def get_metrics(
     session: AsyncSession = Depends(get_db_session),
+    _staff: User = Depends(_staff_behavioral),
 ) -> dict:
     """Operator-chip aggregate. Gated metrics (MAE + critical
     precision/recall) only surface when the ledger has at least
@@ -220,6 +271,7 @@ async def get_metrics(
 @router.get("/dlq")
 async def get_dlq_recent(
     limit: int = Query(50, ge=1, le=500),
+    _staff: User = Depends(_staff_behavioral),
 ) -> dict:
     """Operator introspection of the append-only DLQ ring buffer.
     Useful for post-mortem reconstruction when the Postgres
@@ -277,6 +329,7 @@ def _write_trust_level(level: str) -> None:
 @router.get("/trust")
 async def get_trust(
     session: AsyncSession = Depends(get_db_session),
+    _staff: User = Depends(_staff_behavioral),
 ) -> dict:
     """Operator Trust Calibration Layer (Twin Trust Tile).
 
@@ -498,6 +551,7 @@ async def _maybe_emit_trust_level_changed(
 @router.get("/trust/badge")
 async def get_trust_badge(
     session: AsyncSession = Depends(get_db_session),
+    _staff: User = Depends(_staff_behavioral),
 ) -> dict:
     """Three-field trust badge for cheap polling. Locked shape:
 

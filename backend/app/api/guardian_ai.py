@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session, get_current_user
-from app.core.rbac import require_role
+from app.core.product_roles import normalize_role
 from app.models.user import User
 from app.services import guardian_ai_service as svc
 
@@ -16,7 +16,26 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/guardian-ai", tags=["guardian-ai"])
 
-_ai_role = require_role(["guardian", "operator", "admin"])
+
+
+
+
+async def _require_ai_authority(session: AsyncSession, user: User) -> None:
+    role = normalize_role(getattr(user, "role", None))
+    if role in {"admin", "operator"}:
+        return
+
+    from app.core.family_circle_permissions import ACTION_PRODUCE_AI_PROFILE
+    from app.services.family_circle_runtime_authority import runtime_decision
+
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_AI_PROFILE)
+    if family.canonical:
+        if not family.allowed:
+            raise HTTPException(status_code=403, detail=f"Family Circle AI authority denied: {family.code}")
+        return
+
+    if role != "guardian":
+        raise HTTPException(status_code=403, detail="Guardian AI access not permitted")
 
 
 class ConfigUpdate(BaseModel):
@@ -41,8 +60,9 @@ class RespondAction(BaseModel):
 @router.get("/config")
 async def get_config(
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_ai_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_ai_authority(session, user)
     config = await svc.get_or_create_config(session, user.id)
     await session.commit()
     return config
@@ -52,8 +72,9 @@ async def get_config(
 async def update_config(
     body: ConfigUpdate,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_ai_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_ai_authority(session, user)
     return await svc.update_config(session, user.id, body.model_dump(exclude_unset=True))
 
 
@@ -61,8 +82,9 @@ async def update_config(
 async def predict_risk(
     body: PredictRisk,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_ai_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_ai_authority(session, user)
     return await svc.predict_risk(session, user.id, lat=body.lat, lng=body.lng)
 
 
@@ -70,8 +92,9 @@ async def predict_risk(
 async def accept_action(
     prediction_id: str,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_ai_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_ai_authority(session, user)
     result = await svc.respond_to_prediction(
         session, user.id, uuid.UUID(prediction_id), "accept",
     )
@@ -84,8 +107,9 @@ async def accept_action(
 async def dismiss_prediction(
     prediction_id: str,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_ai_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_ai_authority(session, user)
     result = await svc.respond_to_prediction(
         session, user.id, uuid.UUID(prediction_id), "dismiss",
     )
@@ -98,7 +122,8 @@ async def dismiss_prediction(
 async def prediction_history(
     limit: int = 20,
     session: AsyncSession = Depends(get_db_session),
-    user: User = Depends(_ai_role),
+    user: User = Depends(get_current_user),
 ):
+    await _require_ai_authority(session, user)
     predictions = await svc.get_history(session, user.id, limit)
     return {"predictions": predictions, "count": len(predictions)}

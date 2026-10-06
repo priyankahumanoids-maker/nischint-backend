@@ -48,10 +48,20 @@ async def get_alerts(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
-    """Get recent alerts. Guardian sees alerts for loved ones. Child sees check-ins addressed to them."""
-    if is_protected_member(user.role):
+    """Get recent alerts using canonical audience semantics when available."""
+    from app.services.family_circle_runtime_authority import membership_snapshot
+
+    snapshot = await membership_snapshot(session, user.id)
+    if snapshot is not None:
+        # Trial/Individual Protected users consume their own check-in stream.
+        # Family-plan members are mutual peers regardless of legacy display role.
+        if snapshot.circle.plan in {"trial", "individual"} and snapshot.membership.seat == "protected":
+            from app.services.guardian_dashboard_engine import get_child_alerts
+            return {"alerts": await get_child_alerts(session, str(user.id), limit)}
+    elif is_protected_member(user.role):
         from app.services.guardian_dashboard_engine import get_child_alerts
         return {"alerts": await get_child_alerts(session, str(user.id), limit)}
+
     from app.services.guardian_dashboard_engine import get_alerts as _get
     return {"alerts": await _get(session, user.email, limit, str(user.id), user_role=getattr(user, "role", None))}
 
@@ -95,18 +105,30 @@ async def end_session(
     if not authorized and caller_role in {"admin", "operator"}:
         authorized = True
 
-    if not authorized and is_primary_guardian(caller_role):
-        linked_user_ids = await _get_linked_user_ids(
+    if not authorized and caller_role not in {"admin", "operator"}:
+        from app.core.family_circle_permissions import ACTION_MANAGE_OTHER_SAFETY
+        from app.services.family_circle_runtime_authority import runtime_decision
+
+        family = await runtime_decision(
             session,
-            user.email,
-            str(user.id),
-            getattr(user, "role", None),
-            include_checkin_recovery=False,
+            actor_user_id=user.id,
+            target_user_id=journey.user_id,
+            action=ACTION_MANAGE_OTHER_SAFETY,
         )
-        authorized = any(
-            str(linked_id) == str(journey.user_id)
-            for linked_id in linked_user_ids
-        )
+        if family.canonical:
+            authorized = family.allowed
+        elif is_primary_guardian(caller_role):
+            linked_user_ids = await _get_linked_user_ids(
+                session,
+                user.email,
+                str(user.id),
+                getattr(user, "role", None),
+                include_checkin_recovery=False,
+            )
+            authorized = any(
+                str(linked_id) == str(journey.user_id)
+                for linked_id in linked_user_ids
+            )
 
     if not authorized:
         raise HTTPException(

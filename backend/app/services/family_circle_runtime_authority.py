@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.age_policy import is_minor
 from app.core.family_consent_policy import CURRENT_FAMILY_NOTICE_VERSION
 from app.core.family_circle_permissions import (
+    ACTION_PRODUCE_LOCATION,
     ACTION_VIEW_LOCATION,
     ACTION_VIEW_LOCATION_HISTORY,
     ACTION_VIEW_AI_PROFILE,
@@ -297,6 +298,8 @@ async def runtime_decision(
     if actor is None:
         state = await canonical_membership_state(session, actor_user_id)
         if state == "legacy":
+            if target_user_id is not None and await canonical_membership_state(session, target_user_id) != "legacy":
+                return RuntimeDecision(True, False, "target_owned_by_family_circle")
             return RuntimeDecision(False, False, "legacy_fallback")
         return RuntimeDecision(True, False, "former_family_circle_member" if state == "former" else "canonical_authority_unavailable")
 
@@ -328,6 +331,12 @@ async def runtime_decision(
         target_consent=target_consent,
     )
     decision = permission_decision(ctx, action)
+
+    # This action authorizes ordinary GPS collection, not emergency location.
+    # Existing callers and runtime_snapshot inherit pause without changing SOS.
+    if (decision.allowed and action == ACTION_PRODUCE_LOCATION
+            and await sharing_paused(session, actor.membership.user_id)):
+        return RuntimeDecision(True, False, "sharing_paused")
 
     if (
         decision.allowed
@@ -392,10 +401,8 @@ async def filter_targets_for_action(
     *,
     record_disclosures: bool = False,
 ) -> list[uuid.UUID]:
-    actor = await membership_snapshot(session, actor_user_id)
-    if actor is None:
-        state = await canonical_membership_state(session, actor_user_id)
-        return list(candidate_ids) if state == "legacy" else []
+    # Use the same two-sided authority boundary as individual requests.
+    # Noncanonical candidates retain the caller\'s existing legacy scope.
     allowed: list[uuid.UUID] = []
     for target_id in candidate_ids:
         decision = await runtime_decision(
@@ -405,7 +412,7 @@ async def filter_targets_for_action(
             action=action,
             record_disclosure=record_disclosures,
         )
-        if decision.allowed:
+        if decision.allowed or not decision.canonical:
             allowed.append(target_id)
     return allowed
 

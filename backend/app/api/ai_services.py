@@ -381,10 +381,22 @@ async def get_protected_behavior_summary_api(
     except (ValueError, TypeError, AttributeError):
         raise HTTPException(status_code=422, detail="Invalid protected-member user ID")
 
-    from app.api.geofence import _can_view_safety
+    from app.core.family_circle_permissions import ACTION_VIEW_AI_PROFILE
+    from app.core.product_roles import normalize_role
+    from app.services.family_circle_runtime_authority import runtime_decision
 
-    if not await _can_view_safety(session, user, user_id):
-        raise HTTPException(status_code=403, detail="Not authorized for this protected member")
+    if normalize_role(getattr(user, "role", None)) not in {"admin", "operator"}:
+        family = await runtime_decision(
+            session,
+            actor_user_id=user.id,
+            target_user_id=user_id,
+            action=ACTION_VIEW_AI_PROFILE,
+        )
+        if family.canonical:
+            if not family.allowed:
+                raise HTTPException(status_code=403, detail=f"Family Circle AI authority denied: {family.code}")
+        elif str(user.id) != str(user_id):
+            raise HTTPException(status_code=403, detail="Not authorized for this protected member")
 
     from app.services.protected_behavior_advisory import (
         get_protected_behavior_summary,

@@ -21,6 +21,20 @@ async def ingest_telemetry(
     - metric_type="sos" → critical severity incident
     - metric_type="fall_detected" → high severity incident
     """
+    # Phase 7C-6 legacy containment: this historical endpoint has no device
+    # credential binding. Preserve non-emergency telemetry compatibility, but
+    # never allow an unauthenticated device identifier to manufacture SOS/fall
+    # incidents. Current mobile safety flows use authenticated /wearable/event
+    # and /sensors/fall instead.
+    if telemetry_create.metric_type in {"sos", "fall_detected"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Legacy telemetry cannot create emergency incidents; use an "
+                "authenticated wearable/sensor safety endpoint"
+            ),
+        )
+
     try:
         telemetry = await telemetry_service.ingest_telemetry(session, telemetry_create)
         return telemetry

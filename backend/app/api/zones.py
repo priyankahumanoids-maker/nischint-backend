@@ -9,6 +9,15 @@ from app.models import User
 router = APIRouter(prefix="/zones", tags=["zones"])
 
 
+async def _require_own_safety_authority(session: AsyncSession, user: User) -> None:
+    from app.core.family_circle_permissions import ACTION_MANAGE_OWN_SAFETY
+    from app.services.family_circle_runtime_authority import runtime_decision
+
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_MANAGE_OWN_SAFETY)
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle zone authority denied: {family.code}")
+
+
 class CreateZoneRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     lat: float = Field(..., ge=-90, le=90)
@@ -23,6 +32,7 @@ async def create_zone(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    await _require_own_safety_authority(session, user)
     from app.services.wandering_detection_service import create_safe_zone
 
     if req.zone_type not in ("home", "school", "care_facility", "custom"):
@@ -37,6 +47,7 @@ async def list_zones(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    await _require_own_safety_authority(session, user)
     from app.services.wandering_detection_service import get_safe_zones
 
     zones = await get_safe_zones(session, str(user.id))
@@ -49,6 +60,7 @@ async def remove_zone(
     session: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ):
+    await _require_own_safety_authority(session, user)
     from app.services.wandering_detection_service import delete_safe_zone
 
     result = await delete_safe_zone(session, zone_id, str(user.id))

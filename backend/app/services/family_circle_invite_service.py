@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.age_policy import is_minor
 from app.core.family_circle_permissions import (
+    ACTION_INVITE_MEMBER,
     PLAN_FAMILY,
     PLAN_INDIVIDUAL,
     PLAN_TRIAL,
@@ -152,6 +153,36 @@ async def _lock_circle(session: AsyncSession, circle_id: uuid.UUID) -> None:
     )
 
 
+async def _require_invite_authority(
+    session: AsyncSession, actor_user_id: uuid.UUID, circle_id: uuid.UUID,
+) -> FamilyCircle:
+    """Recheck current sponsor under the caller's Circle lock.
+
+    Refresh ORM state and lock membership so an old role/sponsor snapshot
+    cannot authorize issuance or acceptance. The caller owns the transaction.
+    """
+    from app.services.family_circle_runtime_authority import runtime_decision
+
+    membership = (await session.execute(
+        select(CircleMembership).where(
+            CircleMembership.user_id == actor_user_id,
+            CircleMembership.circle_id == circle_id,
+            CircleMembership.status == "active",
+        ).execution_options(populate_existing=True).with_for_update()
+    )).scalar_one_or_none()
+    circle = await session.get(FamilyCircle, circle_id, populate_existing=True)
+    sponsor = await session.get(User, actor_user_id, populate_existing=True)
+    if (membership is None or circle is None or circle.status != "active"
+            or not circle.plan or sponsor is None or not sponsor.is_active):
+        raise FamilyInviteError("Invitation sponsor no longer has active Circle authority.")
+    decision = await runtime_decision(
+        session, actor_user_id=actor_user_id, action=ACTION_INVITE_MEMBER,
+    )
+    if not decision.canonical or not decision.allowed:
+        raise FamilyInviteError(f"Family Circle invitation authority denied: {decision.code}")
+    return circle
+
+
 async def _expire_pending_invites(session: AsyncSession, circle_id: uuid.UUID, now: datetime) -> None:
     await session.execute(
         text(
@@ -220,6 +251,9 @@ async def create_invite(
     if actor_membership.role not in {"owner", "co_admin"}:
         raise FamilyInviteError("Only the Owner or Co-Admin can invite members.")
 
+    await _lock_circle(session, circle.id)
+    circle = await _require_invite_authority(session, actor.id, circle.id)
+
     kind = str(invitee_kind or "adult").strip().lower()
     if kind not in {"adult", "minor"}:
         raise FamilyInviteError("Invitee type must be adult or minor.")
@@ -243,7 +277,6 @@ async def create_invite(
     if point.tzinfo is None:
         point = point.replace(tzinfo=timezone.utc)
 
-    await _lock_circle(session, circle.id)
     await _expire_pending_invites(session, circle.id, point)
 
     capacity = seat_capacity(circle.plan, seat)
@@ -422,9 +455,9 @@ async def accept_invite_for_user(
     else:
         role = CIRCLE_ROLE_ADULT_MEMBER
 
-    circle = await session.get(FamilyCircle, row["circle_id"])
-    if circle is None or circle.status != "active" or circle.plan is None:
-        raise FamilyInviteError("Family Circle is not active.")
+    circle = await _require_invite_authority(
+        session, row["created_by_user_id"], row["circle_id"],
+    )
 
     try:
         validate_seat_for_membership(circle.plan, str(row["seat"]), role)

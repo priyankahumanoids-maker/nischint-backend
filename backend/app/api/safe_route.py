@@ -42,7 +42,13 @@ async def generate_route(
 
     Returns 3 route options with per-segment risk scoring and color coding.
     """
+    from app.core.family_circle_permissions import ACTION_MANAGE_OWN_SAFETY
+    from app.services.family_circle_runtime_authority import runtime_decision
     from app.services.safe_route_engine import generate_safe_routes
+
+    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_MANAGE_OWN_SAFETY)
+    if family.canonical and not family.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle Safe Route authority denied: {family.code}")
 
     if req.mode not in ("fastest", "safest", "balanced", "night_guardian"):
         raise HTTPException(400, f"Invalid mode: {req.mode}. Use: fastest, safest, balanced, night_guardian")

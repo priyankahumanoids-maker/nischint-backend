@@ -37,12 +37,13 @@ async def start_monitoring(
 ):
     """Start live route monitoring. Generates corridor and stores in Redis."""
     from app.services.route_monitor_service import start_route_monitoring
-    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY
+    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY, ACTION_PRODUCE_LOCATION
     from app.services.family_circle_runtime_authority import runtime_decision
 
-    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_ACTIVITY)
-    if family.canonical and not family.allowed:
-        raise HTTPException(403, f"Family Circle route authority denied: {family.code}")
+    for action in (ACTION_PRODUCE_ACTIVITY, ACTION_PRODUCE_LOCATION):
+        family = await runtime_decision(session, actor_user_id=user.id, action=action)
+        if family.canonical and not family.allowed:
+            raise HTTPException(403, f"Family Circle route authority denied: {family.code}")
 
     if req.mode not in ("fastest", "safest", "balanced", "night_guardian"):
         raise HTTPException(400, f"Invalid mode: {req.mode}")
@@ -81,12 +82,13 @@ async def update_location(
 ):
     """Process GPS location update against active route corridor."""
     from app.services.route_monitor_service import process_location_update
-    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY
+    from app.core.family_circle_permissions import ACTION_PRODUCE_ACTIVITY, ACTION_PRODUCE_LOCATION
     from app.services.family_circle_runtime_authority import runtime_decision
 
-    family = await runtime_decision(session, actor_user_id=user.id, action=ACTION_PRODUCE_ACTIVITY)
-    if family.canonical and not family.allowed:
-        raise HTTPException(403, f"Family Circle route authority denied: {family.code}")
+    for action in (ACTION_PRODUCE_ACTIVITY, ACTION_PRODUCE_LOCATION):
+        family = await runtime_decision(session, actor_user_id=user.id, action=action)
+        if family.canonical and not family.allowed:
+            raise HTTPException(403, f"Family Circle route authority denied: {family.code}")
 
     result = await process_location_update(str(user.id), req.lat, req.lng)
     if "error" in result:

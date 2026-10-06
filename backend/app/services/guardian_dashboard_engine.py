@@ -71,6 +71,35 @@ async def _filter_protected_scope_ids(
 
 
 
+
+
+async def _purpose_scope_sets(
+    session: AsyncSession,
+    viewer_user_id: str,
+    target_ids: list[uuid.UUID],
+) -> dict[str, set[uuid.UUID]]:
+    """Resolve purpose-specific target sets without changing payload shape.
+
+    Genuine legacy viewers retain their existing scope through the shared
+    fallback. Canonical viewers get current consent/entitlement/role/seat
+    decisions for each purpose.
+    """
+    from app.core.family_circle_permissions import (
+        ACTION_VIEW_ACTIVITY,
+        ACTION_VIEW_AI_PROFILE,
+        ACTION_VIEW_LOCATION_HISTORY,
+        ACTION_VIEW_WEARABLE,
+    )
+    from app.services.family_circle_runtime_authority import filter_targets_for_action
+
+    return {
+        "activity": set(await filter_targets_for_action(session, viewer_user_id, target_ids, ACTION_VIEW_ACTIVITY)),
+        "ai": set(await filter_targets_for_action(session, viewer_user_id, target_ids, ACTION_VIEW_AI_PROFILE)),
+        "history": set(await filter_targets_for_action(session, viewer_user_id, target_ids, ACTION_VIEW_LOCATION_HISTORY)),
+        "wearable": set(await filter_targets_for_action(session, viewer_user_id, target_ids, ACTION_VIEW_WEARABLE)),
+    }
+
+
 def _presence_from_ping(raw: str | None, now: datetime, window_s: int = 300) -> bool:
     if not raw:
         return False
@@ -430,12 +459,17 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
         guardian_user_id,
         user_role,
     )
+    purpose_scopes = {"activity": set(), "ai": set(), "history": set(), "wearable": set()}
     if guardian_user_id:
         from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
         from app.services.family_circle_runtime_authority import filter_targets_for_action
         user_ids = await filter_targets_for_action(
-            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION, record_disclosures=True
+            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION, record_disclosures=False
         )
+        purpose_scopes = await _purpose_scope_sets(session, guardian_user_id, user_ids)
+    else:
+        all_ids = set(user_ids)
+        purpose_scopes = {"activity": all_ids, "ai": all_ids, "history": all_ids, "wearable": all_ids}
     now = datetime.now(timezone.utc)
     from app.services.redis_service import get_user_pings
     presence_pings = get_user_pings([str(uid) for uid in user_ids])
@@ -698,14 +732,14 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                     location_ts = last_sess.ended_at or last_sess.previous_update_at or last_sess.started_at
                     location_type = "recent"
 
-        if not location:
+        if not location and uid in purpose_scopes["history"]:
             trail_row = trail_by_user.get(uid)
             if trail_row and trail_row[0] is not None:
                 location = {"lat": trail_row[0], "lng": trail_row[1]}
                 location_ts = trail_row[2]
                 location_type = "recent"
 
-        if not location:
+        if not location and uid in purpose_scopes["history"]:
             past_em = past_emergencies_by_user.get(uid)
             if past_em:
                 location = {"lat": past_em.lat, "lng": past_em.lng}
@@ -757,14 +791,14 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
             "location": location,
             "location_type": location_type,
             "last_updated": last_updated,
-            "battery": battery_pct,
-            "battery_percent": battery_pct,
+            "battery": battery_pct if uid in purpose_scopes["wearable"] else None,
+            "battery_percent": battery_pct if uid in purpose_scopes["wearable"] else None,
             "battery_updated_at": (
                 telemetry_updated_at.isoformat()
-                if device_telemetry is not None and telemetry_updated_at
+                if uid in purpose_scopes["wearable"] and device_telemetry is not None and telemetry_updated_at
                 else None
             ),
-            "telemetry_fresh": device_telemetry is not None,
+            "telemetry_fresh": (device_telemetry is not None) if uid in purpose_scopes["wearable"] else None,
             "presence_online": presence_online,
             "last_seen_online_at": last_seen_online_at,
             "has_active_session": active_session is not None,
@@ -793,6 +827,31 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
                 "location_updates": active_session.location_updates,
                 "alert_count": alert_counts_by_session.get(active_session.id, 0),
             }
+            if uid not in purpose_scopes["activity"]:
+                item["has_active_session"] = None
+                item["active_session"] = {
+                    "session_id": str(active_session.id),
+                    "current_location": active_session.current_location,
+                }
+            elif uid not in purpose_scopes["ai"]:
+                item["active_session"].pop("risk_level", None)
+                item["active_session"].pop("risk_score", None)
+
+        if guardian_user_id and location is not None:
+            from app.core.family_circle_permissions import ACTION_VIEW_LOCATION, ACTION_VIEW_LOCATION_HISTORY
+            from app.services.family_circle_runtime_authority import runtime_decision
+            disclosure_action = (
+                ACTION_VIEW_LOCATION_HISTORY
+                if location_type in {"recent", "historical"}
+                else ACTION_VIEW_LOCATION
+            )
+            await runtime_decision(
+                session,
+                actor_user_id=guardian_user_id,
+                target_user_id=uid,
+                action=disclosure_action,
+                record_disclosure=True,
+            )
         monitored.append(item)
 
     seniors_result = await session.execute(select(Senior).where(Senior.guardian_id == guardian_uuid))
@@ -812,12 +871,19 @@ async def get_loved_ones(session: AsyncSession, guardian_email: str, guardian_us
 async def get_active_sessions(session: AsyncSession, guardian_email: str, guardian_user_id: str | None = None, user_role: str | None = None) -> list[dict]:
     """Get all active sessions with batched user and alert hydration."""
     user_ids = await _get_linked_user_ids(session, guardian_email, guardian_user_id, user_role)
+    ai_allowed_ids: set[uuid.UUID] = set(user_ids)
     if guardian_user_id:
-        from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+        from app.core.family_circle_permissions import ACTION_VIEW_ACTIVITY, ACTION_VIEW_AI_PROFILE, ACTION_VIEW_LOCATION
         from app.services.family_circle_runtime_authority import filter_targets_for_action
         user_ids = await filter_targets_for_action(
-            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION, record_disclosures=True
+            session, guardian_user_id, user_ids, ACTION_VIEW_LOCATION, record_disclosures=False
         )
+        user_ids = await filter_targets_for_action(
+            session, guardian_user_id, user_ids, ACTION_VIEW_ACTIVITY, record_disclosures=False
+        )
+        ai_allowed_ids = set(await filter_targets_for_action(
+            session, guardian_user_id, user_ids, ACTION_VIEW_AI_PROFILE, record_disclosures=False
+        ))
     if not user_ids:
         return []
 
@@ -866,7 +932,7 @@ async def get_active_sessions(session: AsyncSession, guardian_email: str, guardi
     sessions = []
     for gs in active_rows:
         user = users_by_id.get(gs.user_id)
-        sessions.append({
+        item = {
             "session_id": str(gs.id),
             "user_id": str(gs.user_id),
             "user_name": (user.full_name or user.email) if user else "Unknown",
@@ -888,7 +954,18 @@ async def get_active_sessions(session: AsyncSession, guardian_email: str, guardi
             "is_idle": gs.is_idle,
             "route_deviated": gs.route_deviated,
             "alert_count": alert_counts.get(gs.id, 0),
-        })
+        }
+        if gs.user_id not in ai_allowed_ids:
+            item["risk_level"] = None
+            item["risk_score"] = None
+        if guardian_user_id and gs.current_location:
+            from app.core.family_circle_permissions import ACTION_VIEW_LOCATION
+            from app.services.family_circle_runtime_authority import runtime_decision
+            await runtime_decision(
+                session, actor_user_id=guardian_user_id, target_user_id=gs.user_id,
+                action=ACTION_VIEW_LOCATION, record_disclosure=True,
+            )
+        sessions.append(item)
 
     await session.commit()
     sessions.sort(key=lambda x: x["risk_score"], reverse=True)
@@ -899,6 +976,14 @@ async def get_active_sessions(session: AsyncSession, guardian_email: str, guardi
 async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50, guardian_user_id: str | None = None, user_role: str | None = None) -> list[dict]:
     """Get recent alerts without per-check-in N+1 user queries."""
     user_ids = await _get_linked_user_ids(session, guardian_email, guardian_user_id, user_role)
+    if guardian_user_id and user_ids:
+        from app.services.family_circle_runtime_authority import alert_recipient_ids
+        bounded_ids: list[uuid.UUID] = []
+        for target_id in user_ids:
+            canonical, recipients = await alert_recipient_ids(session, target_id)
+            if not canonical or str(guardian_user_id) in {str(uid) for uid in recipients}:
+                bounded_ids.append(target_id)
+        user_ids = bounded_ids
     alerts_list: list[dict] = []
     user_names: dict[uuid.UUID, str] = {}
 
@@ -923,6 +1008,33 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
 
         for a in alert_rows:
             a_type = a.alert_type
+            location = a.location
+            details = a.details
+            recommendation = a.recommendation
+            if guardian_user_id and str(a.user_id) != str(guardian_user_id):
+                from app.core.family_circle_permissions import (
+                    ACTION_VIEW_ACTIVITY, ACTION_VIEW_AI_PROFILE, ACTION_VIEW_LOCATION_HISTORY,
+                )
+                from app.services.family_circle_runtime_authority import runtime_decision
+                is_emergency = str(a_type or "").lower() == "emergency_triggered"
+                if not is_emergency:
+                    history_decision = await runtime_decision(
+                        session, actor_user_id=guardian_user_id, target_user_id=a.user_id,
+                        action=ACTION_VIEW_LOCATION_HISTORY, record_disclosure=bool(location),
+                    )
+                    if not history_decision.allowed:
+                        location = None
+                    ai_decision = await runtime_decision(
+                        session, actor_user_id=guardian_user_id, target_user_id=a.user_id,
+                        action=ACTION_VIEW_AI_PROFILE,
+                    )
+                    activity_decision = await runtime_decision(
+                        session, actor_user_id=guardian_user_id, target_user_id=a.user_id,
+                        action=ACTION_VIEW_ACTIVITY,
+                    )
+                    if not (ai_decision.allowed or activity_decision.allowed):
+                        details = None
+                        recommendation = None
             alerts_list.append({
                 "id": str(a.id),
                 "session_id": str(a.session_id) if a.session_id else None,
@@ -931,9 +1043,9 @@ async def get_alerts(session: AsyncSession, guardian_email: str, limit: int = 50
                 "type": a_type,
                 "severity": a.severity,
                 "message": a.message,
-                "details": a.details,
-                "recommendation": a.recommendation,
-                "location": a.location,
+                "details": details,
+                "recommendation": recommendation,
+                "location": location,
                 "created_at": a.created_at.isoformat() if a.created_at else None,
                 "ack_status": a.ack_status,
                 "ack_type": a.ack_type,
