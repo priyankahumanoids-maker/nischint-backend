@@ -5,13 +5,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Query
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select, func, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session
-from app.core.rbac import require_role
+from app.core.rbac import require_staff_role
 from app.core.product_roles import CANONICAL_ROLES, normalize_role
 from app.models.user import User
 from app.models.facility import Facility
@@ -28,12 +28,21 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # Admin-only: all MUTATING operations (create/update/delete/role-change).
 # These can escalate privileges, change billing surface, or alter system config,
 # so they must remain strictly admin.
-_admin_role = require_role(["admin"])
+_admin_role = require_staff_role(["admin"])
 
 # Admin OR Operator: all READ-ONLY list/detail views + dashboard stats.
 # Operators (control-room role) need visibility into users, facilities, and
-# system health to do their jobs. No mutation possible through these paths.
-_read_role = require_role(["admin", "operator"])
+# system health to do their jobs. Both roles require current authenticator-TOTP
+# proof at this privileged /admin boundary.
+_read_role = require_staff_role(["admin", "operator"])
+
+# Bootstrap-only dependency for staff TOTP enrollment/challenge. Current DB
+# staff authority is still required, but an unenrolled staff member must be able
+# to reach these exact endpoints without already having a TOTP proof.
+_staff_bootstrap_role = require_staff_role(
+    ["admin", "operator"],
+    require_totp=False,
+)
 
 
 # ── Schemas ──
@@ -62,6 +71,10 @@ class UserUpdateStatus(BaseModel):
     is_active: bool
 
 
+class StaffTotpCode(BaseModel):
+    code: str = Field(..., pattern=r"^\d{6}$")
+
+
 class FacilityCreate(BaseModel):
     name: str = Field(..., max_length=200)
     code: str = Field(..., max_length=50)
@@ -84,6 +97,155 @@ class FacilityUpdate(BaseModel):
     email: Optional[str] = None
     is_active: Optional[bool] = None
     max_users: Optional[int] = None
+
+
+# ══════════════════════════════════════════════
+# STAFF AUTHENTICATOR TOTP
+# ══════════════════════════════════════════════
+
+
+def _request_bearer_token(request: Request) -> str:
+    authorization = str(request.headers.get("Authorization") or "").strip()
+    scheme, _, token = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Bearer access token required")
+    return token.strip()
+
+
+@router.get("/security/totp/status")
+async def staff_totp_status(
+    session: AsyncSession = Depends(get_db_session),
+    staff: User = Depends(_staff_bootstrap_role),
+):
+    """Return only the caller's staff authenticator enrollment state."""
+    from app.services.auth_staff_totp_service import get_staff_totp_state
+
+    state = await get_staff_totp_state(session, user_id=staff.id)
+    return {
+        "role": staff.role,
+        "totp_state": state["state"],
+        "enabled": state["enabled"],
+        "pending": state["pending"],
+        "enrolled_at": state["enrolled_at"].isoformat() if state["enrolled_at"] else None,
+        "verified_at": state["verified_at"].isoformat() if state["verified_at"] else None,
+    }
+
+
+@router.post("/security/totp/enroll")
+async def staff_totp_enroll(
+    session: AsyncSession = Depends(get_db_session),
+    staff: User = Depends(_staff_bootstrap_role),
+):
+    """Start/restart pending authenticator enrollment for the current staff user."""
+    from app.services.auth_staff_totp_service import begin_staff_totp_enrollment
+
+    try:
+        enrollment = await begin_staff_totp_enrollment(
+            session,
+            user_id=staff.id,
+            account_label=staff.email or str(staff.id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.error("Staff TOTP encryption unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="Authenticator enrollment unavailable") from exc
+
+    # Secret is intentionally returned only during enrollment so the caller can
+    # add it to an authenticator app. It is never returned by status/proof APIs.
+    return {
+        "totp_state": "pending",
+        "secret": enrollment["secret"],
+        "otpauth_uri": enrollment["otpauth_uri"],
+        "algorithm": "SHA1",
+        "digits": 6,
+        "period_seconds": 30,
+    }
+
+
+@router.post("/security/totp/activate")
+async def staff_totp_activate(
+    body: StaffTotpCode,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    staff: User = Depends(_staff_bootstrap_role),
+):
+    """Verify the first authenticator code and activate mandatory staff TOTP."""
+    from app.services.auth_staff_totp_service import (
+        STAFF_PROOF_TTL_SECONDS,
+        create_staff_proof,
+        get_staff_totp_state,
+        verify_staff_totp_code,
+    )
+
+    state = await get_staff_totp_state(session, user_id=staff.id)
+    if state["enabled"]:
+        raise HTTPException(status_code=409, detail="Authenticator TOTP is already enabled")
+    if not state["pending"]:
+        raise HTTPException(status_code=409, detail="Authenticator enrollment has not been started")
+
+    try:
+        accepted = await verify_staff_totp_code(
+            session, user_id=staff.id, code=body.code
+        )
+    except RuntimeError as exc:
+        logger.error("Staff TOTP verification unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="Authenticator verification unavailable") from exc
+    if not accepted:
+        raise HTTPException(status_code=401, detail="Invalid or replayed authenticator code")
+
+    access_token = _request_bearer_token(request)
+    proof = create_staff_proof(user_id=staff.id, access_token=access_token)
+    return {
+        "enabled": True,
+        "staff_proof": proof,
+        "expires_in": STAFF_PROOF_TTL_SECONDS,
+    }
+
+
+@router.post("/security/totp/proof")
+async def staff_totp_proof(
+    body: StaffTotpCode,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    staff: User = Depends(_staff_bootstrap_role),
+):
+    """Exchange one fresh authenticator code for a short-lived staff proof."""
+    from app.services.auth_staff_totp_service import (
+        STAFF_PROOF_TTL_SECONDS,
+        get_staff_totp_state,
+        verify_staff_totp_and_issue_proof,
+    )
+
+    state = await get_staff_totp_state(session, user_id=staff.id)
+    if not state["enabled"]:
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "error": "staff_totp_enrollment_required",
+                "message": "Authenticator TOTP enrollment is required",
+            },
+        )
+
+    access_token = _request_bearer_token(request)
+    try:
+        proof = await verify_staff_totp_and_issue_proof(
+            session,
+            user_id=staff.id,
+            code=body.code,
+            access_token=access_token,
+        )
+    except RuntimeError as exc:
+        logger.error("Staff TOTP verification unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="Authenticator verification unavailable") from exc
+    if not proof:
+        raise HTTPException(status_code=401, detail="Invalid or replayed authenticator code")
+
+    return {
+        "staff_proof": proof,
+        "expires_in": STAFF_PROOF_TTL_SECONDS,
+        "header": "X-Nischint-Staff-Proof",
+    }
 
 
 # ══════════════════════════════════════════════
@@ -163,11 +325,28 @@ async def update_user_role(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    old_role = user.role
-    user.role = normalize_role(body.role)
+    old_role = normalize_role(user.role)
+    new_role = normalize_role(body.role)
+    user.role = new_role
     await session.flush()
 
-    # Sync to Cognito groups if possible
+    revoked_sessions = 0
+    if old_role != new_role:
+        # Privilege changes take effect immediately. Existing bearer/session
+        # material cannot retain an old admin/operator decision.
+        revoked_sessions = await revoke_all_auth_sessions(
+            session,
+            user.id,
+            reason="admin_role_changed",
+        )
+        await bump_user_token_epoch(session, user.id)
+        user_cache.invalidate_user_keys(
+            str(user.id),
+            str(getattr(user, "cognito_sub", "") or ""),
+        )
+
+    # Sync provider groups best-effort. DB role remains authoritative even if
+    # this remote operation fails or an older provider token remains valid.
     try:
         await _sync_cognito_role(user.email, old_role, user.role)
     except Exception as e:
@@ -178,6 +357,7 @@ async def update_user_role(
         "email": user.email,
         "role": user.role,
         "previous_role": old_role,
+        "revoked_sessions": revoked_sessions,
     }
 
 
