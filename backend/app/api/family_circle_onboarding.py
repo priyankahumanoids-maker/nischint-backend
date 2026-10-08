@@ -83,6 +83,12 @@ def _state_payload(state) -> dict:
     }
 
 
+@router.get("/plans/public")
+async def public_family_circle_plans(session: AsyncSession = Depends(get_db_session)):
+    from app.services.family_circle_plan_catalog_service import list_catalog_plans, public_plan_payload
+    return {"plans": [public_plan_payload(plan) for plan in await list_catalog_plans(session)]}
+
+
 @router.get("/onboarding/status")
 async def get_onboarding_status(
     user: User = Depends(get_current_user),

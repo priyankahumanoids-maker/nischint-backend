@@ -125,6 +125,11 @@ async def resume_own_sharing(session: AsyncSession, *, user: User, now: datetime
 async def leave_circle(session: AsyncSession, *, user: User, now: datetime | None = None) -> dict:
     from app.services.family_circle_runtime_authority import membership_snapshot, runtime_decision
     point = now or datetime.now(timezone.utc)
+    initial = await membership_snapshot(session, user.id)
+    if initial is None:
+        raise PermissionError("family_circle_required")
+    from app.services.family_circle_management_service import locked_membership
+    await locked_membership(session, user.id, initial.circle.id)
     decision = await runtime_decision(session, actor_user_id=user.id, action=ACTION_LEAVE_CIRCLE)
     if not decision.canonical or not decision.allowed:
         raise PermissionError(decision.code)
@@ -232,6 +237,12 @@ async def appoint_co_admin(session: AsyncSession, *, owner: User, target_user_id
         raise PermissionError("different_circle")
     if str(target_user_id) == str(owner.id) or target_snap.membership.role == "owner":
         raise PermissionError("owner_cannot_be_co_admin")
+    # Reject missing DOB and stale adult role labels for this new grant.
+    from app.core.family_circle_roles import role_for_date_of_birth
+    target_user = await session.get(User, target_user_id)
+    if target_user is None:
+        raise PermissionError("co_admin_target_not_found")
+    role_for_date_of_birth(target_user.date_of_birth, "co_admin")
     if target_snap.membership.role == "minor":
         raise PermissionError("co_admin_must_be_adult")
     current = (
@@ -285,6 +296,7 @@ async def transfer_ownership(
     owner: User,
     target_user_id,
     billing_mandate_ready: bool = False,
+    defer_mandate_transition: bool = False,
 ) -> dict:
     """Internal ownership primitive. Public exposure requires fresh step-up OTP."""
     from app.core.family_circle_permissions import ACTION_TRANSFER_OWNERSHIP
@@ -302,7 +314,7 @@ async def transfer_ownership(
     if target_snap.membership.role == "minor":
         raise PermissionError("owner_must_be_adult")
     ent = await resolve_entitlement(session, owner_snap.circle)
-    if ent.state in {"paid_active", "grace"} and not billing_mandate_ready:
+    if ent.state in {"paid_active", "grace"} and not billing_mandate_ready and not defer_mandate_transition:
         raise PermissionError("new_owner_payment_mandate_required")
 
     previous_target_role = target_snap.membership.role

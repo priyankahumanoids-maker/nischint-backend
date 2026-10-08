@@ -38,6 +38,7 @@ class EntitlementSnapshot:
     payment_required: bool = False
     cancel_at_period_end: bool = False
     pending_plan: str | None = None
+    pending_plan_effective_at: datetime | None = None
 
     @property
     def lifeline(self) -> bool:
@@ -97,9 +98,19 @@ async def resolve_entitlement(session: AsyncSession, circle: FamilyCircle, *, no
     point = _utc(now) or datetime.now(timezone.utc)
     if circle.plan == PLAN_TRIAL:
         end = _utc(circle.trial_ends_at)
+        row = await _row(session, circle.id) if session is not None else None
+        pending_plan = row.get("pending_plan") if row else None
+        pending_effective = _utc(row.get("pending_plan_effective_at")) if row else None
         if circle.trial_started_at is not None and end is not None and point < end:
-            return EntitlementSnapshot("trial_active", ENTITLEMENT_ACTIVE, "trial_active", access_until=end)
-        return EntitlementSnapshot("lifeline", ENTITLEMENT_LIFELINE, "trial_expired", access_until=end, payment_required=True)
+            return EntitlementSnapshot(
+                "trial_active", ENTITLEMENT_ACTIVE, "trial_active", access_until=end,
+                pending_plan=pending_plan, pending_plan_effective_at=pending_effective,
+            )
+        return EntitlementSnapshot(
+            "lifeline", ENTITLEMENT_LIFELINE, "trial_expired", access_until=end,
+            payment_required=True, pending_plan=pending_plan,
+            pending_plan_effective_at=pending_effective,
+        )
 
     if circle.plan not in {PLAN_INDIVIDUAL, PLAN_FAMILY}:
         return EntitlementSnapshot("lifeline", ENTITLEMENT_LIFELINE, "plan_uninitialized", payment_required=True)
@@ -113,6 +124,7 @@ async def resolve_entitlement(session: AsyncSession, circle: FamilyCircle, *, no
     grace_until = _utc(row.get("grace_until"))
     cancel_at_period_end = bool(row.get("cancel_at_period_end"))
     pending_plan = row.get("pending_plan")
+    pending_plan_effective_at = _utc(row.get("pending_plan_effective_at"))
 
     if state == "paid_active":
         if period_end is not None and point >= period_end:
@@ -120,10 +132,12 @@ async def resolve_entitlement(session: AsyncSession, circle: FamilyCircle, *, no
                 "lifeline", ENTITLEMENT_LIFELINE, "paid_period_ended",
                 access_until=period_end, payment_required=True,
                 cancel_at_period_end=cancel_at_period_end, pending_plan=pending_plan,
+                pending_plan_effective_at=pending_plan_effective_at,
             )
         return EntitlementSnapshot(
             "paid_active", ENTITLEMENT_ACTIVE, "paid_active", access_until=period_end,
             cancel_at_period_end=cancel_at_period_end, pending_plan=pending_plan,
+            pending_plan_effective_at=pending_plan_effective_at,
         )
     if state == "grace":
         if grace_until is not None and point < grace_until:
@@ -131,21 +145,25 @@ async def resolve_entitlement(session: AsyncSession, circle: FamilyCircle, *, no
                 "grace", ENTITLEMENT_GRACE, "renewal_grace",
                 access_until=period_end, grace_until=grace_until,
                 cancel_at_period_end=cancel_at_period_end, pending_plan=pending_plan,
+                pending_plan_effective_at=pending_plan_effective_at,
             )
         return EntitlementSnapshot(
             "lifeline", ENTITLEMENT_LIFELINE, "renewal_grace_expired",
             access_until=period_end, grace_until=grace_until, payment_required=True,
             cancel_at_period_end=cancel_at_period_end, pending_plan=pending_plan,
+            pending_plan_effective_at=pending_plan_effective_at,
         )
     if state == "lifeline":
         return EntitlementSnapshot(
             "lifeline", ENTITLEMENT_LIFELINE, "billing_inactive",
             access_until=period_end, payment_required=True,
             cancel_at_period_end=cancel_at_period_end, pending_plan=pending_plan,
+            pending_plan_effective_at=pending_plan_effective_at,
         )
     return EntitlementSnapshot(
         "payment_pending", ENTITLEMENT_LIFELINE, "payment_not_verified",
         payment_required=True, pending_plan=pending_plan,
+        pending_plan_effective_at=pending_plan_effective_at,
     )
 
 

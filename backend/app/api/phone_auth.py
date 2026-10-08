@@ -1,12 +1,16 @@
 """Existing-account phone login only. Session issuance stays in auth.py."""
 import asyncio
 
+from datetime import datetime, timezone
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db_session
 from app.core.auth_foundation_policy import OTP_TTL_SECONDS, OTP_RESEND_COOLDOWN_SECONDS
+from app.core.config import settings
 from app.core.rate_limiter import limiter
 from app.services import sms_service, user_cache, auth_two_factor_service
 from app.services.auth_phone_otp_service import (
@@ -22,6 +26,7 @@ class PhoneLoginRequest(BaseModel):
 
 class PhoneLoginVerify(PhoneLoginRequest):
     code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+    installation_id: UUID | None = None
 
 
 @router.post("/phone-login/request", status_code=202)
@@ -70,6 +75,13 @@ async def verify_phone_login(
     response = await _issue_local_session_response(
         session, user, request, provider="local", extra_claims={"two_factor_verified": True},
     )
+    if req.installation_id is not None and response.session_id:
+        from app.services.auth_installation_service import associate_installation
+        await associate_installation(
+            session, user_id=user.id, session_id=UUID(str(response.session_id)),
+            installation_id=req.installation_id, key=settings.jwt_secret.encode("utf-8"),
+            now=datetime.now(timezone.utc),
+        )
     await session.commit()
     user_cache.cache_user(str(user.id), user)
     return response

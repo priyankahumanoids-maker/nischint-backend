@@ -51,10 +51,58 @@ class ConsentRequest(BaseModel):
     device_id: str | None = None
 
 
+class StageDowngradeRequest(BaseModel):
+    protected_user_id: str
+    guardian_user_ids: list[str] = Field(default_factory=list, max_length=2)
+
+
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, PermissionError):
         return HTTPException(status_code=403, detail=str(exc))
     return HTTPException(status_code=422, detail=str(exc))
+
+
+@router.get('/plan-catalog')
+async def plan_catalog(session: AsyncSession = Depends(get_db_session)):
+    from app.services.family_circle_plan_catalog_service import list_catalog_plans, public_plan_payload
+    return {'plans': [public_plan_payload(plan) for plan in await list_catalog_plans(session)]}
+
+
+@router.post('/plan-change/prepare-family')
+async def prepare_family_upgrade(session: AsyncSession = Depends(get_db_session), user: User = Depends(get_current_user)):
+    try:
+        from app.services.family_circle_plan_change_service import prepare_upgrade_to_family
+        result = await prepare_upgrade_to_family(session, owner=user)
+        await session.commit()
+        return result
+    except Exception as exc:
+        await session.rollback()
+        raise _http_error(exc)
+
+
+@router.post('/plan-change/stage-individual')
+async def stage_individual_downgrade(req: StageDowngradeRequest, session: AsyncSession = Depends(get_db_session), user: User = Depends(get_current_user)):
+    try:
+        from app.services.family_circle_runtime_authority import membership_snapshot
+        from app.services.family_circle_entitlement_service import resolve_entitlement
+        from app.services.family_circle_plan_change_service import stage_family_to_individual_downgrade
+        snap = await membership_snapshot(session, user.id)
+        if snap is None or snap.membership.role != 'owner':
+            raise PermissionError('owner_only_billing')
+        ent = await resolve_entitlement(session, snap.circle)
+        if snap.circle.plan != 'family':
+            raise ValueError('Only a Family plan can be downgraded to Individual.')
+        if ent.state != 'paid_active' or ent.access_until is None:
+            raise ValueError('A verified active paid period is required before scheduling a downgrade.')
+        result = await stage_family_to_individual_downgrade(
+            session, owner=user, protected_user_id=req.protected_user_id,
+            guardian_user_ids=req.guardian_user_ids, effective_at=ent.access_until,
+        )
+        await session.commit()
+        return {**result, 'plan_changed': False, 'provider_action_required': True}
+    except Exception as exc:
+        await session.rollback()
+        raise _http_error(exc)
 
 
 @router.get('/entitlement')
@@ -73,6 +121,8 @@ async def my_entitlement(session: AsyncSession = Depends(get_db_session), user: 
     paused = await sharing_paused(session, user.id)
     await session.commit()  # persists idempotent age/timed-resume reconciliation
 
+    from app.services.family_circle_plan_catalog_service import get_catalog_plan, public_plan_payload
+    plan_config = public_plan_payload(await get_catalog_plan(session, snap.circle.plan))
     tracked = bool(snap.circle.plan == 'family' or snap.membership.seat == 'protected')
     if ent.lifeline:
         protection_state = 'protection_off'
@@ -85,8 +135,20 @@ async def my_entitlement(session: AsyncSession = Depends(get_db_session), user: 
     else:
         protection_state = 'protected'
 
+    from datetime import datetime, timezone
+    point = datetime.now(timezone.utc)
+    trial_remaining_seconds = None
+    trial_day = None
+    if snap.circle.plan == 'trial' and snap.circle.trial_started_at and snap.circle.trial_ends_at:
+        trial_remaining_seconds = max(0, int((snap.circle.trial_ends_at - point).total_seconds()))
+        elapsed = max(0, int((point - snap.circle.trial_started_at).total_seconds()))
+        trial_day = min(7, elapsed // 86400 + 1) if trial_remaining_seconds > 0 else 7
+
     return {
         'plan': snap.circle.plan,
+        'plan_config': plan_config,
+        'trial_remaining_seconds': trial_remaining_seconds,
+        'trial_day': trial_day,
         'role': snap.membership.role,
         'seat': snap.membership.seat,
         'owner_name': (owner.full_name if owner else None) or 'the Owner',
@@ -111,6 +173,8 @@ async def my_entitlement(session: AsyncSession = Depends(get_db_session), user: 
         'payment_required': ent.payment_required,
         'cancel_at_period_end': ent.cancel_at_period_end,
         'pending_plan': ent.pending_plan,
+        'pending_plan_effective_at': ent.pending_plan_effective_at,
+        'can_manage_plan': snap.membership.role == 'owner',
         'gateway_enabled': False,
     }
 
@@ -214,3 +278,8 @@ async def my_age18_status(session: AsyncSession = Depends(get_db_session), user:
     status = await age18_status(session, user.id)
     await session.commit()
     return status
+
+
+# R1 canonical application actions; shares existing identity/session boundary.
+from app.api.family_circle_management import router as management_router
+router.include_router(management_router)

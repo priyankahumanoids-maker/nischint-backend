@@ -107,6 +107,17 @@ class _ScalarsFirst:
         return self.value
 
 
+class _CatalogRow:
+    def __init__(self, value):
+        self.value = value
+
+    def mappings(self):
+        return self
+
+    def first(self):
+        return self.value
+
+
 class _QueueSession:
     def __init__(self, results):
         self.results = list(results)
@@ -114,8 +125,30 @@ class _QueueSession:
         self.flush_count = 0
         self.executed = []
 
-    async def execute(self, statement):
+    async def execute(self, statement, params=None):
         self.executed.append(statement)
+        sql = str(statement)
+        if "FROM family_plan_catalog" in sql:
+            plan = str((params or {}).get("plan") or "")
+            capacities = {
+                PLAN_TRIAL: {SEAT_PROTECTED: 1, SEAT_GUARDIAN: 2},
+                PLAN_INDIVIDUAL: {SEAT_PROTECTED: 1, SEAT_GUARDIAN: 2},
+                PLAN_FAMILY: {SEAT_MEMBER: 4},
+            }.get(plan)
+            if capacities is None:
+                return _CatalogRow(None)
+            return _CatalogRow({
+                "plan_key": plan,
+                "display_name": plan.title(),
+                "price_inr": 0 if plan == PLAN_TRIAL else (299 if plan == PLAN_INDIVIDUAL else 999),
+                "billing_period": "trial" if plan == PLAN_TRIAL else "month",
+                "trial_days": 7 if plan == PLAN_TRIAL else None,
+                "seat_capacities": capacities,
+                "feature_flags": {},
+                "sort_order": 0,
+            })
+        if "FROM family_lifecycle_operations" in sql and "kind='member_remove'" in sql:
+            return _ScalarOne(0)
         if not self.results:
             raise AssertionError("unexpected execute")
         return self.results.pop(0)

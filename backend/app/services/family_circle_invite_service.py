@@ -35,7 +35,8 @@ from app.services.family_circle_plan_service import (
     add_membership_with_seat,
     get_plan_shape,
     seat_capacity,
-    validate_seat_for_membership,
+    runtime_seat_capacity,
+    validate_runtime_seat,
 )
 from app.services.family_circle_service import get_active_membership
 
@@ -279,7 +280,7 @@ async def create_invite(
 
     await _expire_pending_invites(session, circle.id, point)
 
-    capacity = seat_capacity(circle.plan, seat)
+    capacity = await runtime_seat_capacity(session, circle.plan, seat)
     occupied = await _active_seat_count(session, circle.id, seat)
     pending = await _pending_invite_count(session, circle.id, seat, point)
     if occupied + pending >= capacity:
@@ -449,8 +450,10 @@ async def accept_invite_for_user(
         raise FamilyInviteError("This invite was created specifically for a Minor.")
 
     if actual_kind == "minor":
-        if not row["parental_basis"] or not row["parental_verification_ref"]:
-            raise FamilyInviteError("Verified parental consent is missing for this Minor invite.")
+        # A legacy free-text reference is not evidence. R1 records a bound
+        # parental request, but no approved verification adapter exists yet.
+        # Keep activation fail-closed for existing and new Child identities.
+        raise FamilyInviteError("Verified parental admission is not enabled. Ask a parent to add you to their circle.")
         role = CIRCLE_ROLE_MINOR
     else:
         role = CIRCLE_ROLE_ADULT_MEMBER
@@ -460,7 +463,7 @@ async def accept_invite_for_user(
     )
 
     try:
-        validate_seat_for_membership(circle.plan, str(row["seat"]), role)
+        await validate_runtime_seat(session, circle.plan, str(row["seat"]), role)
         identity = await add_membership_with_seat(
             session,
             circle=circle,
@@ -527,6 +530,15 @@ async def accept_invite_for_user(
         event_type="member_joined",
         details={"seat": str(row["seat"]), "role": role},
     )
+    # Transactional enqueue only; the established worker owns delivery/retry.
+    from app.services.family_circle_notification_outbox import enqueue_family_notifications
+    administrators = (await session.execute(text("""SELECT user_id FROM circle_memberships
+        WHERE circle_id=:circle AND status='active' AND role IN ('owner','co_admin')"""),
+        {"circle": circle.id})).scalars().all()
+    await enqueue_family_notifications(session, circle_id=circle.id,
+        recipient_user_ids=administrators, event_type="family_member_joined",
+        title="NISCHINT Family Circle", body=f"{new_user.full_name or 'A member'} joined the circle.", payload={"member_user_id": str(new_user.id)},
+        event_key_prefix=f"invite-joined:{row['id']}")
     await session.flush()
     return membership
 
@@ -573,7 +585,8 @@ async def revoke_invite(
 async def seat_usage(session: AsyncSession, circle: FamilyCircle, *, now: datetime | None = None) -> dict[str, dict[str, int]]:
     point = now or datetime.now(timezone.utc)
     await _expire_pending_invites(session, circle.id, point)
-    shape = get_plan_shape(str(circle.plan))
+    from app.services.family_circle_plan_service import get_runtime_plan_shape
+    shape = await get_runtime_plan_shape(session, str(circle.plan))
     result: dict[str, dict[str, int]] = {}
     for seat, capacity in shape.capacities.items():
         active = await _active_seat_count(session, circle.id, seat)

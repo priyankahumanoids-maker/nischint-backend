@@ -125,6 +125,8 @@ class Rows:
     def mappings(self): return self
     def first(self): return self.row
     def scalar_one_or_none(self): return self.row
+    def scalars(self): return self
+    def all(self): return [] if self.row is None else [self.row]
 
 
 @pytest.mark.parametrize("state", ["former", "invalid"])
@@ -209,9 +211,30 @@ def invitation(monkeypatch, *, role="owner", entitlement="active", sponsor_state
     class DB:
         async def execute(self, stmt, params=None):
             events.append(str(stmt))
+            sql = str(stmt)
             if isinstance(stmt, Query):
                 return Rows(membership if sponsor_state == "active" else None)
-            if str(stmt).lstrip().startswith("SELECT 1"): return Rows()
+            if "FROM family_plan_catalog" in sql:
+                plan = str((params or {}).get("plan") or "family").strip().lower()
+                capacities = {
+                    "trial": {"protected": 1, "guardian": 2},
+                    "individual": {"protected": 1, "guardian": 2},
+                    "family": {"member": 4},
+                }.get(plan)
+                if capacities is None:
+                    return Rows(None)
+                return Rows({
+                    "plan_key": plan,
+                    "display_name": plan.title(),
+                    "price_inr": 0 if plan == "trial" else (299 if plan == "individual" else 999),
+                    "billing_period": "trial" if plan == "trial" else "month",
+                    "trial_days": 7 if plan == "trial" else None,
+                    "seat_capacities": capacities,
+                    "feature_flags": {},
+                    "sort_order": 0,
+                })
+            if sql.lstrip().startswith("SELECT 1"): return Rows()
+            if sql.lstrip().startswith("SELECT user_id FROM circle_memberships"): return Rows("a")
             return Rows("accepted")
         async def get(self, model, uid, **kwargs):
             if model is Circle: return circle
@@ -235,7 +258,7 @@ def invitation(monkeypatch, *, role="owner", entitlement="active", sponsor_state
                parental_basis=None, parental_verification_ref=None)
     async def invite_row(*args, **kwargs): return row
     monkeypatch.setattr(i, "_invite_row", invite_row)
-    return i, DB(), S(id="a"), S(id="new", date_of_birth=date(1990, 1, 1)), point, row, events
+    return i, DB(), S(id="a"), S(id="new", full_name="New Member", date_of_birth=date(1990, 1, 1)), point, row, events
 
 
 @pytest.mark.parametrize("role,entitlement,allow", [
@@ -273,6 +296,7 @@ def test_valid_invite_acceptance(monkeypatch, role):
     assert run(i.accept_invite_for_user(db, code="ABCDEF", new_user=user, now=point)).user_id == "new"
     assert "add_member" in events
     assert any("AND status='pending'" in e for e in events)
+    assert any("INSERT INTO family_notification_outbox" in e for e in events)
 
 
 @pytest.mark.parametrize("invalid", ["expired", "accepted", "revoked"])

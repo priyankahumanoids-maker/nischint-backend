@@ -14,6 +14,7 @@ router = APIRouter(prefix="/push", tags=["push"])
 
 class PushTokenRequest(BaseModel):
     token: str
+    installation_id: UUID | None = None
 
 
 @router.post("/token", status_code=status.HTTP_201_CREATED)
@@ -44,8 +45,25 @@ async def register_push_token(
         ),
         {"uid": current_user.id, "tok": body.token},
     )
+    notice_state = "untracked"
+    if body.installation_id is not None:
+        from datetime import datetime, timezone
+        from app.services.auth_installation_service import (
+            associate_push_token, dispatch_pending_new_device_notice,
+        )
+        associated = await associate_push_token(
+            session, user_id=current_user.id, installation_id=body.installation_id, token=body.token,
+        )
+        if not associated:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="The login installation is not active for this account.")
+        await session.commit()
+        notice_state = await dispatch_pending_new_device_notice(
+            session, user_id=current_user.id, installation_id=body.installation_id,
+            now=datetime.now(timezone.utc),
+        )
     await session.commit()
-    return {"status": "registered"}
+    return {"status": "registered", "new_device_notice": notice_state}
 
 
 # ── Reachability classifier ──────────────────────────────────────────

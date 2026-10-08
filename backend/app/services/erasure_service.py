@@ -69,6 +69,10 @@ class ErasureError(Exception):
     """Base exception for erasure-flow errors."""
 
 
+class ErasureMembershipBlocked(ErasureError):
+    """Circle ownership must be resolved before erasure."""
+
+
 class ErasureAlreadyPending(ErasureError):
     """User already has a pending erasure request."""
 
@@ -117,6 +121,11 @@ async def submit_request(
             "An erasure request is already pending for this account."
         )
 
+    from app.services.family_circle_management_service import depart_for_erasure
+    try:
+        await depart_for_erasure(session, user)
+    except PermissionError as exc:
+        raise ErasureMembershipBlocked(str(exc)) from exc
     now = datetime.now(timezone.utc)
     grace_expires = now + timedelta(days=GRACE_PERIOD_DAYS)
 

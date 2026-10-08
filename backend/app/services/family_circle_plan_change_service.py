@@ -28,6 +28,32 @@ async def _owner_circle(session: AsyncSession, owner: User):
     return snap
 
 
+async def prepare_upgrade_to_family(session: AsyncSession, *, owner: User) -> dict:
+    """Record Owner intent without activating a paid Family entitlement.
+
+    No provider call occurs here.  The existing verified billing-event boundary
+    remains the only route that applies the actual plan change.
+    """
+    snap = await _owner_circle(session, owner)
+    source = str(snap.circle.plan or '')
+    if source not in {'trial', 'individual'}:
+        raise ValueError('Only Trial or Individual can be upgraded to Family.')
+    result = await session.execute(text("""
+        UPDATE family_circle_entitlements
+           SET pending_plan='family', pending_plan_effective_at=NULL,
+               pending_seat_assignments=NULL, updated_at=NOW()
+         WHERE circle_id=:circle_id
+     RETURNING circle_id
+    """), {'circle_id': str(snap.circle.id)})
+    if result.scalar_one_or_none() is None:
+        raise ValueError('Canonical entitlement row is missing.')
+    await append_family_audit(
+        session, circle_id=snap.circle.id, actor_user_id=owner.id, subject_user_id=None,
+        event_type='plan_upgrade_prepared', details={'from': source, 'to': 'family', 'provider_verified': False},
+    )
+    return {'target_plan': 'family', 'state': 'provider_action_required', 'plan_changed': False}
+
+
 async def stage_family_to_individual_downgrade(
     session: AsyncSession,
     *,
@@ -188,6 +214,7 @@ async def apply_staged_family_to_individual_downgrade(
 
 
 __all__ = [
+    'prepare_upgrade_to_family',
     'stage_family_to_individual_downgrade',
     'apply_upgrade_to_family',
     'apply_staged_family_to_individual_downgrade',

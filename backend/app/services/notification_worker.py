@@ -61,8 +61,11 @@ async def process_notification_jobs():
     # Existing scheduler owns retries; no mobile poll or second scheduler.
     # A separate transaction reads only committed lifecycle outbox entries.
     from app.services.family_circle_notification_outbox import drain_family_notifications
+    from app.services.family_circle_trial_reminder_service import enqueue_due_trial_reminders
     async with async_session() as family_session:
         try:
+            await enqueue_due_trial_reminders(family_session)
+            await family_session.commit()
             await drain_family_notifications(family_session)
             await family_session.commit()
         except Exception:

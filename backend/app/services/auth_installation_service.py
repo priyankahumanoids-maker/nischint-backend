@@ -74,3 +74,47 @@ async def other_signed_in_push_tokens(session, *, user_id: UUID, installation_id
     # A legacy account-transfer upsert may leave a stale installation pointer;
     # the owner join excludes it until a verified association is refreshed.
     return list(result.scalars().all())
+
+
+async def dispatch_pending_new_device_notice(session, *, user_id: UUID, installation_id: UUID, now: datetime) -> str:
+    """Deliver a single new-device notice to the user's other active installations.
+
+    ``notice_state`` is the durable dedup key. A provider failure keeps the row
+    pending so a later token-registration retry can deliver it. If there is no
+    other active signed-in destination, no notification is required.
+    """
+    aware(now)
+    row = (await session.execute(text("""
+        SELECT notice_state FROM auth_installations
+        WHERE id=:iid AND user_id=:uid AND revoked_at IS NULL FOR UPDATE
+    """), {"iid": installation_id, "uid": user_id})).mappings().first()
+    if not row:
+        raise ValueError("Active subject installation required")
+    state = str(row["notice_state"] or "not_required")
+    if state != "pending":
+        return state
+
+    tokens = await other_signed_in_push_tokens(
+        session, user_id=user_id, installation_id=installation_id, now=now,
+    )
+    if not tokens:
+        await session.execute(text("""
+            UPDATE auth_installations SET notice_state='not_required'
+            WHERE id=:iid AND user_id=:uid AND notice_state='pending'
+        """), {"iid": installation_id, "uid": user_id})
+        return "not_required"
+
+    from app.services.push_service import send_push_to_tokens
+    sent = await send_push_to_tokens(
+        tokens,
+        title="New sign-in to your NISCHINT account",
+        body="A new device signed in to your account. Review Signed-in devices if this was not you.",
+        data={"event_type": "new_device_login", "screen": "settings", "section": "sessions"},
+    )
+    if int(sent or 0) > 0:
+        await session.execute(text("""
+            UPDATE auth_installations SET notice_state='delivered'
+            WHERE id=:iid AND user_id=:uid AND notice_state='pending'
+        """), {"iid": installation_id, "uid": user_id})
+        return "delivered"
+    return "pending"

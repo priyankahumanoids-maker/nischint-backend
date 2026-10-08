@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +47,7 @@ class PlanShape:
     capacities: dict[str, int]
 
 
+# Compatibility snapshot for legacy tests only. Runtime allocation uses family_plan_catalog.
 PLAN_SHAPES = {
     PLAN_TRIAL: PlanShape(PLAN_TRIAL, {SEAT_PROTECTED: 1, SEAT_GUARDIAN: 2}),
     PLAN_INDIVIDUAL: PlanShape(PLAN_INDIVIDUAL, {SEAT_PROTECTED: 1, SEAT_GUARDIAN: 2}),
@@ -73,6 +74,31 @@ def seat_capacity(plan: str, seat: str) -> int:
 def validate_seat_for_membership(plan: str, seat: str, role: str) -> str:
     canonical_seat = str(seat or "").strip().lower()
     seat_capacity(plan, canonical_seat)
+    if role == CIRCLE_ROLE_MINOR and canonical_seat == SEAT_GUARDIAN:
+        raise CirclePlanError("A Minor cannot occupy a Guardian seat.")
+    return canonical_seat
+
+
+
+
+async def get_runtime_plan_shape(session: AsyncSession, plan: str) -> PlanShape:
+    from app.services.family_circle_plan_catalog_service import get_catalog_plan
+    configured = await get_catalog_plan(session, plan)
+    return PlanShape(configured.plan, dict(configured.capacities))
+
+
+async def runtime_seat_capacity(session: AsyncSession, plan: str, seat: str) -> int:
+    shape = await get_runtime_plan_shape(session, plan)
+    canonical_seat = str(seat or "").strip().lower()
+    capacity = shape.capacities.get(canonical_seat)
+    if capacity is None:
+        raise CirclePlanError("Seat type is not valid for this plan.")
+    return int(capacity)
+
+
+async def validate_runtime_seat(session: AsyncSession, plan: str, seat: str, role: str) -> str:
+    canonical_seat = str(seat or "").strip().lower()
+    await runtime_seat_capacity(session, plan, canonical_seat)
     if role == CIRCLE_ROLE_MINOR and canonical_seat == SEAT_GUARDIAN:
         raise CirclePlanError("A Minor cannot occupy a Guardian seat.")
     return canonical_seat
@@ -119,6 +145,8 @@ async def _active_seat_count(
     session: AsyncSession,
     circle_id: uuid.UUID,
     seat: str,
+    *,
+    exclude_removal_id: uuid.UUID | None = None,
 ) -> int:
     value = (
         await session.execute(
@@ -131,7 +159,16 @@ async def _active_seat_count(
             )
         )
     ).scalar_one()
-    return int(value or 0)
+    # Removed membership never authorizes reads/producers. Its seat alone is
+    # reserved for the server's ten-second Undo window (FC08 prerequisite).
+    reserved = (await session.execute(text("""
+        SELECT COUNT(*) FROM family_lifecycle_operations
+        WHERE circle_id=:circle AND kind='member_remove' AND state='pending'
+          AND expires_at > clock_timestamp() AND details->>'seat'=:seat
+          AND id IS DISTINCT FROM CAST(:exclude_removal_id AS UUID)
+    """), {"circle": circle_id, "seat": seat,
+            "exclude_removal_id": exclude_removal_id})).scalar_one()
+    return int(value or 0) + int(reserved or 0)
 
 
 async def assert_seat_available(
@@ -146,8 +183,8 @@ async def assert_seat_available(
     if not circle.plan:
         raise CirclePlanError("Circle plan must be selected before seats are allocated.")
 
-    canonical_seat = validate_seat_for_membership(circle.plan, seat, role)
-    capacity = seat_capacity(circle.plan, canonical_seat)
+    canonical_seat = await validate_runtime_seat(session, circle.plan, seat, role)
+    capacity = await runtime_seat_capacity(session, circle.plan, canonical_seat)
     current = await _active_seat_count(session, circle.id, canonical_seat)
     if current >= capacity:
         raise CirclePlanError(f"{canonical_seat} seat capacity is full for this plan.")
@@ -179,8 +216,8 @@ async def initialize_circle_plan(
         raise CirclePlanError("Family Circle plan/seat has already been initialized.")
 
     canonical_plan = str(plan or "").strip().lower()
-    shape = get_plan_shape(canonical_plan)
-    canonical_seat = validate_seat_for_membership(canonical_plan, owner_seat, owner_membership.role)
+    shape = await get_runtime_plan_shape(session, canonical_plan)
+    canonical_seat = await validate_runtime_seat(session, canonical_plan, owner_seat, owner_membership.role)
 
     await _lock_circle(session, circle.id)
 
@@ -303,6 +340,9 @@ __all__ = [
     "PLAN_SHAPES",
     "get_plan_shape",
     "seat_capacity",
+    "get_runtime_plan_shape",
+    "runtime_seat_capacity",
+    "validate_runtime_seat",
     "validate_seat_for_membership",
     "trial_fingerprints",
     "assert_seat_available",

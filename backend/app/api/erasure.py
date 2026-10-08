@@ -260,6 +260,8 @@ async def submit_self_erasure(
             user_agent=(request.headers.get("user-agent") or "")[:1000],
             reason=(body.reason if body else None),
         )
+    except erasure_service.ErasureMembershipBlocked as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     except erasure_service.ErasureAlreadyPending as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
 
