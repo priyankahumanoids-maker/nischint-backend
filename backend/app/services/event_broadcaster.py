@@ -128,22 +128,22 @@ class EventBroadcaster:
         try:
             from app.services.redis_service import is_available, publish_event
 
-            if is_available():
-                published = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        publish_event,
-                        _REDIS_PUBSUB_CHANNEL,
-                        event,
-                    ),
-                    timeout=1.0,
+            def publish_if_available():
+                # Include lazy connection/PING in the offload, not just PUBLISH.
+                if not is_available():
+                    return False
+                return publish_event(_REDIS_PUBSUB_CHANNEL, event)
+
+            published = await asyncio.wait_for(
+                asyncio.to_thread(publish_if_available), timeout=1.0,
+            )
+            if published:
+                logger.info(
+                    f"[SSE_REDIS] published {event_type} channel={channel}"
                 )
-                if published:
-                    logger.info(
-                        f"[SSE_REDIS] published {event_type} channel={channel}"
-                    )
         except Exception as exc:
             logger.warning(
-                f"[SSE_REDIS] publish failed {event_type} channel={channel}: {exc}"
+                "[SSE_REDIS] publish failed (%s)", type(exc).__name__
             )
 
     def start_redis_listener(self, loop: asyncio.AbstractEventLoop):

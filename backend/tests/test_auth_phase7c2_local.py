@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from uuid import UUID
 
 from fastapi import HTTPException
 from sqlalchemy import Column, String
@@ -414,6 +415,23 @@ class ProviderAdmissionTests(unittest.TestCase):
 class LoginTests(unittest.TestCase):
     def verify(self, *, valid, users):
         s, calls = FakeSession(), []
+        installation_id = UUID("00000000-0000-4000-8000-000000000001")
+        session_id = UUID("00000000-0000-4000-8000-000000000002")
+        # Retain the existing response sentinel assertion while representing
+        # the session field consumed by the accepted installation binding.
+        class SessionResponse(str):
+            pass
+        response = SessionResponse("session-response")
+        response.session_id = session_id
+        async def associate(session, *, user_id, session_id, installation_id, key, now):
+            self.assertIs(session, s)
+            self.assertEqual(user_id, users[0].id)
+            self.assertEqual(session_id, response.session_id)
+            self.assertEqual(installation_id, UUID("00000000-0000-4000-8000-000000000001"))
+            self.assertEqual(key, KEY.hex().encode("utf-8"))
+            self.assertIsNotNone(now.tzinfo)
+            calls.append("associate_installation")
+        module("app.services.auth_installation_service", associate_installation=associate)
         async def verifier(*args, **kwargs):
             calls.append("verify")
             if not valid: raise HTTPException(400, "invalid")
@@ -423,14 +441,16 @@ class LoginTests(unittest.TestCase):
         async def state(*args, **kwargs): return {"configured": False}
         async def issuer(session, user, request, **kwargs):
             calls.append(("issue", user.id))
-            return "session-response"
+            return response
         module("app.api.auth", _issue_local_session_response=issuer)
         fn = executable("app/api/phone_auth.py", "verify_phone_login", canonical_phone=phone.canonical_phone,
                         verify_phone_code=verifier, users_for_phone=lookup, PHONE_LOGIN=phone.PHONE_LOGIN,
-                        HTTPException=HTTPException, auth_two_factor_service=types.SimpleNamespace(get_sms_two_factor_state=state),
+                        HTTPException=HTTPException, UUID=UUID, datetime=datetime, timezone=timezone,
+                        settings=types.SimpleNamespace(jwt_secret=KEY.hex()),
+                        auth_two_factor_service=types.SimpleNamespace(get_sms_two_factor_state=state),
                         user_cache=types.SimpleNamespace(cache_user=lambda *args: calls.append("cache")))
         try:
-            result = run(fn(REQUEST, types.SimpleNamespace(phone=PHONE, code="123456"), s))
+            result = run(fn(REQUEST, types.SimpleNamespace(phone=PHONE, code="123456", installation_id=installation_id), s))
         except HTTPException as exc:
             result = exc.status_code
         return result, calls, s
@@ -443,6 +463,7 @@ class LoginTests(unittest.TestCase):
         result, calls, s = self.verify(valid=True, users=[user])
         self.assertEqual(result, "session-response")
         self.assertEqual(calls[:3], ["verify", "lookup", ("issue", "preserved-id")])
+        self.assertEqual(calls[3:], ["associate_installation", "cache"])
         self.assertEqual(s.commits, 1)
     def test_unknown_phone_creates_no_user_or_session(self):
         result, calls, s = self.verify(valid=True, users=[])

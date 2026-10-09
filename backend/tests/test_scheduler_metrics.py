@@ -24,6 +24,8 @@ def _isolate(monkeypatch):
     # Force every code path inside scheduler_metrics to skip Redis so tests
     # only see in-process state.
     monkeypatch.setattr(sm, "_redis", lambda: None)
+    # This suite asserts immediate local state, not asynchronous telemetry.
+    monkeypatch.setattr(sm, "_queue_metrics", lambda stats: None)
     yield
     sm._stats.clear()
     sm._attached_schedulers.clear()

@@ -23,7 +23,8 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from apscheduler.events import (
@@ -60,6 +61,55 @@ _lock = threading.Lock()
 _stats: dict[str, _JobStats] = {}
 _attached_schedulers: set[int] = set()
 
+# One process-local daemon, bounded/coalesced pending snapshots. Local counters
+# remain authoritative immediately; remote telemetry is best-effort.
+_PENDING_LIMIT = 256
+_BATCH_LIMIT = 64
+_pending = OrderedDict()
+_pending_condition = threading.Condition()
+_telemetry_worker = None
+_dropped_snapshots = 0
+
+
+def _queue_metrics(stats: _JobStats) -> None:
+    """Called under _lock: copy state, never perform network I/O here."""
+    global _telemetry_worker, _dropped_snapshots
+    snapshot = replace(stats, drifts_ms=list(stats.drifts_ms))
+    with _pending_condition:
+        if snapshot.job_id not in _pending and len(_pending) >= _PENDING_LIMIT:
+            _pending.popitem(last=False)
+            _dropped_snapshots += 1
+        _pending[snapshot.job_id] = snapshot
+        if _telemetry_worker is None or not _telemetry_worker.is_alive():
+            _telemetry_worker = threading.Thread(
+                target=_telemetry_loop, name="scheduler-metrics-redis", daemon=True,
+            )
+            _telemetry_worker.start()
+        _pending_condition.notify()
+
+
+def _telemetry_loop() -> None:
+    global _dropped_snapshots
+    while True:
+        with _pending_condition:
+            _pending_condition.wait_for(lambda: bool(_pending))
+            batch = [_pending.popitem(last=False)[1]
+                     for _ in range(min(_BATCH_LIMIT, len(_pending)))]
+            dropped, _dropped_snapshots = _dropped_snapshots, 0
+        if dropped:
+            logger.warning("scheduler metrics telemetry queue saturated; snapshots coalesced/dropped=%d", dropped)
+        # No local/shared lock is held across persistence or threshold I/O.
+        for snapshot in batch:
+            try:
+                _persist(snapshot)
+            except Exception as exc:
+                logger.error("scheduler metrics worker failure (%s)", type(exc).__name__)
+        try:
+            _maybe_emit_threshold_event(batch[-1].job_id)
+        except Exception as exc:
+            logger.error("scheduler metrics threshold worker failure (%s)", type(exc).__name__)
+
+
 
 # ── Redis helpers ─────────────────────────────────────────────────────
 def _redis():
@@ -92,7 +142,7 @@ def _persist(stats: _JobStats) -> None:
         c.set(f"nischint:{REDIS_NS}:{stats.job_id}", json.dumps(payload), ex=86400)
         c.sadd(f"nischint:{REDIS_NS}:_index", stats.job_id)
     except Exception as e:
-        logger.debug(f"scheduler_metrics persist failed for {stats.job_id}: {e}")
+        logger.warning("scheduler metrics Redis persistence failed (%s)", type(e).__name__)
 
 
 def _get_or_create(job_id: str, owner: str = "") -> _JobStats:
@@ -162,11 +212,8 @@ def _on_submitted(event, owner: str) -> None:
                 s.drifts_ms[-ROLLING_WINDOW:]
             )
 
-        _persist(s)
+        _queue_metrics(s)
 
-    _maybe_emit_threshold_event(
-        event.job_id
-    )
 
 
 def _on_executed(event, owner: str) -> None:
@@ -215,11 +262,8 @@ def _on_executed(event, owner: str) -> None:
                 + duration_ms
             ) / n
 
-        _persist(s)
+        _queue_metrics(s)
 
-    _maybe_emit_threshold_event(
-        event.job_id
-    )
 
 
 def _on_missed(event, owner: str) -> None:
@@ -228,9 +272,8 @@ def _on_missed(event, owner: str) -> None:
         s.missed_count += 1
         s.last_status = "missed"
         s.last_run_at = datetime.now(timezone.utc).isoformat()
-        _persist(s)
+        _queue_metrics(s)
     logger.warning(f"[scheduler_metrics] missed job {event.job_id} (owner={owner})")
-    _maybe_emit_threshold_event(event.job_id)
 
 
 def _on_error(event, owner: str) -> None:
@@ -240,8 +283,7 @@ def _on_error(event, owner: str) -> None:
         s.last_status = "error"
         s.last_error = str(getattr(event, "exception", ""))[:300]
         s.last_run_at = datetime.now(timezone.utc).isoformat()
-        _persist(s)
-    _maybe_emit_threshold_event(event.job_id)
+        _queue_metrics(s)
 
 
 def _maybe_emit_threshold_event(job_id: str | None) -> None:
@@ -259,8 +301,8 @@ def _maybe_emit_threshold_event(job_id: str | None) -> None:
             int(snap.get("error_total") or 0),
             job_id=job_id,
         )
-    except Exception:
-        logger.debug("threshold evaluation failed", exc_info=True)
+    except Exception as exc:
+        logger.error("scheduler metrics threshold evaluation failed (%s)", type(exc).__name__)
 
 
 # ── Attach to a running scheduler (idempotent) ────────────────────────
@@ -368,7 +410,7 @@ def get_snapshot() -> dict:
                 except Exception:
                     continue
         except Exception as e:
-            logger.debug(f"snapshot redis read failed: {e}")
+            logger.warning("scheduler metrics Redis snapshot failed (%s)", type(e).__name__)
 
     # Merge local state on top (local has freshest data inside this process)
     with _lock:
@@ -444,7 +486,7 @@ def reset_drift_baseline() -> dict:
     with _lock:
         for s in _stats.values():
             s.drifts_ms.clear()
-            _persist(s)
+            _queue_metrics(s)
             cleared += 1
     c = _redis()
     if c:

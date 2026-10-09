@@ -23,8 +23,11 @@ that's the correct trade-off when Redis is unreachable).
 """
 import os
 import logging
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +45,31 @@ def _build_limiter() -> Limiter:
     )
     if _redis_url:
         try:
-            limiter = Limiter(storage_uri=_redis_url, **common)
+            # redis-py URL query options override kwargs. These three options
+            # must not override the HTTP limiter's explicit short bounds.
+            parsed = urlsplit(_redis_url)
+            query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+                     if k not in {"socket_connect_timeout", "socket_timeout", "retry_on_timeout"}]
+            storage_uri = urlunsplit(parsed._replace(query=urlencode(query)))
+            limiter = Limiter(
+                storage_uri=storage_uri,
+                storage_options={
+                    "socket_connect_timeout": 1.0,
+                    "socket_timeout": 1.0,
+                    "retry_on_timeout": False,
+                    "retry": Retry(NoBackoff(), 0),
+                },
+                **common,
+            )
             logger.info(
-                "Rate limiter: Redis-backed (%s) with in-memory fallback armed",
-                _redis_url.split("@")[-1] if "@" in _redis_url else "connected",
+                "Rate limiter: Redis-backed with bounded I/O and in-memory fallback armed",
             )
             return limiter
         except Exception as e:
             # Limiter() itself rarely throws (the underlying connection is
             # lazy), but if it does — e.g. malformed URI — fall through to a
             # pure in-memory limiter so the API still boots.
-            logger.warning("Rate limiter: Redis init failed (%s), using in-memory only", e)
+            logger.warning("Rate limiter: Redis init failed (%s), using in-memory only", type(e).__name__)
     else:
         logger.info("Rate limiter: in-memory only (REDIS_URL not set)")
     return Limiter(**common)

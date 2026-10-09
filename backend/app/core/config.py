@@ -1,7 +1,8 @@
 # Centralized Configuration via Pydantic Settings
+import hashlib
 from functools import lru_cache
 from pathlib import Path
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -11,7 +12,16 @@ class Settings(BaseSettings):
     app_env: str = "dev"
 
     # ── JWT ──
-    jwt_secret: str = "nischint_jwt_secret_key_prod_2026"
+    jwt_secret: str = Field(default="", validate_default=True, repr=False)
+    @field_validator("jwt_secret")
+    @classmethod
+    def require_external_jwt_secret(cls, value: str) -> str:
+        # Reject the retired repository default by fingerprint, never retain a
+        # usable signing-key fallback. Preserve supplied key bytes exactly.
+        if not value.strip() or hashlib.sha256(value.strip().encode("utf-8")).hexdigest() == "a03cdb24cc4ed665ee5ebbb2bafdf5db566976c266b7acb66799ed4bb2f987f0":
+            raise ValueError("JWT_SECRET must be externally configured and must not use the retired default")
+        return value
+
     jwt_algorithm: str = "HS256"
     jwt_expires_minutes: int = Field(default=15, ge=5, le=60)
     jwt_refresh_expires_days: int = Field(default=30, ge=1, le=365)
@@ -140,6 +150,7 @@ class Settings(BaseSettings):
     model_config = {
         "env_file": str(Path(__file__).resolve().parent.parent.parent / ".env"),
         "extra": "ignore",
+        "hide_input_in_errors": True,
     }
 
 
