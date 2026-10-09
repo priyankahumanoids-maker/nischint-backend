@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -53,6 +53,7 @@ def _user_to_dict(user: User) -> dict[str, Any]:
         "facility_id":        user.facility_id,
         "phone":              user.phone,
         "full_name":          user.full_name,
+        "date_of_birth":      user.date_of_birth.isoformat() if user.date_of_birth else None,
         "is_active":          bool(user.is_active),
         "deleted_at":         user.deleted_at.isoformat() if user.deleted_at else None,
         "erasure_status":     user.erasure_status,
@@ -75,6 +76,22 @@ def _dict_to_user(data: dict[str, Any]) -> User:
         except ValueError:
             return None
 
+    # Missing key identifies pre-DOB cache payloads; explicit null is legitimate.
+    if "date_of_birth" not in data:
+        raise ValueError("Stale user cache payload: date_of_birth field missing")
+    raw_dob = data["date_of_birth"]
+    dob = None
+    if raw_dob is not None:
+        try:
+            if not isinstance(raw_dob, str):
+                raise ValueError
+            dob = date.fromisoformat(raw_dob)
+            if dob.isoformat() != raw_dob:
+                raise ValueError
+        except (ValueError, TypeError):
+            # Do not include malformed profile data in the existing cache log.
+            raise ValueError("Invalid cached date_of_birth") from None
+
     user = User()
     user.id                 = UUID(data["id"])
     user.email              = data["email"]
@@ -86,6 +103,7 @@ def _dict_to_user(data: dict[str, Any]) -> User:
     user.facility_id        = data.get("facility_id")
     user.phone              = data.get("phone")
     user.full_name          = data.get("full_name")
+    user.date_of_birth      = dob
     user.is_active          = bool(data.get("is_active", True))
     user.deleted_at         = _parse_dt(data.get("deleted_at"))
     user.erasure_status     = data.get("erasure_status")

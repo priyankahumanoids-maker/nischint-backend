@@ -5,7 +5,7 @@ Locks the contract for the short-window auth cache that wraps
 authenticated endpoint pays.
 """
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -38,7 +38,11 @@ def _make_user(**overrides) -> User:
 
 
 @pytest.fixture(autouse=True)
-def _clear_mem_cache_between_tests():
+def _clear_mem_cache_between_tests(monkeypatch):
+    # Every test is offline, including the unattached ORM instance check.
+    monkeypatch.setattr(user_cache.redis_service, "get_json", lambda *a, **kw: None)
+    monkeypatch.setattr(user_cache.redis_service, "set_json", lambda *a, **kw: False)
+    monkeypatch.setattr(user_cache.redis_service, "delete_key", lambda *a, **kw: True)
     user_cache._mem_cache.clear()
     yield
     user_cache._mem_cache.clear()
@@ -136,3 +140,56 @@ def test_invalidate_user_keys_handles_blanks(monkeypatch):
     """Passing falsy / missing subs should be a no-op, not a crash."""
     monkeypatch.setattr(user_cache.redis_service, "delete_key", lambda *a, **kw: True)
     user_cache.invalidate_user_keys("", None, "x")  # must not raise
+
+
+@pytest.mark.parametrize("dob", [date(2000, 12, 30), None])
+@pytest.mark.parametrize("storage", ["redis", "memory"])
+def test_dob_round_trip_and_scalar_preservation(monkeypatch, dob, storage):
+    import json
+    written = []
+    monkeypatch.setattr(user_cache.redis_service, "set_json", lambda namespace, sub, data, ttl: written.append((json.loads(json.dumps(data)), ttl)))
+    original = _make_user(date_of_birth=dob, guardian_id=uuid.uuid4(), facility_id="synthetic-facility")
+    sub = str(original.id)
+    user_cache.cache_user(sub, original)
+    payload, ttl = written[0]
+    assert payload["date_of_birth"] == (dob.isoformat() if dob else None)
+    assert ttl == user_cache.USER_CACHE_TTL_S == 30
+    assert user_cache._MEM_CACHE_TTL_S == 10
+    if storage == "redis":
+        user_cache._mem_cache.clear()
+        monkeypatch.setattr(user_cache.redis_service, "get_json", lambda *a: payload)
+    restored = user_cache.get_cached_user(sub)
+    assert restored is not None and restored.date_of_birth == dob
+    if dob is not None:
+        assert type(restored.date_of_birth) is date
+    assert user_cache._user_to_dict(restored) == payload
+
+
+@pytest.mark.parametrize("storage", ["redis", "memory"])
+def test_legacy_payload_forces_miss_then_authoritative_reload(monkeypatch, storage):
+    user = _make_user(date_of_birth=date(2000, 12, 30))
+    sub = str(user.id)
+    payload = user_cache._user_to_dict(user)
+    del payload["date_of_birth"]
+    if storage == "redis":
+        monkeypatch.setattr(user_cache.redis_service, "get_json", lambda *a: payload)
+    else:
+        user_cache._mem_set(sub, payload)
+    assert user_cache.get_cached_user(sub) is None
+    # get_current_user can now reload and replace the old payload normally.
+    user_cache.cache_user(sub, user)
+    assert user_cache.get_cached_user(sub).date_of_birth == user.date_of_birth
+
+
+@pytest.mark.parametrize("bad", ["", "not-a-date", "2000-02-30", "2000-12-30T00:00:00", "20001230", 123, False, {}, []])
+@pytest.mark.parametrize("storage", ["redis", "memory"])
+def test_malformed_dob_is_cache_miss(monkeypatch, bad, storage):
+    user = _make_user()
+    sub = str(user.id)
+    payload = user_cache._user_to_dict(user)
+    payload["date_of_birth"] = bad
+    if storage == "redis":
+        monkeypatch.setattr(user_cache.redis_service, "get_json", lambda *a: payload)
+    else:
+        user_cache._mem_set(sub, payload)
+    assert user_cache.get_cached_user(sub) is None
