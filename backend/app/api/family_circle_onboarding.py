@@ -1,6 +1,8 @@
 """Family Circle Phase 4 onboarding and invite API."""
 from __future__ import annotations
 
+import asyncio
+
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -144,8 +146,23 @@ async def create_family_circle_invite(
             parental_basis=req.parental_basis,
             parental_verification_ref=req.parental_verification_ref,
         )
-        usage = await seat_usage(session, circle)
+
+        # Invite creation is the authoritative mutation. Commit it first so
+        # optional seat-usage display work cannot cause the client to report
+        # a false invite-creation failure.
         await session.commit()
+
+        usage = None
+        try:
+            usage = await asyncio.wait_for(
+                seat_usage(session, circle),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            # The invite has already been committed successfully.
+            # Abort only the slow post-commit read transaction.
+            await session.rollback()
+
         return {
             "code": code,
             "join_url": f"nischint://join?code={code}",
