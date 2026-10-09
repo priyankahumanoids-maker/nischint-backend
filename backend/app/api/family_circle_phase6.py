@@ -34,6 +34,7 @@ from app.services.family_circle_runtime_authority import (
     membership_snapshot,
     runtime_decision,
     runtime_snapshot,
+    bounded_runtime_read,
     sharing_paused,
 )
 
@@ -106,8 +107,8 @@ async def stage_individual_downgrade(req: StageDowngradeRequest, session: AsyncS
 
 
 @router.get('/entitlement')
+@bounded_runtime_read
 async def my_entitlement(session: AsyncSession = Depends(get_db_session), user: User = Depends(get_current_user)):
-    await reconcile_age18_for_user(session, user.id)
     snap = await membership_snapshot(session, user.id)
     if snap is None:
         raise HTTPException(status_code=404, detail='Family Circle membership not found.')

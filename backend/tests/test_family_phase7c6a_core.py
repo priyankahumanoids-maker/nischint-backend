@@ -22,7 +22,7 @@ def load_service(name):
     for n in tree.body:
         if isinstance(n, ast.ImportFrom):
             if n.module and (n.module.startswith(("app.core.", "sqlalchemy", "fastapi"))
-                             or n.module in {"__future__", "datetime", "dataclasses", "typing"}):
+                             or n.module in {"__future__", "datetime", "dataclasses", "typing", "contextvars", "functools"}):
                 nodes.append(n)
         elif isinstance(n, ast.Import):
             if all(a.name in {"uuid", "asyncio", "logging", "json", "hashlib", "secrets", "string"} for a in n.names):

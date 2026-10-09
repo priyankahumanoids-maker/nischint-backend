@@ -8,6 +8,10 @@ regaining access through old relationship rows.
 from __future__ import annotations
 
 import uuid
+import asyncio
+from contextvars import ContextVar
+from functools import wraps
+from fastapi import HTTPException
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -17,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.age_policy import is_minor
 from app.core.family_consent_policy import CURRENT_FAMILY_NOTICE_VERSION
 from app.core.family_circle_permissions import (
+    ACTION_INVITE_MEMBER,
     ACTION_PRODUCE_LOCATION,
     ACTION_VIEW_LOCATION,
     ACTION_VIEW_LOCATION_HISTORY,
@@ -69,6 +74,43 @@ class MembershipSnapshot:
     circle: FamilyCircle
 
 
+# Request-local only: never reused by mutation routes, another session, or account.
+_READ_STATE = ContextVar("family_runtime_read", default=None)
+RUNTIME_READ_TIMEOUT_SECONDS = 8.0
+
+
+def bounded_runtime_read(fn):
+    @wraps(fn)
+    async def wrapped(*args, **kwargs):
+        token = _READ_STATE.set({})
+        try:
+            async with asyncio.timeout(RUNTIME_READ_TIMEOUT_SECONDS):
+                return await fn(*args, **kwargs)
+        except TimeoutError:
+            raise HTTPException(503, "Family Circle authority temporarily unavailable.") from None
+        finally:
+            _READ_STATE.reset(token)
+    return wrapped
+
+
+def _read_once(fn):
+    @wraps(fn)
+    async def wrapped(session, identity, **kwargs):
+        cache = _READ_STATE.get()
+        if cache is None:
+            return await fn(session, identity, **kwargs)
+        key = (fn.__name__, id(session), str(getattr(identity, "id", identity)), repr(kwargs))
+        if key not in cache:
+            cache[key] = await fn(session, identity, **kwargs)
+        return cache[key]
+    return wrapped
+
+
+@_read_once
+async def _runtime_entitlement(session, circle):
+    return await resolve_entitlement(session, circle)
+
+
 async def _uuid(value) -> uuid.UUID | None:
     try:
         return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
@@ -99,6 +141,7 @@ async def canonical_membership_state(session: AsyncSession, user_id: str | uuid.
     return "former"
 
 
+@_read_once
 async def membership_snapshot(
     session: AsyncSession,
     user_id: str | uuid.UUID,
@@ -130,6 +173,7 @@ async def membership_snapshot(
     return MembershipSnapshot(membership=membership, circle=circle)
 
 
+@_read_once
 async def _consent_state(session: AsyncSession, subject_user_id: uuid.UUID, *, now: datetime | None = None) -> ConsentState:
     """Derive current canonical consent, enforcing notice and ownership.
 
@@ -203,6 +247,7 @@ async def _consent_state(session: AsyncSession, subject_user_id: uuid.UUID, *, n
     return ConsentState(values)
 
 
+@_read_once
 async def sharing_paused(
     session: AsyncSession,
     user_id: str | uuid.UUID,
@@ -316,13 +361,17 @@ async def runtime_decision(
     actor_consent = await _consent_state(session, actor.membership.user_id)
     target_consent = await _consent_state(session, target.membership.user_id) if target is not None else ConsentState()
     # Phase 6 replaces this former temporary ACTIVE entitlement with the canonical resolver.
-    entitlement = await resolve_entitlement(session, actor.circle)
+    entitlement = await _runtime_entitlement(session, actor.circle)
     ctx = PermissionContext(
         actor_user_id=str(actor.membership.user_id),
         actor_role=actor.membership.role,
         actor_seat=str(actor.membership.seat),
         plan=str(actor.circle.plan),
-        entitlement=entitlement.permission_entitlement,
+        # Formation is independent of paid protection, only for a persisted
+        # unpaid Family entitlement. All role/seat/circle checks still apply.
+        entitlement=("active" if action == ACTION_INVITE_MEMBER
+                     and getattr(entitlement, "formation_pending", False)
+                     else entitlement.permission_entitlement),
         same_circle=True,
         actor_consent=actor_consent,
         target_user_id=str(target.membership.user_id) if target is not None else None,
@@ -515,7 +564,7 @@ async def runtime_snapshot(session: AsyncSession, user_id: str | uuid.UUID) -> d
 
     location_allowed = await allowed(ACTION_PRODUCE_LOCATION)
     actor_consent = await _consent_state(session, actor.membership.user_id)
-    entitlement = await resolve_entitlement(session, actor.circle)
+    entitlement = await _runtime_entitlement(session, actor.circle)
 
     return {
         "canonical": True,

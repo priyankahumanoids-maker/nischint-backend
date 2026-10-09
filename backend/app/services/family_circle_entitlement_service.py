@@ -36,6 +36,7 @@ class EntitlementSnapshot:
     access_until: datetime | None = None
     grace_until: datetime | None = None
     payment_required: bool = False
+    formation_pending: bool = False
     cancel_at_period_end: bool = False
     pending_plan: str | None = None
     pending_plan_effective_at: datetime | None = None
@@ -164,6 +165,7 @@ async def resolve_entitlement(session: AsyncSession, circle: FamilyCircle, *, no
         "payment_pending", ENTITLEMENT_LIFELINE, "payment_not_verified",
         payment_required=True, pending_plan=pending_plan,
         pending_plan_effective_at=pending_plan_effective_at,
+        formation_pending=state == "payment_pending" and circle.plan == PLAN_FAMILY,
     )
 
 
