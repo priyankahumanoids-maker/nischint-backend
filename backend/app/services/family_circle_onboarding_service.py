@@ -136,7 +136,9 @@ async def create_creator_circle(
         raise FamilyOnboardingError("This person already belongs to a Family Circle.")
 
     try:
-        identity = await create_circle(session, user, name=circle_name)
+        identity = await create_circle(
+            session, user, name=circle_name, plan=canonical_plan, owner_seat=canonical_seat
+        )
         circle = await session.get(FamilyCircle, identity.circle_id)
         membership = await session.get(CircleMembership, identity.membership_id)
         if circle is None or membership is None:
@@ -150,6 +152,7 @@ async def create_creator_circle(
             owner_seat=canonical_seat,
             phone=user.phone,
             device_id=device_id,
+            creator_fields_initialized=True,
         )
         await seed_entitlement_state(session, circle)
         await record_legal_acceptance(session, user_id=user.id)

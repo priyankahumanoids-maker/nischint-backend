@@ -201,6 +201,7 @@ async def initialize_circle_plan(
     phone: str | None = None,
     device_id: str | None = None,
     now: datetime | None = None,
+    creator_fields_initialized: bool = False,
 ) -> None:
     """Select the initial plan and assign the creator's seat.
 
@@ -212,12 +213,19 @@ async def initialize_circle_plan(
         raise CirclePlanError("Cannot initialize a closed Family Circle.")
     if owner_membership.circle_id != circle.id or owner_membership.user_id != circle.owner_user_id:
         raise CirclePlanError("Owner membership does not belong to this Family Circle.")
-    if circle.plan is not None or owner_membership.seat is not None:
+    if not creator_fields_initialized and (circle.plan is not None or owner_membership.seat is not None):
         raise CirclePlanError("Family Circle plan/seat has already been initialized.")
 
     canonical_plan = str(plan or "").strip().lower()
     shape = await get_runtime_plan_shape(session, canonical_plan)
     canonical_seat = await validate_runtime_seat(session, canonical_plan, owner_seat, owner_membership.role)
+
+    if creator_fields_initialized and (
+        circle.plan != canonical_plan or owner_membership.seat != canonical_seat
+        or owner_membership.role != "owner" or owner_membership.status != "active"
+        or circle.trial_started_at is not None or circle.trial_ends_at is not None
+    ):
+        raise CirclePlanError("Creator plan/seat does not match initial onboarding state.")
 
     await _lock_circle(session, circle.id)
 
@@ -232,6 +240,8 @@ async def initialize_circle_plan(
                 CircleMembership.circle_id == circle.id,
                 CircleMembership.status == "active",
                 CircleMembership.seat.is_not(None),
+                # Only the exact pre-seated creator is exempt, never another member.
+                *([CircleMembership.id != owner_membership.id] if creator_fields_initialized else []),
             )
         )
     ).scalar_one()

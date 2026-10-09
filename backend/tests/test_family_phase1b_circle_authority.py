@@ -120,7 +120,7 @@ def test_adult_create_circle_preserves_existing_user_id_and_creates_owner_member
     assert membership.user_id == owner_id
     assert membership.circle_id == circle.id == identity.circle_id
     assert membership.role == CIRCLE_ROLE_OWNER
-    assert session.flush_count == 1
+    assert session.flush_count == 2
 
 
 def test_existing_active_membership_blocks_second_circle():
