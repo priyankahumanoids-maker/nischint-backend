@@ -141,6 +141,11 @@ async def trigger_sos(
             "mode":          "loadtest",
             "side_effects":  "suppressed",
         }
+    from app.core.family_circle_permissions import ACTION_TRIGGER_SOS
+    from app.services.family_circle_runtime_authority import runtime_decision
+    family_sos = await runtime_decision(session, actor_user_id=user.id, action=ACTION_TRIGGER_SOS)
+    if family_sos.canonical and not family_sos.allowed:
+        raise HTTPException(status_code=403, detail=f"Family Circle SOS authority denied: {family_sos.code}")
     return await svc.trigger_sos(
         session, user.id,
         trigger_type=body.trigger_type,

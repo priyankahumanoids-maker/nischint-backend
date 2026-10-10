@@ -543,6 +543,46 @@ async def accept_invite_for_user(
     return membership
 
 
+async def list_pending_invites(session: AsyncSession, *, actor: User) -> list[dict]:
+    circle, membership = await _load_circle_and_actor(session, actor.id)
+    if membership.role not in {"owner", "co_admin"}:
+        raise FamilyInviteError("Only the Owner or Co-Admin can revoke invites.")
+    point = datetime.now(timezone.utc)
+    await _expire_pending_invites(session, circle.id, point)
+    rows = (await session.execute(text("""
+        SELECT id, seat, invitee_kind, created_at, expires_at
+        FROM family_circle_invites
+        WHERE circle_id=:circle_id AND status='pending' AND expires_at > :now
+        ORDER BY created_at DESC LIMIT 30
+    """), {"circle_id": circle.id, "now": point})).mappings().all()
+    return [{"id": str(r["id"]), "seat": r["seat"], "invitee_kind": r["invitee_kind"],
+             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+             "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None}
+            for r in rows]
+
+
+async def revoke_pending_invite_by_id(
+    session: AsyncSession, *, actor: User, invite_id: uuid.UUID
+) -> bool:
+    circle, membership = await _load_circle_and_actor(session, actor.id)
+    if membership.role not in {"owner", "co_admin"}:
+        raise FamilyInviteError("Only the Owner or Co-Admin can revoke invites.")
+    point = datetime.now(timezone.utc)
+    # The circle constraint and pending state are checked atomically. A joined
+    # member is never removed or affected by cancelling a different invite.
+    result = await session.execute(text("""
+        UPDATE family_circle_invites
+        SET status='revoked', revoked_at=:now
+        WHERE id=:id AND circle_id=:circle_id AND status='pending'
+        RETURNING id
+    """), {"id": invite_id, "circle_id": circle.id, "now": point})
+    revoked = result.scalar_one_or_none() is not None
+    if revoked:
+        await append_family_audit(session, circle_id=circle.id, actor_user_id=actor.id,
+                                  subject_user_id=None, event_type="invite_revoked", details={})
+    return revoked
+
+
 async def revoke_invite(
     session: AsyncSession,
     *,
@@ -614,5 +654,7 @@ __all__ = [
     "preview_invite",
     "accept_invite_for_user",
     "revoke_invite",
+    "list_pending_invites",
+    "revoke_pending_invite_by_id",
     "seat_usage",
 ]

@@ -2,18 +2,20 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
 from app.core.family_consent_policy import (
     CURRENT_FAMILY_NOTICE_VERSION,
 )
-from app.models.family_circle import FamilyCircle
+from app.models.family_circle import FamilyCircle, CircleMembership
 from app.models.user import User
 from app.services.family_circle_invite_service import (
     FamilyInviteError,
@@ -21,6 +23,8 @@ from app.services.family_circle_invite_service import (
     preview_invite,
     revoke_invite,
     seat_usage,
+    list_pending_invites,
+    revoke_pending_invite_by_id,
 )
 from app.services.family_circle_onboarding_service import (
     FamilyOnboardingError,
@@ -201,6 +205,67 @@ async def preview_family_circle_invite(
     except FamilyInviteError as exc:
         await session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/members")
+async def family_circle_visible_members(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Membership-only roster, not paid tracking/AI permission."""
+    membership = await get_active_membership(session, user.id)
+    if membership is None:
+        raise HTTPException(status_code=404, detail="No active Family Circle membership")
+    circle = await session.get(FamilyCircle, membership.circle_id)
+    if circle is None or circle.plan != "family":
+        raise HTTPException(status_code=403, detail="Family plan membership required")
+    rows = (await session.execute(
+        select(CircleMembership, User)
+        .join(User, User.id == CircleMembership.user_id)
+        .where(CircleMembership.circle_id == membership.circle_id, CircleMembership.status == "active")
+    )).all()
+    return {"members": [
+        {"user_id": str(person.id), "name": person.full_name or "Member",
+         "role": item.role, "seat": item.seat}
+        for item, person in rows
+    ]}
+
+
+class InviteIdRequest(BaseModel):
+    invite_id: str = Field(min_length=36, max_length=36)
+
+
+@router.get("/invites/pending")
+async def pending_family_invites(
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        rows = await list_pending_invites(session, actor=user)
+        await session.commit()
+        return {"invites": rows}
+    except FamilyInviteError as exc:
+        await session.rollback()
+        raise _http_error(exc) from exc
+
+
+@router.post("/invites/revoke-by-id")
+async def revoke_family_pending_invite_by_id(
+    req: InviteIdRequest,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        invite_id = uuid.UUID(req.invite_id)
+        revoked = await revoke_pending_invite_by_id(session, actor=user, invite_id=invite_id)
+        await session.commit()
+        return {"revoked": revoked}
+    except FamilyInviteError as exc:
+        await session.rollback()
+        raise _http_error(exc) from exc
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=422, detail="Invalid invitation ID") from exc
 
 
 @router.post("/invites/revoke")

@@ -151,8 +151,19 @@ async def trigger_sos(
         "triggered_at": log.triggered_at.isoformat(),
     }
 
-    # Broadcast SOS to user's guardians and operators
+    # Canonical Family Circle recipient fan-out: all OTHER active Family members
+    # (Owner, Co-Admin, adult/minor member) have equal emergency access.
+    # Legacy Trial/Individual retain Protected -> Guardian only. This resolver
+    # never treats unaccepted invitations or departed members as recipients.
+    from app.services.family_circle_runtime_authority import alert_recipient_ids
+    try:
+        _, recipients = await alert_recipient_ids(session, user_id)
+    except Exception as exc:
+        logger.error("SOS recipient lookup unavailable user=%s error=%s", user_id, exc)
+        recipients = []  # Never block emergency event creation or own-device SSE.
     await broadcaster.broadcast_to_user(str(user_id), "sos_triggered", sos_data)
+    for recipient_id in dict.fromkeys(recipients):
+        await broadcaster.broadcast_to_user(recipient_id, "sos_triggered", sos_data)
     await broadcaster.broadcast_to_operators("sos_triggered", sos_data)
     logger.warning(f"SOS TRIGGERED for user {user_id} via {trigger_type} at ({lat}, {lng})")
 
@@ -233,7 +244,15 @@ async def cancel_sos(
         "resolved_at": log.resolved_at.isoformat(),
     }
 
+    from app.services.family_circle_runtime_authority import alert_recipient_ids
+    try:
+        _, recipients = await alert_recipient_ids(session, user_id)
+    except Exception as exc:
+        logger.error("SOS recipient lookup unavailable user=%s error=%s", user_id, exc)
+        recipients = []  # Never block emergency event creation or own-device SSE.
     await broadcaster.broadcast_to_user(str(user_id), "sos_resolved", resolved_data)
+    for recipient_id in dict.fromkeys(recipients):
+        await broadcaster.broadcast_to_user(recipient_id, "sos_resolved", resolved_data)
     await broadcaster.broadcast_to_operators("sos_resolved", resolved_data)
     logger.info(f"SOS resolved for user {user_id}: {sos_id} by {resolved_by}")
 
