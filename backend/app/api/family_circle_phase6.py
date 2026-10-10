@@ -6,6 +6,7 @@ boundary is available.
 """
 from __future__ import annotations
 
+from functools import partial
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -107,7 +108,7 @@ async def stage_individual_downgrade(req: StageDowngradeRequest, session: AsyncS
 
 
 @router.get('/entitlement')
-@bounded_runtime_read
+@partial(bounded_runtime_read, timeout_seconds=20.0)
 async def my_entitlement(session: AsyncSession = Depends(get_db_session), user: User = Depends(get_current_user)):
     snap = await membership_snapshot(session, user.id)
     if snap is None:

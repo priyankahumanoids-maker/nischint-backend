@@ -79,12 +79,12 @@ _READ_STATE = ContextVar("family_runtime_read", default=None)
 RUNTIME_READ_TIMEOUT_SECONDS = 8.0
 
 
-def bounded_runtime_read(fn):
+def bounded_runtime_read(fn, *, timeout_seconds=RUNTIME_READ_TIMEOUT_SECONDS):
     @wraps(fn)
     async def wrapped(*args, **kwargs):
         token = _READ_STATE.set({})
         try:
-            async with asyncio.timeout(RUNTIME_READ_TIMEOUT_SECONDS):
+            async with asyncio.timeout(timeout_seconds):
                 return await fn(*args, **kwargs)
         except TimeoutError:
             raise HTTPException(503, "Family Circle authority temporarily unavailable.") from None
